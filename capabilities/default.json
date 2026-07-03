@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "RustShell desktop window permissions",
+  "windows": ["main", "file-manager"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-get-all-windows",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:webview:allow-create-webview-window",
+    "dialog:allow-open"
+  ]
+}

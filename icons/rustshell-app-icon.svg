@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">RustShell app icon</title>
+  <desc id="desc">A compact RustShell application icon optimized for Windows taskbar sizes.</desc>
+  <defs>
+    <linearGradient id="bg" x1="68" y1="64" x2="444" y2="448" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1f8fff"/>
+      <stop offset="0.58" stop-color="#1267d8"/>
+      <stop offset="1" stop-color="#10c896"/>
+    </linearGradient>
+    <linearGradient id="prompt" x1="144" y1="224" x2="360" y2="344" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.54" stop-color="#75cdff"/>
+      <stop offset="1" stop-color="#5cf4be"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="58" y="58" width="396" height="396" rx="92" fill="url(#bg)"/>
+  <rect x="118" y="130" width="276" height="252" rx="44" fill="#07111f" stroke="#d6f4ff" stroke-width="18" stroke-opacity="0.35"/>
+  <path d="M118 190c0-33 27-60 60-60h156c33 0 60 27 60 60v38H118z" fill="#1b2d46"/>
+  <circle cx="170" cy="176" r="13" fill="#ff6678"/>
+  <circle cx="214" cy="176" r="13" fill="#ffd25c"/>
+  <circle cx="258" cy="176" r="13" fill="#56efba"/>
+  <path d="M164 254l66 50-66 50" fill="none" stroke="#f9fcff" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M288 350h82" fill="none" stroke="#5ff6bf" stroke-width="48" stroke-linecap="round"/>
+  <path d="M164 254l66 50-66 50M288 350h82" fill="none" stroke="url(#prompt)" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

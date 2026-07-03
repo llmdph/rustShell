@@ -1,0 +1,58 @@
+[package]
+name = "rustshell"
+version = "0.2.0"
+edition = "2021"
+authors = ["RustShell"]
+description = "A high-performance Rust SSH/Shell desktop client inspired by Xshell."
+license = "PROPRIETARY"
+build = "build.rs"
+
+[features]
+default = []
+vendored-ssh-openssl = ["ssh2/openssl-on-win32", "ssh2/vendored-openssl"]
+slint-ui = ["dep:slint", "dep:slint-build", "dep:vt100"]
+
+[[bin]]
+name = "rustshell-slint"
+path = "src/bin/slint_shell.rs"
+required-features = ["slint-ui"]
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam-channel = "0.5"
+directories = "5.0"
+encoding_rs = "0.8"
+filetime = "0.2"
+portable-pty = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+ssh2 = "0.9"
+slint = { version = "=1.9.2", optional = true }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1.10", features = ["serde", "v4"] }
+vt100 = { version = "0.15", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["linux-native"] }
+
+[build-dependencies]
+slint-build = { version = "=1.9.2", optional = true }
+tauri-build = { version = "2", features = [] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

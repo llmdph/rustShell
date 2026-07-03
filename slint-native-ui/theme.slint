@@ -1,0 +1,19 @@
+export global Theme {
+    in-out property <int> mode: 0;
+
+    out property <color> bg: mode == 2 ? #eef2f7 : mode == 1 ? #101214 : #05070b;
+    out property <color> chrome: mode == 2 ? #f8fafc : mode == 1 ? #171a1e : #070b11;
+    out property <color> panel: mode == 2 ? #ffffff : mode == 1 ? #1d2127 : #0e141d;
+    out property <color> panel2: mode == 2 ? #f1f5f9 : mode == 1 ? #15181d : #090e15;
+    out property <color> line: mode == 2 ? #cbd5e1 : mode == 1 ? #343b45 : #202a39;
+    out property <color> text: mode == 2 ? #152033 : #edf2f7;
+    out property <color> muted: mode == 2 ? #64748b : #9aa8ba;
+    out property <color> input: mode == 2 ? #ffffff : mode == 1 ? #0d0f12 : #070b11;
+    out property <color> primary: mode == 2 ? #2563eb : mode == 1 ? #7ca7ff : #2b8df0;
+    out property <color> accent: mode == 2 ? #0f9f6e : mode == 1 ? #5eead4 : #2fd7a2;
+    out property <color> danger: mode == 2 ? #dc2626 : #ff556c;
+    out property <color> warn: mode == 2 ? #d97706 : #ffc257;
+    out property <color> terminal: mode == 2 ? #f8fafc : #000000;
+    out property <color> hover: mode == 2 ? #dbeafe : #101722;
+    out property <color> selected: mode == 2 ? #bfdbfe : #1f3a60;
+}

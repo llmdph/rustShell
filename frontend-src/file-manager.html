@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RustShell 文件管理器</title>
+    <style>
+      #file-manager-boot {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        display: grid;
+        place-items: center;
+        background: #05070b;
+        color: #dfe7f2;
+        font: 13px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
+      }
+
+      #file-manager-boot .boot-panel {
+        width: min(360px, calc(100vw - 48px));
+        padding: 18px 20px;
+        border: 1px solid rgba(148, 163, 184, 0.26);
+        border-radius: 8px;
+        background: #0d121b;
+        box-shadow: 0 18px 48px rgba(0, 0, 0, 0.36);
+      }
+
+      #file-manager-boot .boot-title {
+        margin-bottom: 6px;
+        color: #ffffff;
+        font-weight: 600;
+      }
+
+      #file-manager-boot pre {
+        max-height: 260px;
+        margin: 10px 0 0;
+        overflow: auto;
+        white-space: pre-wrap;
+        color: #ffb4c2;
+        font: 12px/1.45 Consolas, "Cascadia Mono", monospace;
+      }
+    </style>
+    <script>
+      window.__RUSTSHELL_VIEW__ = "file-manager";
+      window.__RUSTSHELL_FILE_MANAGER_BOOT__ = Date.now();
+      window.__RUSTSHELL_REPORT_BOOT_ERROR__ = function (title, detail) {
+        const boot = document.getElementById("file-manager-boot");
+        if (!boot) return;
+        boot.innerHTML =
+          '<div class="boot-panel"><div class="boot-title">' +
+          String(title || "文件管理器启动失败") +
+          '</div><div>前端入口已经加载，但渲染时遇到错误。</div><pre>' +
+          String(detail || "").replace(/[&<>"']/g, function (char) {
+            return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char];
+          }) +
+          "</pre></div>";
+      };
+      window.addEventListener("error", function (event) {
+        window.__RUSTSHELL_REPORT_BOOT_ERROR__(
+          "文件管理器脚本错误",
+          event.message + "\n" + (event.filename || "") + ":" + (event.lineno || 0) + ":" + (event.colno || 0)
+        );
+      });
+      window.addEventListener("unhandledrejection", function (event) {
+        window.__RUSTSHELL_REPORT_BOOT_ERROR__("文件管理器异步错误", event.reason && (event.reason.stack || event.reason.message || event.reason));
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="file-manager-boot">
+      <div class="boot-panel">
+        <div class="boot-title">文件管理器启动中</div>
+        <div>正在加载 RustShell 文件管理器...</div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

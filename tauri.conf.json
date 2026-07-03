@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "RustShell",
+  "version": "0.1.0",
+  "identifier": "com.rustshell.desktop",
+  "build": {
+    "frontendDist": "dist",
+    "devUrl": "http://127.0.0.1:1422",
+    "beforeDevCommand": "npm.cmd run dev",
+    "beforeBuildCommand": "npm.cmd run build"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "RustShell",
+        "width": 1420,
+        "height": 860,
+        "minWidth": 1080,
+        "minHeight": 680,
+        "resizable": true,
+        "decorations": false,
+        "transparent": false,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.ico"]
+  }
+}

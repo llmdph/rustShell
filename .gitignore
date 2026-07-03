@@ -1,0 +1,17 @@
+target/
+node_modules/
+dist/
+release/
+
+*.pdb
+*.log
+
+.env
+.env.*
+!.env.example
+
+.DS_Store
+Thumbs.db
+
+.claude/settings.local.json
+screenshot-*.png
