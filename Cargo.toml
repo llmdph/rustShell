@@ -1,6 +1,6 @@
 [package]
 name = "rustshell"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["RustShell"]
 description = "A high-performance Rust SSH/Shell desktop client inspired by Xshell."
