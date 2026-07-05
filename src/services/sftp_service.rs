@@ -149,6 +149,19 @@ impl SftpConnection {
         Ok(target)
     }
 
+    pub fn copy_path(&self, path: &str, target_path: &str, is_dir: bool) -> Result<String> {
+        let target = resolve_remote_move_target(&self.sftp, path, target_path)?;
+        if target == path {
+            bail!("remote target is the same as source");
+        }
+        if is_dir && remote_path_is_same_or_child(path, &target) {
+            bail!("cannot copy a directory into itself");
+        }
+        copy_remote_path(&self.sftp, Path::new(path), Path::new(&target), is_dir)
+            .with_context(|| format!("failed to copy {} to {}", path, target))?;
+        Ok(target)
+    }
+
     pub fn move_path(&self, path: &str, target_path: &str) -> Result<String> {
         let target = resolve_remote_move_target(&self.sftp, path, target_path)?;
         if target == path {
@@ -1226,6 +1239,15 @@ fn resolve_remote_child_path(
 
 fn remote_path_exists(sftp: &ssh2::Sftp, path: &Path) -> bool {
     sftp.lstat(path).is_ok()
+}
+
+fn remote_path_is_same_or_child(parent: &str, child: &str) -> bool {
+    let parent = parent.trim_end_matches('/');
+    let child = child.trim_end_matches('/');
+    if parent.is_empty() {
+        return child.is_empty() || child.starts_with('/');
+    }
+    child == parent || child.starts_with(&format!("{}/", parent))
 }
 
 fn resolve_remote_move_target(

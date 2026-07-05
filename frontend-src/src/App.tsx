@@ -134,6 +134,13 @@ import { pickTextFile } from "@/lib/browserFiles";
 import { cn } from "@/lib/utils";
 import { formatMode, resolvePermissionMode } from "./features/files/permissions";
 
+type FileDropTarget = {
+  side: FileSide;
+  profileId?: string;
+  targetPath?: string;
+  targetId?: string;
+};
+
 export default function App() {
   const fileWindowParams = useMemo(readFileManagerWindowParams, []);
   const isFileManagerWindow = fileWindowParams.isFileManagerWindow;
@@ -212,6 +219,7 @@ export default function App() {
   const serverStatusProfileIdRef = useRef<string | null>(null);
   const [hostKeyPrompt, setHostKeyPrompt] = useState<HostKeyPromptState | null>(null);
   const [dragOverSide, setDragOverSide] = useState<FileSide | null>(null);
+  const [dragOverDockTarget, setDragOverDockTarget] = useState<string | null>(null);
   const [profileSecrets, setProfileSecrets] = useState<Record<string, string>>({});
   const [profileSecretDrafts, setProfileSecretDrafts] = useState<Record<string, string>>({});
   const authPromptedTabsRef = useRef(new Set<string>());
@@ -732,14 +740,27 @@ export default function App() {
       const side: "local" | "remote" = profile && !isLocalProtocol(profile.protocol) ? "remote" : "local";
       const secret = profile ? profileSecrets[profile.id] || profile.password || "" : "";
       const height = fileDockHeightByTabId[tab.id] ?? 240;
+      const dropTargetId = `${tab.id}:${side}:${profile?.id ?? "local"}`;
+      const transferRecordCount = transfers.length + transferHistory.length;
+      const runningTransferCount = transfers.filter((transfer) => transfer.status === "running").length;
+      const uploadProfile =
+        activeProfile && !isLocalProtocol(activeProfile.protocol)
+          ? activeProfile
+          : profiles.find((item) => !isLocalProtocol(item.protocol)) ?? null;
+      const uploadSecret = uploadProfile ? profileSecrets[uploadProfile.id] || uploadProfile.password || "" : "";
 
       return (
         <TerminalFileDock
           key={`${tab.id}-${side}-${profile?.id ?? "local"}`}
           side={side}
+          profileId={profile?.id ?? null}
+          dropTargetId={dropTargetId}
           sessionLabel={profile?.name ?? tab.title}
           followPath={tab.currentDirectory ?? null}
           height={height}
+          dropActive={dragOverDockTarget === dropTargetId}
+          transferRecordCount={transferRecordCount}
+          runningTransferCount={runningTransferCount}
           onHeightChange={(nextHeight) => {
             setFileDockHeightByTabId((current) => ({ ...current, [tab.id]: nextHeight }));
           }}
@@ -757,13 +778,153 @@ export default function App() {
             if (side === "remote" && profile) void openRemoteEditorForProfile(profile, secret, entry);
             else void openLocalEditor(entry);
           }}
+          onDownloadEntries={
+            side === "remote" && profile
+              ? async (entries) => {
+                  if (entries.length === 0) return;
+                  const failures: string[] = [];
+                  let started = 0;
+                  for (const entry of entries) {
+                    try {
+                      await api.startTransfer(profile.id, "download", localPath || ".", entry.path, transferConflict, secret || undefined);
+                      started += 1;
+                    } catch (error) {
+                      failures.push(`${entry.name}: ${String(error)}`);
+                    }
+                  }
+                  if (started > 0) {
+                    busRef.current.emit("refreshTransfers", undefined);
+                    busRef.current.emit("toast", {
+                      tone: "success",
+                      text: started === 1 ? "下载已开始" : `${started} 个下载已开始`
+                    });
+                  }
+                  if (failures.length > 0) {
+                    const summary = failures.slice(0, 3).join("；");
+                    setStatus(`下载启动失败 ${failures.length} 个：${summary}${failures.length > 3 ? "..." : ""}`);
+                    pushToast("error", `下载启动失败 ${failures.length} 个项目`);
+                  }
+                }
+              : undefined
+          }
+          onUploadEntries={
+            side === "local" && uploadProfile
+              ? async (entries) => {
+                  if (entries.length === 0) return;
+                  const failures: string[] = [];
+                  let started = 0;
+                  for (const entry of entries) {
+                    try {
+                      await api.startTransfer(uploadProfile.id, "upload", entry.path, remotePath || ".", transferConflict, uploadSecret || undefined);
+                      started += 1;
+                    } catch (error) {
+                      failures.push(`${entry.name}: ${String(error)}`);
+                    }
+                  }
+                  if (started > 0) {
+                    busRef.current.emit("refreshTransfers", undefined);
+                    busRef.current.emit("toast", {
+                      tone: "success",
+                      text: started === 1 ? "上传已开始" : `${started} 个上传已开始`
+                    });
+                  }
+                  if (failures.length > 0) {
+                    const summary = failures.slice(0, 3).join("；");
+                    setStatus(`上传启动失败 ${failures.length} 个：${summary}${failures.length > 3 ? "..." : ""}`);
+                    pushToast("error", `上传启动失败 ${failures.length} 个项目`);
+                  }
+                }
+              : undefined
+          }
+          onRemoveEntries={async (entries) => {
+            if (entries.length === 0) return;
+            const confirmed = await confirmAction("删除确认", {
+              message:
+                entries.length === 1
+                  ? `确认删除 ${entries[0].name}？`
+                  : `确认删除选中的 ${entries.length} 个项目？`,
+              confirmLabel: "删除",
+              danger: true
+            });
+            if (!confirmed) return;
+
+            const failures: string[] = [];
+            let deleted = 0;
+            for (const entry of entries) {
+              try {
+                if (side === "remote" && profile) {
+                  await api.removeRemotePath(profile.id, entry.path, entry.isDir, entry.isDir, secret || undefined);
+                } else {
+                  await api.removeLocalPath(entry.path, entry.isDir);
+                }
+                deleted += 1;
+              } catch (error) {
+                failures.push(`${entry.name}: ${String(error)}`);
+              }
+            }
+            if (deleted > 0) {
+              pushToast("success", deleted === 1 ? "已删除" : `已删除 ${deleted} 个项目`);
+            }
+            if (failures.length > 0) {
+              const summary = failures.slice(0, 3).join("；");
+              setStatus(`删除失败 ${failures.length} 个：${summary}${failures.length > 3 ? "..." : ""}`);
+              pushToast("error", `删除失败 ${failures.length} 个项目`);
+              if (side === "remote" && profile && shouldPromptForPassword(profile, failures[0])) {
+                requestProfileSecret(profile, failures[0]);
+                pushToast("info", "请输入连接密码/口令");
+              }
+            }
+          }}
+          onTransferEntriesToDirectory={async (entries, targetPath, operation) => {
+            if (entries.length === 0) return;
+            const failures: string[] = [];
+            let completed = 0;
+            const verb = operation === "copy" ? "复制" : "移动";
+            for (const entry of entries) {
+              try {
+                if (side === "remote" && profile) {
+                  if (operation === "copy") {
+                    await api.copyRemotePath(profile.id, entry.path, targetPath, entry.isDir, secret || undefined);
+                  } else {
+                    await api.moveRemotePath(profile.id, entry.path, targetPath, secret || undefined);
+                  }
+                } else if (operation === "copy") {
+                  await api.copyLocalPath(entry.path, targetPath);
+                } else {
+                  await api.moveLocalPath(entry.path, targetPath);
+                }
+                completed += 1;
+              } catch (error) {
+                failures.push(`${entry.name}: ${String(error)}`);
+              }
+            }
+            if (completed > 0) {
+              pushToast("success", completed === 1 ? `已${verb}` : `已${verb} ${completed} 个项目`);
+            }
+            if (failures.length > 0) {
+              const summary = failures.slice(0, 3).join("；");
+              setStatus(`${verb}失败 ${failures.length} 个：${summary}${failures.length > 3 ? "..." : ""}`);
+              pushToast("error", `${verb}失败 ${failures.length} 个项目`);
+              if (side === "remote" && profile && shouldPromptForPassword(profile, failures[0])) {
+                requestProfileSecret(profile, failures[0]);
+                pushToast("info", "请输入连接密码/口令");
+              }
+            }
+          }}
+          onCopyText={(options) =>
+            copyWithFallback({
+              ...options,
+              onCopied: options.onCopied ?? (() => pushToast("success", "已复制"))
+            })
+          }
+          onOpenTransferQueue={() => setDialog("transfers")}
           onClose={() => {
             setFileDockOpenByTabId((current) => ({ ...current, [tab.id]: false }));
           }}
         />
       );
     },
-    [fileDockHeightByTabId, profileSecrets, profiles]
+    [activeProfile, confirmAction, copyWithFallback, dragOverDockTarget, fileDockHeightByTabId, localPath, profileSecrets, profiles, pushToast, remotePath, transferConflict, transferHistory.length, transfers]
   );
 
   const confirmActionRef = useRef(confirmAction);
@@ -2402,6 +2563,48 @@ export default function App() {
     [activeProfile, passwordForActive, pushToast, remoteHomeReady, remotePath, transferConflict]
   );
 
+  const uploadExternalPathsToTarget = useCallback(
+    async (profileId: string, targetRemotePath: string, paths: string[]) => {
+      const profile = profiles.find((item) => item.id === profileId) ?? null;
+      if (!profile || isLocalProtocol(profile.protocol)) {
+        pushToast("info", "请选择远程会话后再拖入上传");
+        return;
+      }
+      const uniquePaths = Array.from(new Set(paths.map((path) => path.trim()).filter(Boolean)));
+      if (uniquePaths.length === 0) return;
+      const password = profileSecrets[profile.id] || profileSecretDrafts[profile.id] || profile.password || undefined;
+
+      const failures: string[] = [];
+      let started = 0;
+      for (const path of uniquePaths) {
+        try {
+          await api.startTransfer(profile.id, "upload", path, targetRemotePath, transferConflict, password);
+          started += 1;
+        } catch (error) {
+          failures.push(`${pathBaseName(path) || path}: ${String(error)}`);
+        }
+      }
+
+      if (started > 0) {
+        busRef.current.emit("refreshTransfers", undefined);
+        busRef.current.emit("toast", {
+          tone: "success",
+          text: started === 1 ? "上传已开始" : `${started} 个上传已开始`
+        });
+      }
+      if (failures.length > 0) {
+        const summary = failures.slice(0, 3).join("；");
+        setStatus(`上传启动失败 ${failures.length} 个：${summary}${failures.length > 3 ? "..." : ""}`);
+        pushToast("error", `上传启动失败 ${failures.length} 个项目`);
+        if (shouldPromptForPassword(profile, failures[0])) {
+          requestProfileSecret(profile, failures[0]);
+          pushToast("info", "请输入连接密码/口令");
+        }
+      }
+    },
+    [profileSecretDrafts, profileSecrets, profiles, pushToast, transferConflict]
+  );
+
   const syncComparedEntries = async (direction: "upload" | "download", scope: "all" | "missing" = "all") => {
     if (!activeProfile || isLocalProtocol(activeProfile.protocol)) return;
     const entries =
@@ -2565,7 +2768,7 @@ export default function App() {
     }
   };
 
-  const filePaneSideAtPosition = useCallback((position: { x: number; y: number }): FileSide | null => {
+  const fileDropTargetAtPosition = useCallback((position: { x: number; y: number }): FileDropTarget | null => {
     const ratio = window.devicePixelRatio || 1;
     const candidates = [
       { x: position.x, y: position.y },
@@ -2576,7 +2779,14 @@ export default function App() {
       const element = document.elementFromPoint(point.x, point.y) as HTMLElement | null;
       const pane = element?.closest<HTMLElement>("[data-file-pane-side]");
       const side = pane?.dataset.filePaneSide;
-      if (side === "local" || side === "remote") return side;
+      if (pane && (side === "local" || side === "remote")) {
+        return {
+          side,
+          profileId: pane.dataset.fileDropProfileId,
+          targetPath: pane.dataset.fileDropTargetPath,
+          targetId: pane.dataset.fileDropTargetId
+        };
+      }
     }
     return null;
   }, []);
@@ -2591,23 +2801,34 @@ export default function App() {
         const payload = event.payload;
         if (payload.type === "leave") {
           setDragOverSide((current) => (current === "remote" ? null : current));
+          setDragOverDockTarget(null);
           return;
         }
 
-        const side = filePaneSideAtPosition(payload.position);
+        const target = fileDropTargetAtPosition(payload.position);
+        const side = target?.side ?? null;
+        const canDropToDock = Boolean(target?.side === "remote" && target.profileId && target.targetPath);
+        const canDropToBrowser = remoteBrowserReady && remoteHomeReady && (side === "remote" || (isFileManagerWindow && side !== "local"));
         if (payload.type === "enter" || payload.type === "over") {
-          if (remoteBrowserReady && remoteHomeReady && (side === "remote" || (isFileManagerWindow && side !== "local"))) {
-            setDragOverSide("remote");
+          if (canDropToDock || canDropToBrowser) {
+            setDragOverSide(target?.targetId ? null : "remote");
+            setDragOverDockTarget(target?.targetId ?? null);
           } else {
             setDragOverSide((current) => (current === "remote" ? null : current));
+            setDragOverDockTarget(null);
           }
           return;
         }
 
         if (payload.type === "drop") {
           setDragOverSide((current) => (current === "remote" ? null : current));
+          setDragOverDockTarget(null);
           if (side === "local") {
             pushToast("info", "请拖放到远程面板上传");
+            return;
+          }
+          if (target?.profileId && target.targetPath) {
+            void uploadExternalPathsToTarget(target.profileId, target.targetPath, payload.paths);
             return;
           }
           if (side !== "remote" && !isFileManagerWindow) {
@@ -2631,7 +2852,7 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [filePaneSideAtPosition, isFileManagerWindow, pushToast, remoteBrowserReady, remoteHomeReady, uploadExternalPaths]);
+  }, [fileDropTargetAtPosition, isFileManagerWindow, pushToast, remoteBrowserReady, remoteHomeReady, uploadExternalPaths, uploadExternalPathsToTarget]);
 
   const beginFileDrag = (side: FileSide, file: FileEntry, event: DragEvent<HTMLButtonElement>) => {
     const selectedPaths = side === "local" ? selectedLocalPaths : selectedRemotePaths;

@@ -197,6 +197,19 @@ pub fn local_duplicate(path: &str, new_name: &str) -> std::io::Result<String> {
         .parent()
         .map(|parent| parent.join(new_name))
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "无法确定父目录"))?;
+    let metadata = fs::symlink_metadata(&source)?;
+    if metadata.is_dir() {
+        let source_abs = fs::canonicalize(&source)?;
+        if let Some(parent) = target.parent() {
+            let target_parent_abs = fs::canonicalize(parent)?;
+            if target_parent_abs.starts_with(&source_abs) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "不能复制目录到自身内部",
+                ));
+            }
+        }
+    }
     if local_path_exists(&target) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -204,7 +217,52 @@ pub fn local_duplicate(path: &str, new_name: &str) -> std::io::Result<String> {
         ));
     }
 
+    if metadata.file_type().is_symlink() {
+        copy_local_symlink(&source, &target)?;
+    } else if metadata.is_dir() {
+        copy_dir_recursive(&source, &target)?;
+    } else {
+        fs::copy(&source, &target)?;
+        preserve_local_metadata(&target, &metadata)?;
+    }
+    Ok(target.display().to_string())
+}
+
+pub fn local_copy(path: &str, target_path: &str) -> std::io::Result<String> {
+    let source = PathBuf::from(path);
+    let mut target = PathBuf::from(target_path);
+    if target.is_dir() {
+        let file_name = source.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "无法确定文件名")
+        })?;
+        target = target.join(file_name);
+    }
+    if source == target {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "目标与源相同",
+        ));
+    }
     let metadata = fs::symlink_metadata(&source)?;
+    if metadata.is_dir() {
+        let source_abs = fs::canonicalize(&source)?;
+        if let Some(parent) = target.parent() {
+            let target_parent_abs = fs::canonicalize(parent)?;
+            if target_parent_abs.starts_with(&source_abs) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "不能复制目录到自身内部",
+                ));
+            }
+        }
+    }
+    if local_path_exists(&target) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "目标已存在",
+        ));
+    }
+
     if metadata.file_type().is_symlink() {
         copy_local_symlink(&source, &target)?;
     } else if metadata.is_dir() {

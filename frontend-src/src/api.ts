@@ -261,6 +261,8 @@ export const api = {
     invoke<void>("remove_local_path", { request: { path, isDir } }),
   duplicateLocalPath: (path: string, newName: string) =>
     invoke<string>("duplicate_local_path", { request: { path, newName } }),
+  copyLocalPath: (path: string, targetPath: string) =>
+    invoke<string>("copy_local_path", { request: { path, targetPath } }),
   moveLocalPath: (path: string, targetPath: string) =>
     invoke<string>("move_local_path", { request: { path, targetPath } }),
   touchLocalPath: (path: string, mtime: number, recursive: boolean) =>
@@ -314,6 +316,10 @@ export const api = {
   ) =>
     invoke<string>("duplicate_remote_path", {
       request: { profileId, path, isDir, newName, password: password || null }
+    }),
+  copyRemotePath: (profileId: string, path: string, targetPath: string, isDir: boolean, password?: string | null) =>
+    invoke<string>("copy_remote_path", {
+      request: { profileId, path, targetPath, isDir, password: password || null }
     }),
   moveRemotePath: (profileId: string, path: string, targetPath: string, password?: string | null) =>
     invoke<string>("move_remote_path", {

@@ -1,4 +1,4 @@
-import { ArrowUp, ChevronDown, ChevronRight, Folder, FolderOpen, RefreshCcw, X } from "lucide-react";
+import { ArrowUp, ChevronDown, ChevronRight, Copy, Download, Folder, FolderOpen, ListChecks, ListX, RefreshCcw, Trash2, Upload, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 
 import type { FileEntry } from "@/api";
@@ -18,6 +18,14 @@ import type { FileSort } from "@/features/files/filePaneTypes";
 import { cn } from "@/lib/utils";
 
 type DockSide = "local" | "remote";
+type TreeDropOperation = "move" | "copy";
+type DockTransferEntry = Pick<FileEntry, "path" | "name" | "isDir">;
+type DockDragPayload = {
+  source: "terminal-file-dock";
+  side: DockSide;
+  profileId: string | null;
+  entries: DockTransferEntry[];
+};
 
 type DockNode = {
   path: string;
@@ -30,15 +38,28 @@ type DockNode = {
 
 type TerminalFileDockProps = {
   side: DockSide;
+  profileId?: string | null;
+  dropTargetId?: string;
   sessionLabel: string;
   followPath: string | null;
   height: number;
+  dropActive?: boolean;
+  transferRecordCount?: number;
+  runningTransferCount?: number;
   onHeightChange: (height: number) => void;
   listDir: (path: string) => Promise<FileEntry[]>;
   resolveHome: () => Promise<string>;
   onOpenFile: (entry: FileEntry) => void;
+  onDownloadEntries?: (entries: FileEntry[], remotePath: string) => void | Promise<void>;
+  onUploadEntries?: (entries: FileEntry[], remotePath: string) => void | Promise<void>;
+  onRemoveEntries?: (entries: FileEntry[], currentPath: string) => void | Promise<void>;
+  onTransferEntriesToDirectory?: (entries: DockTransferEntry[], targetPath: string, operation: TreeDropOperation) => void | Promise<void>;
+  onCopyText?: (options: { title: string; text: string; onCopied?: () => void }) => Promise<boolean>;
+  onOpenTransferQueue?: () => void;
   onClose: () => void;
 };
+
+const DOCK_DRAG_TYPE = "application/x-rustshell-terminal-file-drag";
 
 function isRemoteSide(side: DockSide) {
   return side === "remote";
@@ -95,6 +116,50 @@ function sameDockPath(side: DockSide, left: string, right: string): boolean {
   return isRemoteSide(side)
     ? normalizedLeft === normalizedRight
     : normalizedLeft.toLowerCase() === normalizedRight.toLowerCase();
+}
+
+function isSameOrChildDockPath(side: DockSide, parent: string, child: string): boolean {
+  const normalizedParent = normalizeDockPath(side, parent);
+  const normalizedChild = normalizeDockPath(side, child);
+  if (!normalizedParent || !normalizedChild) return false;
+  if (sameDockPath(side, normalizedParent, normalizedChild)) return true;
+  if (isRemoteSide(side)) {
+    if (normalizedParent === "/") return normalizedChild.startsWith("/");
+    return normalizedChild.startsWith(`${normalizedParent}/`);
+  }
+  const parentKey = normalizedParent.toLowerCase();
+  const childKey = normalizedChild.toLowerCase();
+  return childKey.startsWith(parentKey.endsWith("\\") ? parentKey : `${parentKey}\\`);
+}
+
+function canDropEntriesOnDirectory(side: DockSide, entries: DockTransferEntry[], targetPath: string): boolean {
+  return !entries.some((entry) => {
+    const sourceParent = parentPath(side, entry.path);
+    if (sourceParent && sameDockPath(side, sourceParent, targetPath)) return true;
+    if (sameDockPath(side, entry.path, targetPath)) return true;
+    return entry.isDir && isSameOrChildDockPath(side, entry.path, targetPath);
+  });
+}
+
+function readDockDragPayload(dataTransfer: DataTransfer): DockDragPayload | null {
+  const raw = dataTransfer.getData(DOCK_DRAG_TYPE);
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as DockDragPayload;
+    if (value.source !== "terminal-file-dock") return null;
+    if (value.side !== "local" && value.side !== "remote") return null;
+    if (!Array.isArray(value.entries) || value.entries.length === 0) return null;
+    const entries = value.entries.filter(
+      (entry): entry is DockTransferEntry =>
+        typeof entry?.path === "string" &&
+        typeof entry.name === "string" &&
+        typeof entry.isDir === "boolean"
+    );
+    if (entries.length === 0) return null;
+    return { source: "terminal-file-dock", side: value.side, profileId: value.profileId ?? null, entries };
+  } catch {
+    return null;
+  }
 }
 
 function pathChain(side: DockSide, targetPath: string): Array<Pick<DockNode, "path" | "name">> {
@@ -207,13 +272,24 @@ function mergeLoadedChildren(
 
 export function TerminalFileDock({
   side,
+  profileId,
+  dropTargetId,
   sessionLabel,
   followPath,
   height,
+  dropActive = false,
+  transferRecordCount = 0,
+  runningTransferCount = 0,
   onHeightChange,
   listDir,
   resolveHome,
   onOpenFile,
+  onDownloadEntries,
+  onUploadEntries,
+  onRemoveEntries,
+  onTransferEntriesToDirectory,
+  onCopyText,
+  onOpenTransferQueue,
   onClose
 }: TerminalFileDockProps) {
   const [path, setPath] = useState<string>("");
@@ -225,8 +301,10 @@ export function TerminalFileDock({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [tree, setTree] = useState<DockNode | null>(null);
+  const [treeDropPath, setTreeDropPath] = useState<string | null>(null);
   const requestSeq = useRef(0);
   const followedRef = useRef<string | null>(null);
+  const dockDragRef = useRef<DockDragPayload | null>(null);
 
   const hydrateTreeAroundPath = useCallback(
     async (target: string, targetEntries: FileEntry[], seq: number) => {
@@ -309,6 +387,8 @@ export function TerminalFileDock({
   }, [followPath, navigate, path, side]);
 
   const sortedEntries = useMemo(() => sortFiles(entries, sort), [entries, sort]);
+  const selectedPathSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
+  const selectedEntries = useMemo(() => sortedEntries.filter((entry) => selectedPathSet.has(entry.path)), [selectedPathSet, sortedEntries]);
 
   const openEntry = useCallback(
     (entry: FileEntry) => {
@@ -318,25 +398,120 @@ export function TerminalFileDock({
     [navigate, onOpenFile]
   );
 
-  const contextActions = useMemo<FileAction[]>(
-    () => [
-      {
-        label: "打开",
-        icon: <FolderOpen size={14} />,
-        disabled: !selected,
-        onClick: () => {
-          if (selected) openEntry(selected);
-        }
-      },
-      {
-        label: "刷新",
-        icon: <RefreshCcw size={14} />,
-        onClick: () => {
-          if (path) void navigate(path);
-        }
+  const copyDockText = useCallback(
+    async (title: string, text: string) => {
+      if (!text) return;
+      if (onCopyText) {
+        await onCopyText({ title, text });
+        return;
       }
-    ],
-    [navigate, openEntry, path, selected]
+      await navigator.clipboard?.writeText(text).catch(() => undefined);
+    },
+    [onCopyText]
+  );
+
+  const removeSelectedEntries = useCallback(async () => {
+    if (!onRemoveEntries || selectedEntries.length === 0) return;
+    await onRemoveEntries(selectedEntries, path);
+    if (path) void navigate(path);
+  }, [navigate, onRemoveEntries, path, selectedEntries]);
+
+  const dragPayloadFromEvent = useCallback(
+    (event: DragEvent<HTMLElement>) => {
+      const payload = dockDragRef.current ?? readDockDragPayload(event.dataTransfer);
+      if (!payload || payload.side !== side) return null;
+      if (side === "remote" && payload.profileId !== (profileId ?? null)) return null;
+      return payload;
+    },
+    [profileId, side]
+  );
+
+  const contextActions = useMemo<FileAction[]>(
+    () => {
+      const hasSelection = selectedEntries.length > 0;
+      return [
+        {
+          label: "打开",
+          icon: <FolderOpen size={14} />,
+          disabled: !selected,
+          onClick: () => {
+            if (selected) openEntry(selected);
+          }
+        },
+        side === "remote"
+          ? {
+              label: "下载到本地",
+              icon: <Download size={14} />,
+              disabled: !onDownloadEntries || !hasSelection,
+              onClick: () => {
+                if (onDownloadEntries) void onDownloadEntries(selectedEntries, path);
+              }
+            }
+          : {
+              label: "上传到远程",
+              icon: <Upload size={14} />,
+              disabled: !onUploadEntries || !hasSelection,
+              onClick: () => {
+                if (onUploadEntries) void onUploadEntries(selectedEntries, path);
+              }
+            },
+        { type: "separator" },
+        {
+          label: "删除",
+          icon: <Trash2 size={14} />,
+          disabled: !onRemoveEntries || !hasSelection,
+          danger: true,
+          onClick: () => {
+            void removeSelectedEntries();
+          }
+        },
+        { type: "separator" },
+        {
+          label: "复制路径",
+          icon: <Copy size={14} />,
+          disabled: !hasSelection,
+          onClick: () => {
+            void copyDockText("复制路径", selectedEntries.map((entry) => entry.path).join("\n"));
+          }
+        },
+        {
+          label: "复制名称",
+          icon: <Copy size={14} />,
+          disabled: !hasSelection,
+          onClick: () => {
+            void copyDockText("复制名称", selectedEntries.map((entry) => entry.name).join("\n"));
+          }
+        },
+        { type: "separator" },
+        {
+          label: "全选",
+          icon: <ListChecks size={14} />,
+          disabled: sortedEntries.length === 0,
+          onClick: () => {
+            setSelected(sortedEntries[0] ?? null);
+            setSelectedPaths(sortedEntries.map((entry) => entry.path));
+          }
+        },
+        {
+          label: "清空选择",
+          icon: <ListX size={14} />,
+          disabled: !hasSelection,
+          onClick: () => {
+            setSelected(null);
+            setSelectedPaths([]);
+          }
+        },
+        { type: "separator" },
+        {
+          label: "刷新",
+          icon: <RefreshCcw size={14} />,
+          onClick: () => {
+            if (path) void navigate(path);
+          }
+        }
+      ];
+    },
+    [copyDockText, navigate, onDownloadEntries, onRemoveEntries, onUploadEntries, openEntry, path, removeSelectedEntries, selected, selectedEntries, side, sortedEntries]
   );
 
   const loadNodeChildren = useCallback(
@@ -410,12 +585,21 @@ export function TerminalFileDock({
   };
 
   const handleFileDragStart = (entry: FileEntry, event: DragEvent<HTMLButtonElement>) => {
-    event.dataTransfer.effectAllowed = "copy";
-    event.dataTransfer.setData("text/plain", entry.path);
-    event.dataTransfer.setData(
-      "application/x-rustshell-file-entry",
-      JSON.stringify({ side, path: entry.path, name: entry.name, isDir: entry.isDir })
-    );
+    const entries = selectedPathSet.has(entry.path) && selectedEntries.length > 0 ? selectedEntries : [entry];
+    if (!selectedPathSet.has(entry.path)) {
+      setSelected(entry);
+      setSelectedPaths([entry.path]);
+    }
+    const payload: DockDragPayload = {
+      source: "terminal-file-dock",
+      side,
+      profileId: profileId ?? null,
+      entries: entries.map((item) => ({ path: item.path, name: item.name, isDir: item.isDir }))
+    };
+    dockDragRef.current = payload;
+    event.dataTransfer.effectAllowed = "copyMove";
+    event.dataTransfer.setData("text/plain", entries.map((item) => item.path).join("\n"));
+    event.dataTransfer.setData(DOCK_DRAG_TYPE, JSON.stringify(payload));
   };
 
   const prepareContextMenu = (_event: MouseEvent, entry?: FileEntry, alreadySelected = false) => {
@@ -425,17 +609,57 @@ export function TerminalFileDock({
     }
   };
 
+  const handleTreeNodeDragOver = (node: DockNode, event: DragEvent<HTMLButtonElement>) => {
+    const payload = dragPayloadFromEvent(event);
+    if (!payload || !onTransferEntriesToDirectory || !canDropEntriesOnDirectory(side, payload.entries, node.path)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = event.ctrlKey ? "copy" : "move";
+    setTreeDropPath(node.path);
+  };
+
+  const handleTreeNodeDragLeave = (node: DockNode, event: DragEvent<HTMLButtonElement>) => {
+    const nextTarget = event.relatedTarget as Node | null;
+    if (nextTarget && event.currentTarget.contains(nextTarget)) return;
+    setTreeDropPath((current) => (current && sameDockPath(side, current, node.path) ? null : current));
+  };
+
+  const handleTreeNodeDrop = async (node: DockNode, event: DragEvent<HTMLButtonElement>) => {
+    const payload = dragPayloadFromEvent(event);
+    setTreeDropPath(null);
+    if (!payload || !onTransferEntriesToDirectory || !canDropEntriesOnDirectory(side, payload.entries, node.path)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    await onTransferEntriesToDirectory(payload.entries, node.path, event.ctrlKey ? "copy" : "move");
+    if (path) void navigate(path);
+    void loadNodeChildren(node);
+  };
+
   const renderNode = (node: DockNode, depth: number) => (
     <div key={node.path}>
       <button
         type="button"
+        data-file-pane-side={side}
+        data-file-drop-target-id={dropTargetId}
+        data-file-drop-profile-id={side === "remote" ? profileId || undefined : undefined}
+        data-file-drop-target-path={side === "remote" ? node.path : undefined}
         className={cn(
           "flex h-6 w-full min-w-0 items-center gap-1 rounded-sm px-1 text-left text-xs hover:bg-accent",
-          sameDockPath(side, path, node.path) && "bg-accent text-foreground"
+          sameDockPath(side, path, node.path) && "bg-accent text-foreground",
+          treeDropPath && sameDockPath(side, treeDropPath, node.path) && "bg-primary/10 text-primary ring-1 ring-primary/40"
         )}
         style={{ paddingLeft: `${4 + depth * 12}px` }}
         title={node.path}
         onClick={() => void navigate(node.path)}
+        onDragOver={(event) => handleTreeNodeDragOver(node, event)}
+        onDragLeave={(event) => handleTreeNodeDragLeave(node, event)}
+        onDrop={(event) => {
+          void handleTreeNodeDrop(node, event);
+        }}
       >
         <span
           className="grid size-4 flex-none place-items-center rounded-sm hover:bg-border"
@@ -460,7 +684,18 @@ export function TerminalFileDock({
   );
 
   return (
-    <section data-terminal-file-dock className="relative flex min-h-0 flex-col overflow-hidden border-t bg-background" style={{ height }}>
+    <section
+      data-terminal-file-dock
+      data-file-pane-side={side}
+      data-file-drop-target-id={dropTargetId}
+      data-file-drop-profile-id={side === "remote" ? profileId || undefined : undefined}
+      data-file-drop-target-path={side === "remote" ? path || undefined : undefined}
+      className={cn(
+        "relative flex min-h-0 flex-col overflow-hidden border-t bg-background",
+        dropActive && side === "remote" && "outline-dashed outline-1 outline-offset-[-2px] outline-primary/60"
+      )}
+      style={{ height }}
+    >
       <div
         className="absolute inset-x-0 -top-px z-20 flex h-2 cursor-row-resize items-center justify-center hover:bg-ring/20"
         title="拖拽调整文件区高度"
@@ -487,6 +722,24 @@ export function TerminalFileDock({
           }}
         />
         <IconButton className="h-6 w-6 min-w-6 p-0" title="刷新" icon={<RefreshCcw size={13} />} onClick={() => path && void navigate(path)} />
+        <IconButton
+          className={cn(
+            "h-6 min-w-6 p-0",
+            transferRecordCount > 0 && "w-auto px-1.5",
+            runningTransferCount > 0 && "border-primary/50 text-primary"
+          )}
+          title={
+            runningTransferCount > 0
+              ? `传输记录：${runningTransferCount} 个运行中 / ${transferRecordCount} 条记录`
+              : `传输记录：${transferRecordCount} 条`
+          }
+          label={transferRecordCount > 0 ? String(transferRecordCount) : undefined}
+          icon={<ListChecks size={13} />}
+          onClick={() => {
+            onOpenTransferQueue?.();
+          }}
+          disabled={!onOpenTransferQueue}
+        />
         <IconButton className="h-6 w-6 min-w-6 p-0" title="关闭文件区" icon={<X size={13} />} onClick={onClose} />
       </div>
       <div className="grid min-h-0 flex-1 grid-cols-[200px_minmax(0,1fr)] overflow-hidden">
@@ -508,13 +761,18 @@ export function TerminalFileDock({
                 onSort={(key) => setSort((current) => nextFileSort(current, key))}
                 onOpen={openEntry}
                 onDragStart={handleFileDragStart}
-                onDragEnd={() => undefined}
+                onDragEnd={() => {
+                  dockDragRef.current = null;
+                  setTreeDropPath(null);
+                }}
                 onSelectAll={() => setSelectedPaths(sortedEntries.map((entry) => entry.path))}
                 onClearSelection={() => {
                   setSelected(null);
                   setSelectedPaths([]);
                 }}
-                onRemove={() => undefined}
+                onRemove={() => {
+                  void removeSelectedEntries();
+                }}
                 onRename={() => undefined}
                 onContextMenu={prepareContextMenu}
                 contextActions={contextActions}
@@ -533,6 +791,11 @@ export function TerminalFileDock({
               {!loading && sortedEntries.length === 0 && (
                 <div className="pointer-events-none absolute inset-0 grid place-items-center text-xs text-muted-foreground">
                   空目录
+                </div>
+              )}
+              {dropActive && side === "remote" && (
+                <div className="pointer-events-none absolute inset-2 z-10 flex items-center justify-center rounded-md border border-dashed border-primary/60 bg-background/85 text-[13px] text-foreground shadow-sm">
+                  拖放到此远程目录上传
                 </div>
               )}
             </>

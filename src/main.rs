@@ -9,7 +9,7 @@ use crate::{
         settings::AppSettings,
         sftp::{
             list_local_dir as read_local_dir, local_chmod as chmod_local_path_impl,
-            local_create_file as create_local_file_impl,
+            local_copy as copy_local_path_impl, local_create_file as create_local_file_impl,
             local_create_symlink as create_local_symlink_impl,
             local_duplicate as duplicate_local_path_impl,
             local_file_sha256 as local_file_sha256_impl, local_home as read_local_home,
@@ -201,6 +201,16 @@ struct RemoteDuplicateRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RemoteCopyRequest {
+    profile_id: String,
+    path: String,
+    target_path: String,
+    is_dir: bool,
+    password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RemoteMoveRequest {
     profile_id: String,
     path: String,
@@ -334,6 +344,13 @@ struct LocalRemoveRequest {
 struct LocalDuplicateRequest {
     path: String,
     new_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalCopyRequest {
+    path: String,
+    target_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -917,6 +934,11 @@ fn duplicate_local_path(request: LocalDuplicateRequest) -> Result<String, String
 }
 
 #[tauri::command]
+fn copy_local_path(request: LocalCopyRequest) -> Result<String, String> {
+    copy_local_path_impl(&request.path, &request.target_path).map_err(to_string)
+}
+
+#[tauri::command]
 fn move_local_path(request: LocalMoveRequest) -> Result<String, String> {
     move_local_path_impl(&request.path, &request.target_path).map_err(to_string)
 }
@@ -1118,6 +1140,18 @@ fn duplicate_remote_path(
     let password = resolve_password(&profile, request.password.as_deref(), &state)?;
     with_sftp(&profile, password.as_deref(), &state, |connection| {
         connection.duplicate_path(&request.path, request.is_dir, &request.new_name)
+    })
+}
+
+#[tauri::command]
+fn copy_remote_path(
+    request: RemoteCopyRequest,
+    state: State<'_, AppRuntime>,
+) -> Result<String, String> {
+    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
+    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
+    with_sftp(&profile, password.as_deref(), &state, |connection| {
+        connection.copy_path(&request.path, &request.target_path, request.is_dir)
     })
 }
 
@@ -1675,6 +1709,7 @@ fn main() {
             create_local_symlink,
             remove_local_path,
             duplicate_local_path,
+            copy_local_path,
             move_local_path,
             touch_local_path,
             chmod_local_path,
@@ -1693,6 +1728,7 @@ fn main() {
             remove_remote_path,
             rename_remote_path,
             duplicate_remote_path,
+            copy_remote_path,
             move_remote_path,
             chmod_remote_path,
             chown_remote_path,
