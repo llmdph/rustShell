@@ -48,7 +48,7 @@ use tauri::{
     menu::MenuBuilder,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::PageLoadEvent,
-    AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use uuid::Uuid;
 
@@ -60,6 +60,7 @@ struct AppRuntime {
     password_cache: Mutex<HashMap<Uuid, String>>,
     settings: Mutex<AppSettings>,
     transfers: Mutex<HashMap<Uuid, TransferTask>>,
+    allow_main_close: AtomicBool,
 }
 
 const TRANSFER_HISTORY_LIMIT: usize = 200;
@@ -1503,6 +1504,20 @@ fn clear_transfer_history() -> Result<Vec<TransferView>, String> {
 }
 
 #[tauri::command]
+fn exit_main_window(app: AppHandle, state: State<'_, AppRuntime>) -> Result<(), String> {
+    state.allow_main_close.store(true, Ordering::SeqCst);
+    if let Some(window) = app.get_webview_window("main") {
+        if let Err(error) = window.destroy() {
+            state.allow_main_close.store(false, Ordering::SeqCst);
+            return Err(to_string(error));
+        }
+    } else {
+        app.exit(0);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn open_file_manager_window(
     profile_id: Option<String>,
     app: AppHandle,
@@ -1563,6 +1578,7 @@ fn main() {
         password_cache: Mutex::new(HashMap::new()),
         settings: Mutex::new(settings),
         transfers: Mutex::new(HashMap::new()),
+        allow_main_close: AtomicBool::new(false),
     };
 
     tauri::Builder::default()
@@ -1606,8 +1622,22 @@ fn main() {
                 return;
             }
             if let WindowEvent::CloseRequested { api, .. } = event {
+                let state = window.state::<AppRuntime>();
+                if state.allow_main_close.load(Ordering::SeqCst) {
+                    return;
+                }
                 api.prevent_close();
-                let _ = window.hide();
+                let should_confirm = lock(&state.settings)
+                    .map(|settings| settings.confirm_on_exit)
+                    .unwrap_or(true);
+                if should_confirm {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    let _ = window.emit("rustshell://request-exit-confirm", ());
+                } else {
+                    let _ = window.hide();
+                }
             }
         })
         .manage(runtime)
@@ -1627,6 +1657,7 @@ fn main() {
             duplicate_terminal,
             load_settings,
             save_settings,
+            exit_main_window,
             trust_host_key,
             load_known_hosts,
             save_known_hosts,

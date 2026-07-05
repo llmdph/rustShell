@@ -2,6 +2,7 @@ target/
 node_modules/
 dist/
 release/
+.codex-run/
 
 *.pdb
 *.log

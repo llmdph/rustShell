@@ -229,6 +229,7 @@ export const api = {
   terminalResize: (terminalId: string, cols: number, rows: number) =>
     invoke<void>("terminal_resize", { request: { terminalId, cols, rows } }),
   closeTerminal: (terminalId: string) => invoke<void>("close_terminal", { terminalId }),
+  exitMainWindow: () => invoke<void>("exit_main_window"),
   loadSettings: () => invoke<AppSettings>("load_settings"),
   saveSettings: (settings: AppSettings) => invoke<AppSettings>("save_settings", { settings }),
   trustHostKey: (issue: HostKeyIssue) =>

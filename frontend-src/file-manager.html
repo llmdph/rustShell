@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" class="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -11,17 +11,17 @@
         z-index: 2147483647;
         display: grid;
         place-items: center;
-        background: #05070b;
-        color: #dfe7f2;
+        background: #0a0a0a;
+        color: #e5e5e5;
         font: 13px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
       }
 
       #file-manager-boot .boot-panel {
         width: min(360px, calc(100vw - 48px));
         padding: 18px 20px;
-        border: 1px solid rgba(148, 163, 184, 0.26);
-        border-radius: 8px;
-        background: #0d121b;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 10px;
+        background: #171717;
         box-shadow: 0 18px 48px rgba(0, 0, 0, 0.36);
       }
 
@@ -49,7 +49,7 @@
         boot.innerHTML =
           '<div class="boot-panel"><div class="boot-title">' +
           String(title || "文件管理器启动失败") +
-          '</div><div>前端入口已经加载，但渲染时遇到错误。</div><pre>' +
+          "</div><div>前端入口已经加载，但渲染时遇到错误。</div><pre>" +
           String(detail || "").replace(/[&<>"']/g, function (char) {
             return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char];
           }) +
@@ -62,7 +62,10 @@
         );
       });
       window.addEventListener("unhandledrejection", function (event) {
-        window.__RUSTSHELL_REPORT_BOOT_ERROR__("文件管理器异步错误", event.reason && (event.reason.stack || event.reason.message || event.reason));
+        window.__RUSTSHELL_REPORT_BOOT_ERROR__(
+          "文件管理器异步错误",
+          event.reason && (event.reason.stack || event.reason.message || event.reason)
+        );
       });
     </script>
   </head>
@@ -74,6 +77,6 @@
         <div>正在加载 RustShell 文件管理器...</div>
       </div>
     </div>
-    <script type="module" src="/src/main.tsx"></script>
+    <script type="module" src="/src/file-manager-main.tsx"></script>
   </body>
 </html>
