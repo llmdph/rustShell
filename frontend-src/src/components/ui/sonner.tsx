@@ -1,5 +1,6 @@
 import { useEffect, useState, type CSSProperties } from "react"
 import { Toaster as Sonner, type ToasterProps } from "sonner"
+import "sonner/dist/styles.css"
 
 function Toaster({ ...props }: ToasterProps) {
   const [theme, setTheme] = useState<"light" | "dark">(
