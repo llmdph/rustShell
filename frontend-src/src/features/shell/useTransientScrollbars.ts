@@ -6,8 +6,7 @@ export function useTransientScrollbars() {
     const scrollKeys = new Set(["PageUp", "PageDown", "Home", "End", " "]);
     const scrollContainerSelector = [
       ".transfer-list-body",
-      "[data-scroll-container]",
-      ".xterm-viewport"
+      "[data-scroll-container]"
     ].join(",");
     const isScrollable = (element: HTMLElement) => {
       const style = window.getComputedStyle(element);
@@ -23,10 +22,7 @@ export function useTransientScrollbars() {
     const findScrollContainer = (target: EventTarget | null) => {
       if (!(target instanceof Node)) return null;
       let element = target instanceof HTMLElement ? target : target.parentElement;
-      const terminalViewport = element?.closest(".xterm")?.querySelector<HTMLElement>(".xterm-viewport");
-      if (terminalViewport) {
-        return terminalViewport;
-      }
+      if (element?.closest("[data-xterm-host], .xterm")) return null;
       const knownContainer = element?.closest<HTMLElement>(scrollContainerSelector);
       if (knownContainer) {
         return knownContainer;

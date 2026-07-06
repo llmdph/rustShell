@@ -43,6 +43,11 @@ function xtermTheme(theme: AppSettings["theme"], backgroundAlpha = 100) {
   };
 }
 
+const HIDDEN_DRAIN_DELAY = 250;
+const VISIBLE_DRAIN_WARM_IDLE_DELAY = 32;
+const VISIBLE_DRAIN_IDLE_DELAY = 80;
+const VISIBLE_DRAIN_COLD_IDLE_DELAY = 160;
+
 export function XtermView({ terminal, settings, active, visible, paneStyle, terminalBackgroundAlpha, onActivate, onDrain, onReplayConsumed }: XtermViewProps) {
   const shown = visible ?? active;
   const terminalBackground = xtermTheme(settings.theme, terminalBackgroundAlpha).background;
@@ -319,16 +324,25 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     let stopped = false;
     let timer = 0;
     const fast = shown;
+    let idleRounds = 0;
     let lastStatus = terminal.status;
     let lastError = terminal.lastError ?? "";
     let lastHostKey = terminal.hostKeyIssue?.fingerprint ?? "";
     let lastDirectory = terminal.currentDirectory ?? "";
 
+    const idleDelay = () => {
+      if (!fast) return HIDDEN_DRAIN_DELAY;
+      if (idleRounds < 4) return VISIBLE_DRAIN_WARM_IDLE_DELAY;
+      if (idleRounds < 20) return VISIBLE_DRAIN_IDLE_DELAY;
+      return VISIBLE_DRAIN_COLD_IDLE_DELAY;
+    };
+
     const drainLoop = async () => {
-      let nextDelay = fast ? 12 : 250;
+      let nextDelay = idleDelay();
       try {
         const drain = await api.terminalDrain(terminal.id);
-        if (drain.output) {
+        const hasOutput = Boolean(drain.output);
+        if (hasOutput) {
           if (fast) {
             scheduleDrainWrite(drain.output);
           } else {
@@ -343,16 +357,19 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
           nextError !== lastError ||
           nextHostKey !== lastHostKey ||
           nextDirectory !== lastDirectory;
-        if (drain.output) {
-          nextDelay = fast ? 0 : 250;
-        }
         if (metadataChanged) {
-          nextDelay = fast ? 0 : 250;
           lastStatus = drain.status;
           lastError = nextError;
           lastHostKey = nextHostKey;
           lastDirectory = nextDirectory;
           onDrainRef.current(drain);
+        }
+        if (hasOutput || metadataChanged) {
+          idleRounds = 0;
+          nextDelay = fast && hasOutput ? 0 : idleDelay();
+        } else {
+          idleRounds += 1;
+          nextDelay = idleDelay();
         }
       } catch {
         stopped = true;
