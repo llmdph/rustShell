@@ -345,7 +345,6 @@
 /* ---------- Optional global background (user setting, localStorage) ---------- */
 [data-app-bg] .app-surface {
   background-color: color-mix(in srgb, var(--card) calc(var(--app-surface-alpha, 86) * 1%), transparent) !important;
-  backdrop-filter: blur(12px);
 }
 
 [data-app-bg] [data-workspace-layout] {
@@ -362,7 +361,6 @@
 
 [data-app-bg] [data-terminal-tabs] {
   background-color: color-mix(in srgb, var(--muted) 72%, transparent) !important;
-  backdrop-filter: blur(10px);
 }
 
 [data-app-bg] [data-terminal-tabs] [role="tab"][aria-selected="true"] {
@@ -372,7 +370,6 @@
 [data-app-bg] [data-terminal-tools],
 [data-app-bg] [data-file-list-root] {
   background-color: color-mix(in srgb, var(--card) calc(var(--app-surface-alpha, 86) * 1%), transparent) !important;
-  backdrop-filter: blur(10px);
 }
 
 [data-app-bg] [data-file-list-root] > div:first-child {

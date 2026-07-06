@@ -69,6 +69,8 @@ const SFTP_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SFTP_MAX_SESSIONS: usize = 4;
 const APP_ICON_RGBA: &[u8] = include_bytes!("../icons/rustshell-app-icon-64.rgba");
 const APP_ICON_SIZE: u32 = 64;
+const WEBVIEW2_BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy";
 
 fn rustshell_window_icon() -> tauri::image::Image<'static> {
     tauri::image::Image::new(APP_ICON_RGBA, APP_ICON_SIZE, APP_ICON_SIZE)
@@ -1579,6 +1581,7 @@ async fn open_file_manager_window(
         .resizable(true)
         .decorations(false)
         .transparent(false)
+        .additional_browser_args(WEBVIEW2_BROWSER_ARGS)
         .on_page_load(|_, payload| {
             let event = match payload.event() {
                 PageLoadEvent::Started => "started",

@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 export type Protocol =
   | "SSH"
@@ -152,58 +151,9 @@ export function hasTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-function wait(ms: number) {
-  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
-}
-
 export const api = {
-  openFileManagerWindow: async (profileId?: string | null) => {
-    const label = "file-manager";
-    const existing = await WebviewWindow.getByLabel(label);
-    if (existing) {
-      await existing.close().catch(() => undefined);
-      await wait(160);
-    }
-
-    // 使用 file-manager.html(自带启动诊断面板),渲染报错会显示在窗口里而不是白屏
-    const url = profileId ? `file-manager.html?profileId=${encodeURIComponent(profileId)}` : "file-manager.html";
-    const fileWindow = new WebviewWindow(label, {
-      url,
-      title: "RustShell 文件管理器",
-      width: 1180,
-      height: 760,
-      minWidth: 860,
-      minHeight: 560,
-      center: true,
-      focus: true,
-      visible: true,
-      resizable: true,
-      decorations: false,
-      transparent: false
-    });
-
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const settle = (handler: () => void) => {
-        if (settled) return;
-        settled = true;
-        window.clearTimeout(timeout);
-        handler();
-      };
-      const timeout = window.setTimeout(() => settle(resolve), 3000);
-
-      void fileWindow.once("tauri://created", () => {
-        settle(() => {
-          void fileWindow.show();
-          void fileWindow.setFocus();
-          resolve();
-        });
-      });
-      void fileWindow.once("tauri://error", (event) => {
-        settle(() => reject(event.payload || "文件管理器窗口创建失败"));
-      });
-    });
-  },
+  openFileManagerWindow: (profileId?: string | null) =>
+    invoke<void>("open_file_manager_window", { profileId: profileId || null }),
   listProfiles: () => invoke<Profile[]>("list_profiles"),
   saveProfile: (profile: Profile) => {
     const { password, ...savedProfile } = profile;

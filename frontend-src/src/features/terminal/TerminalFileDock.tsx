@@ -1,4 +1,4 @@
-import { ArrowUp, ChevronDown, ChevronRight, Copy, Download, Folder, FolderOpen, ListChecks, ListX, RefreshCcw, Trash2, Upload, X } from "lucide-react";
+import { ArrowUp, ChevronDown, ChevronRight, Copy, Download, Folder, FolderOpen, ListChecks, ListX, MoveRight, RefreshCcw, Trash2, Upload, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 
 import type { FileEntry } from "@/api";
@@ -25,6 +25,13 @@ type DockDragPayload = {
   side: DockSide;
   profileId: string | null;
   entries: DockTransferEntry[];
+};
+type TreeDropHint = {
+  path: string;
+  label: string;
+  operation: TreeDropOperation;
+  x: number;
+  y: number;
 };
 
 type DockNode = {
@@ -160,6 +167,15 @@ function readDockDragPayload(dataTransfer: DataTransfer): DockDragPayload | null
   } catch {
     return null;
   }
+}
+
+function treeDropOperation(event: DragEvent<HTMLElement>): TreeDropOperation {
+  return event.ctrlKey ? "copy" : "move";
+}
+
+function treeDropLabel(node: DockNode, operation: TreeDropOperation): string {
+  const target = node.name || node.path;
+  return `${operation === "copy" ? "复制到" : "移动到"} ${target}`;
 }
 
 function pathChain(side: DockSide, targetPath: string): Array<Pick<DockNode, "path" | "name">> {
@@ -302,9 +318,13 @@ export function TerminalFileDock({
   const [error, setError] = useState("");
   const [tree, setTree] = useState<DockNode | null>(null);
   const [treeDropPath, setTreeDropPath] = useState<string | null>(null);
+  const [treeDropHint, setTreeDropHint] = useState<TreeDropHint | null>(null);
+  const [internalDragActive, setInternalDragActive] = useState(false);
   const requestSeq = useRef(0);
   const followedRef = useRef<string | null>(null);
   const dockDragRef = useRef<DockDragPayload | null>(null);
+  const treeAutoExpandTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const treeAutoExpandPathRef = useRef<string | null>(null);
 
   const hydrateTreeAroundPath = useCallback(
     async (target: string, targetEntries: FileEntry[], seq: number) => {
@@ -389,6 +409,7 @@ export function TerminalFileDock({
   const sortedEntries = useMemo(() => sortFiles(entries, sort), [entries, sort]);
   const selectedPathSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
   const selectedEntries = useMemo(() => sortedEntries.filter((entry) => selectedPathSet.has(entry.path)), [selectedPathSet, sortedEntries]);
+  const uploadDropActive = dropActive && side === "remote" && !internalDragActive;
 
   const openEntry = useCallback(
     (entry: FileEntry) => {
@@ -543,6 +564,38 @@ export function TerminalFileDock({
     [loadNodeChildren, side]
   );
 
+  const clearTreeAutoExpand = useCallback(() => {
+    if (treeAutoExpandTimerRef.current !== null) {
+      window.clearTimeout(treeAutoExpandTimerRef.current);
+      treeAutoExpandTimerRef.current = null;
+    }
+    treeAutoExpandPathRef.current = null;
+  }, []);
+
+  const scheduleTreeAutoExpand = useCallback(
+    (node: DockNode) => {
+      if (node.expanded || node.loading) {
+        clearTreeAutoExpand();
+        return;
+      }
+      if (treeAutoExpandPathRef.current && sameDockPath(side, treeAutoExpandPathRef.current, node.path)) return;
+      clearTreeAutoExpand();
+      treeAutoExpandPathRef.current = node.path;
+      treeAutoExpandTimerRef.current = window.setTimeout(() => {
+        treeAutoExpandTimerRef.current = null;
+        treeAutoExpandPathRef.current = null;
+        if (!node.loaded) {
+          void loadNodeChildren(node);
+          return;
+        }
+        setTree((current) => updateTreeNode(current, side, node.path, (item) => ({ ...item, expanded: true })));
+      }, 650);
+    },
+    [clearTreeAutoExpand, loadNodeChildren, side]
+  );
+
+  useEffect(() => clearTreeAutoExpand, [clearTreeAutoExpand]);
+
   const beginResize = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
     const startY = event.clientY;
@@ -597,6 +650,7 @@ export function TerminalFileDock({
       entries: entries.map((item) => ({ path: item.path, name: item.name, isDir: item.isDir }))
     };
     dockDragRef.current = payload;
+    setInternalDragActive(true);
     event.dataTransfer.effectAllowed = "copyMove";
     event.dataTransfer.setData("text/plain", entries.map((item) => item.path).join("\n"));
     event.dataTransfer.setData(DOCK_DRAG_TYPE, JSON.stringify(payload));
@@ -609,34 +663,59 @@ export function TerminalFileDock({
     }
   };
 
+  const clearTreeDropFeedback = () => {
+    clearTreeAutoExpand();
+    setTreeDropPath(null);
+    setTreeDropHint(null);
+  };
+
   const handleTreeNodeDragOver = (node: DockNode, event: DragEvent<HTMLButtonElement>) => {
     const payload = dragPayloadFromEvent(event);
     if (!payload || !onTransferEntriesToDirectory || !canDropEntriesOnDirectory(side, payload.entries, node.path)) {
       return;
     }
+    const operation = treeDropOperation(event);
     event.preventDefault();
     event.stopPropagation();
-    event.dataTransfer.dropEffect = event.ctrlKey ? "copy" : "move";
+    event.dataTransfer.dropEffect = operation;
     setTreeDropPath(node.path);
+    setTreeDropHint({
+      path: node.path,
+      label: treeDropLabel(node, operation),
+      operation,
+      x: event.clientX,
+      y: event.clientY
+    });
+    scheduleTreeAutoExpand(node);
   };
 
   const handleTreeNodeDragLeave = (node: DockNode, event: DragEvent<HTMLButtonElement>) => {
     const nextTarget = event.relatedTarget as Node | null;
     if (nextTarget && event.currentTarget.contains(nextTarget)) return;
     setTreeDropPath((current) => (current && sameDockPath(side, current, node.path) ? null : current));
+    setTreeDropHint((current) => (current && sameDockPath(side, current.path, node.path) ? null : current));
   };
 
   const handleTreeNodeDrop = async (node: DockNode, event: DragEvent<HTMLButtonElement>) => {
     const payload = dragPayloadFromEvent(event);
-    setTreeDropPath(null);
+    const operation = treeDropOperation(event);
+    clearTreeDropFeedback();
+    setInternalDragActive(false);
     if (!payload || !onTransferEntriesToDirectory || !canDropEntriesOnDirectory(side, payload.entries, node.path)) {
       return;
     }
     event.preventDefault();
     event.stopPropagation();
-    await onTransferEntriesToDirectory(payload.entries, node.path, event.ctrlKey ? "copy" : "move");
+    dockDragRef.current = null;
+    await onTransferEntriesToDirectory(payload.entries, node.path, operation);
     if (path) void navigate(path);
     void loadNodeChildren(node);
+  };
+
+  const handleTreePaneDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    const nextTarget = event.relatedTarget as Node | null;
+    if (nextTarget && event.currentTarget.contains(nextTarget)) return;
+    clearTreeDropFeedback();
   };
 
   const renderNode = (node: DockNode, depth: number) => (
@@ -650,7 +729,9 @@ export function TerminalFileDock({
         className={cn(
           "flex h-6 w-full min-w-0 items-center gap-1 rounded-sm px-1 text-left text-xs hover:bg-accent",
           sameDockPath(side, path, node.path) && "bg-accent text-foreground",
-          treeDropPath && sameDockPath(side, treeDropPath, node.path) && "bg-primary/10 text-primary ring-1 ring-primary/40"
+          treeDropPath &&
+            sameDockPath(side, treeDropPath, node.path) &&
+            "bg-sky-500/15 text-foreground ring-1 ring-inset ring-sky-500/60"
         )}
         style={{ paddingLeft: `${4 + depth * 12}px` }}
         title={node.path}
@@ -692,7 +773,7 @@ export function TerminalFileDock({
       data-file-drop-target-path={side === "remote" ? path || undefined : undefined}
       className={cn(
         "relative flex min-h-0 flex-col overflow-hidden border-t bg-background",
-        dropActive && side === "remote" && "outline-dashed outline-1 outline-offset-[-2px] outline-primary/60"
+        uploadDropActive && "outline-dashed outline-1 outline-offset-[-2px] outline-primary/60"
       )}
       style={{ height }}
     >
@@ -743,7 +824,14 @@ export function TerminalFileDock({
         <IconButton className="h-6 w-6 min-w-6 p-0" title="关闭文件区" icon={<X size={13} />} onClick={onClose} />
       </div>
       <div className="grid min-h-0 flex-1 grid-cols-[200px_minmax(0,1fr)] overflow-hidden">
-        <div data-scroll-container className="min-h-0 overflow-auto border-r bg-muted/20 p-1">
+        <div
+          data-scroll-container
+          className={cn(
+            "min-h-0 overflow-auto border-r bg-muted/20 p-1",
+            internalDragActive && onTransferEntriesToDirectory && "bg-sky-500/[0.04]"
+          )}
+          onDragLeave={handleTreePaneDragLeave}
+        >
           {tree ? renderNode(tree, 0) : <div className="p-2 text-xs text-muted-foreground">目录树加载中...</div>}
         </div>
         <div className="relative min-h-0 overflow-hidden">
@@ -763,7 +851,8 @@ export function TerminalFileDock({
                 onDragStart={handleFileDragStart}
                 onDragEnd={() => {
                   dockDragRef.current = null;
-                  setTreeDropPath(null);
+                  setInternalDragActive(false);
+                  clearTreeDropFeedback();
                 }}
                 onSelectAll={() => setSelectedPaths(sortedEntries.map((entry) => entry.path))}
                 onClearSelection={() => {
@@ -793,7 +882,7 @@ export function TerminalFileDock({
                   空目录
                 </div>
               )}
-              {dropActive && side === "remote" && (
+              {uploadDropActive && (
                 <div className="pointer-events-none absolute inset-2 z-10 flex items-center justify-center rounded-md border border-dashed border-primary/60 bg-background/85 text-[13px] text-foreground shadow-sm">
                   拖放到此远程目录上传
                 </div>
@@ -802,6 +891,21 @@ export function TerminalFileDock({
           )}
         </div>
       </div>
+      {treeDropHint && (
+        <div
+          className="pointer-events-none fixed z-[100] flex max-w-[260px] items-center gap-1.5 rounded-[2px] border border-border bg-popover px-1.5 py-0.5 text-[11px] font-medium text-popover-foreground shadow-md"
+          style={{ left: treeDropHint.x + 14, top: treeDropHint.y + 12 }}
+        >
+          {treeDropHint.operation === "copy" ? (
+            <span className="grid size-3.5 flex-none place-items-center rounded-[1px] border border-sky-600 bg-sky-50 text-[10px] leading-none text-sky-700 dark:bg-sky-950/70">
+              +
+            </span>
+          ) : (
+            <MoveRight size={12} className="flex-none text-muted-foreground" />
+          )}
+          <span className="min-w-0 truncate">{treeDropHint.label}</span>
+        </div>
+      )}
     </section>
   );
 }
