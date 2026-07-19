@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1422 --strictPort",
     "build": "vite build",
-    "preview": "vite preview --host 127.0.0.1 --port 1422"
+    "preview": "vite preview --host 127.0.0.1 --port 1422",
+    "package": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/package.ps1",
+    "package:all": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/package.ps1 -Targets all"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.9",
