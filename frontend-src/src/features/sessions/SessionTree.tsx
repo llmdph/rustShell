@@ -217,7 +217,7 @@ const SessionFolderRow = memo(function SessionFolderRow({
   return (
     <ActionContextMenu actions={() => getActions(path)}>
       <button
-        className="grid h-5 w-full grid-cols-[12px_14px_minmax(0,1fr)] items-center gap-0.5 rounded-[2px] border-0 bg-transparent pr-[3px] text-left text-xs font-semibold leading-none text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
+        className="row-sweep grid h-5 w-full grid-cols-[12px_14px_minmax(0,1fr)] items-center gap-0.5 rounded-[2px] border-0 bg-transparent pr-[3px] text-left text-xs font-semibold leading-none text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
         style={{ ...style, paddingLeft: indent }}
         onClick={() => onToggle(path)}
         title={collapsed ? "展开目录" : "收起目录"}
@@ -251,7 +251,7 @@ const SessionProfileRow = memo(function SessionProfileRow({
     <ActionContextMenu actions={() => getActions(profile)}>
       <button
         className={cn(
-          "grid min-h-5 w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-[5px] rounded-[1px] border-0 bg-transparent pr-1 text-left text-xs leading-none text-foreground transition-colors hover:bg-muted/70",
+          "row-sweep grid min-h-5 w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-[5px] rounded-[1px] border-0 bg-transparent pr-1 text-left text-xs leading-none text-foreground transition-colors hover:bg-muted/70",
           active && "bg-primary/25 hover:bg-primary/25"
         )}
         style={{ ...style, paddingLeft: indent }}
