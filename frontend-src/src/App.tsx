@@ -158,7 +158,14 @@ export default function App() {
   const [secretProfileId, setSecretProfileId] = useState<string | null>(null);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [knownHostsText, setKnownHostsText] = useState("");
-  const [status, setStatus] = useState("就绪");
+  // Nothing renders this string today, but ~50 call sites report progress into
+  // it. Holding it in a ref keeps those messages available (and revivable as a
+  // status bar) without paying a full re-render of this component for each one.
+  // The stable identity also stops it from invalidating downstream callbacks.
+  const statusRef = useRef("就绪");
+  const setStatus = useCallback((next: string) => {
+    statusRef.current = next;
+  }, []);
   const [hostSearch, setHostSearch] = useState("");
   const [sessionSearch, setSessionSearch] = useState("");
   const {

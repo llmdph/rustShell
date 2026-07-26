@@ -264,13 +264,31 @@ export function TerminalArea({
     event.preventDefault();
     const stack = stackRef.current;
     if (!stack) return;
+    // Move the divider by writing the two pane edges directly. Committing the
+    // ratio to React state on every pointermove re-rendered both panes — and
+    // every XtermView inside them — at pointer frequency. The style objects
+    // above are rebuilt each render but carry unchanged values mid-drag, so
+    // React never patches over these writes.
+    const panes = stack.querySelectorAll<HTMLElement>("[data-terminal-pane]");
+    const primaryPane = panes[0] ?? null;
+    const secondaryPane = panes[1] ?? null;
+    const primaryEdge = splitDirection === "row" ? "right" : "bottom";
+    const secondaryEdge = splitDirection === "row" ? "left" : "top";
+
+    let latestRatio = splitRatio;
     const applyRatio = (clientX: number, clientY: number) => {
       const rect = stack.getBoundingClientRect();
       const ratio =
         splitDirection === "row"
           ? (clientX - rect.left) / Math.max(1, rect.width)
           : (clientY - rect.top) / Math.max(1, rect.height);
-      onSplitRatioChange(Math.min(0.8, Math.max(0.2, ratio)));
+      latestRatio = Math.min(0.8, Math.max(0.2, ratio));
+      if (primaryPane) {
+        primaryPane.style[primaryEdge] = `calc(${((1 - latestRatio) * 100).toFixed(3)}% + 1px)`;
+      }
+      if (secondaryPane) {
+        secondaryPane.style[secondaryEdge] = `calc(${(latestRatio * 100).toFixed(3)}% + 1px)`;
+      }
     };
     const handleMove = (moveEvent: globalThis.PointerEvent) => applyRatio(moveEvent.clientX, moveEvent.clientY);
     const handleUp = () => {
@@ -278,6 +296,7 @@ export function TerminalArea({
       window.dispatchEvent(new CustomEvent("rustshell:terminal-layout-resize-end"));
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
+      onSplitRatioChange(latestRatio);
     };
     document.body.classList.add("is-resizing-terminal-layout");
     window.addEventListener("pointermove", handleMove);

@@ -324,6 +324,7 @@ export function TerminalFileDock({
   const [treeDropHint, setTreeDropHint] = useState<TreeDropHint | null>(null);
   const [internalDragActive, setInternalDragActive] = useState(false);
   const requestSeq = useRef(0);
+  const rootRef = useRef<HTMLElement | null>(null);
   const followedRef = useRef<string | null>(null);
   const dockDragRef = useRef<DockDragPayload | null>(null);
   const treeAutoExpandTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
@@ -644,15 +645,22 @@ export function TerminalFileDock({
     event.preventDefault();
     const startY = event.clientY;
     const startHeight = height;
+    // Resize the element directly and report the final height once on release.
+    // Calling `onHeightChange` per pointermove pushed new state into App, which
+    // rebuilt the dock render callback and re-rendered every terminal pane at
+    // pointer frequency.
+    let latestHeight = startHeight;
     const handleMove = (moveEvent: globalThis.PointerEvent) => {
       const delta = startY - moveEvent.clientY;
-      onHeightChange(Math.min(520, Math.max(160, Math.round(startHeight + delta))));
+      latestHeight = Math.min(520, Math.max(160, Math.round(startHeight + delta)));
+      if (rootRef.current) rootRef.current.style.height = `${latestHeight}px`;
     };
     const handleUp = () => {
       document.body.classList.remove("is-resizing-terminal-layout");
       window.dispatchEvent(new CustomEvent("rustshell:terminal-layout-resize-end"));
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
+      if (latestHeight !== startHeight) onHeightChange(latestHeight);
     };
     document.body.classList.add("is-resizing-terminal-layout");
     window.addEventListener("pointermove", handleMove);
@@ -810,6 +818,7 @@ export function TerminalFileDock({
 
   return (
     <section
+      ref={rootRef}
       data-terminal-file-dock
       data-file-pane-side={side}
       data-file-drop-target-id={dropTargetId}

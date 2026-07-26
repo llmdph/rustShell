@@ -59,7 +59,7 @@ type UseAppBootstrapArgs = {
   setProfiles: Dispatch<SetStateAction<Profile[]>>;
   setSelectedProfileId: Dispatch<SetStateAction<string | null>>;
   setSettings: Dispatch<SetStateAction<AppSettings>>;
-  setStatus: Dispatch<SetStateAction<string>>;
+  setStatus: (status: string) => void;
   setTabs: Dispatch<SetStateAction<TerminalView[]>>;
 };
 
