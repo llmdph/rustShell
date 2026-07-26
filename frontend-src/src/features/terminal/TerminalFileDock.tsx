@@ -331,22 +331,20 @@ export function TerminalFileDock({
 
   const hydrateTreeAroundPath = useCallback(
     async (target: string, targetEntries: FileEntry[], seq: number) => {
+      // Only the immediate parent is fetched eagerly. Listing every ancestor
+      // meant opening ~/a/b/c cost four extra round trips before the pane felt
+      // responsive, and over SFTP they queue behind a single connection. Deeper
+      // ancestors render collapsed and load when the user expands them.
       const chain = pathChain(side, target);
-      const ancestorPaths = chain.slice(0, -1).map((item) => item.path);
-      const ancestorLists = await Promise.all(
-        ancestorPaths.map(async (ancestor) => {
-          try {
-            return { path: ancestor, entries: await listDir(ancestor) };
-          } catch {
-            return null;
-          }
-        })
-      );
+      const parent = chain.length > 1 ? chain[chain.length - 2].path : null;
+      const parentEntries = parent
+        ? await listDir(parent).catch(() => null)
+        : null;
       if (requestSeq.current !== seq) return;
       setTree((current) => {
         let next = ensureTreePath(current, side, target);
-        for (const loaded of ancestorLists) {
-          if (loaded) next = mergeLoadedChildren(next, side, loaded.path, loaded.entries, true);
+        if (parent && parentEntries) {
+          next = mergeLoadedChildren(next, side, parent, parentEntries, true);
         }
         next = mergeLoadedChildren(next, side, target, targetEntries, false);
         return next;

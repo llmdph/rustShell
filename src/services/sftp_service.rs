@@ -25,7 +25,7 @@ const REMOTE_TEXT_PREVIEW_LIMIT: u64 = 1024 * 1024;
 const REMOTE_DIR_ENTRY_LIMIT: usize = 10_000;
 
 pub struct SftpConnection {
-    _session: ssh2::Session,
+    session: ssh2::Session,
     sftp: ssh2::Sftp,
 }
 
@@ -33,10 +33,26 @@ impl SftpConnection {
     pub fn connect(profile: &SessionProfile, password: Option<&str>) -> Result<Self> {
         let session = connect(profile, password)?;
         let sftp = session.sftp().context("failed to start SFTP subsystem")?;
-        Ok(Self {
-            _session: session,
-            sftp,
-        })
+        Ok(Self { session, sftp })
+    }
+
+    /// Run a shell command over this connection's SSH session and return its
+    /// stdout. Opening another channel on an authenticated session costs one
+    /// round trip, versus a full TCP connect plus handshake plus auth for a
+    /// fresh session.
+    pub fn exec(&self, command: &str) -> Result<String> {
+        let mut channel = self
+            .session
+            .channel_session()
+            .context("failed to open SSH command channel")?;
+        channel.exec(command).context("failed to run command")?;
+
+        let mut output = String::new();
+        channel
+            .read_to_string(&mut output)
+            .context("failed to read command output")?;
+        channel.wait_close().ok();
+        Ok(output)
     }
 
     pub fn home_dir(&self) -> Result<String> {

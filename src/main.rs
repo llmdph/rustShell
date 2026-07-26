@@ -25,7 +25,7 @@ use crate::{
         terminal::{HostKeyIssue, TerminalModel, TerminalSize, TerminalStatus},
     },
     services::{
-        sftp_service, ssh,
+        sftp_pool, sftp_service, ssh,
         storage::{self, SessionStore, TransferHistoryRecord as TransferView},
         terminal_service::TerminalLauncher,
     },
@@ -34,12 +34,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    io::Read,
     path::Path,
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard,
     },
     thread,
     time::{Duration, Instant},
@@ -56,17 +55,23 @@ struct AppRuntime {
     store: SessionStore,
     profiles: Mutex<Vec<SessionProfile>>,
     terminals: Mutex<HashMap<Uuid, TerminalModel>>,
-    sftp_sessions: Mutex<HashMap<Uuid, CachedSftpConnection>>,
+    /// Behind an `Arc` so blocking commands can hand an owned handle to
+    /// `spawn_blocking` instead of borrowing from `State`.
+    sftp: Arc<sftp_pool::SftpPool>,
+    server_status_cache: Mutex<HashMap<Uuid, CachedServerStatus>>,
     password_cache: Mutex<HashMap<Uuid, String>>,
     settings: Mutex<AppSettings>,
     transfers: Mutex<HashMap<Uuid, TransferTask>>,
+    terminal_pump: Arc<PumpSignal>,
     allow_main_close: AtomicBool,
 }
 
 const TRANSFER_HISTORY_LIMIT: usize = 200;
 const FINISHED_TRANSFER_QUEUE_LIMIT: usize = 50;
-const SFTP_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const SFTP_MAX_SESSIONS: usize = 4;
+/// Long enough to collapse the burst of duplicate status requests that a
+/// profile switch or dock open triggers, short enough that a manual refresh
+/// still feels live.
+const SERVER_STATUS_TTL: Duration = Duration::from_secs(2);
 const APP_ICON_RGBA: &[u8] = include_bytes!("../icons/rustshell-app-icon-64.rgba");
 const APP_ICON_SIZE: u32 = 64;
 const WEBVIEW2_BROWSER_ARGS: &str =
@@ -448,7 +453,7 @@ struct TerminalView {
     current_directory: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TerminalDrain {
     id: String,
@@ -460,7 +465,60 @@ struct TerminalDrain {
     current_directory: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+/// Fields the frontend re-renders on. Output is streamed unconditionally; these
+/// are only forwarded when they actually change, so a quiet terminal produces
+/// no IPC traffic at all.
+#[derive(PartialEq, Eq)]
+struct TerminalMetadata {
+    status: String,
+    last_error: Option<String>,
+    host_key_fingerprint: Option<String>,
+    current_directory: Option<String>,
+}
+
+impl TerminalMetadata {
+    fn of(drain: &TerminalDrain) -> Self {
+        Self {
+            status: drain.status.clone(),
+            last_error: drain.last_error.clone(),
+            host_key_fingerprint: drain
+                .host_key_issue
+                .as_ref()
+                .map(|issue| issue.fingerprint.clone()),
+            current_directory: drain.current_directory.clone(),
+        }
+    }
+}
+
+/// Lets `terminal_send` (and connect) wake the pump the instant the user does
+/// something, so the idle backoff never shows up as input latency.
+#[derive(Default)]
+struct PumpSignal {
+    raised: Mutex<bool>,
+    condvar: Condvar,
+}
+
+impl PumpSignal {
+    fn notify(&self) {
+        *lock_poison_ok(&self.raised) = true;
+        self.condvar.notify_all();
+    }
+
+    /// Blocks until notified or `timeout` elapses, then clears the flag.
+    fn wait(&self, timeout: Duration) {
+        let mut raised = lock_poison_ok(&self.raised);
+        if !*raised {
+            let (guard, _) = self
+                .condvar
+                .wait_timeout(raised, timeout)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            raised = guard;
+        }
+        *raised = false;
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerStatusView {
     hostname: String,
@@ -498,9 +556,49 @@ struct TransferState {
     message: Option<String>,
 }
 
-struct CachedSftpConnection {
-    connection: sftp_service::SftpConnection,
-    last_used: Instant,
+struct CachedServerStatus {
+    view: ServerStatusView,
+    fetched_at: Instant,
+}
+
+/// Everything a blocking SFTP task needs, extracted from `State` up front so the
+/// task itself owns `'static` data.
+struct SftpContext {
+    profile: SessionProfile,
+    password: Option<String>,
+    pool: Arc<sftp_pool::SftpPool>,
+}
+
+fn sftp_context(
+    profile_id: &str,
+    password: Option<&str>,
+    state: &State<'_, AppRuntime>,
+) -> Result<SftpContext, String> {
+    let profile = profile_for_transfer(profile_id, password, state)?;
+    let password = resolve_password(&profile, password, state)?;
+    Ok(SftpContext {
+        // `with_sftp` used to normalise the profile just before connecting; the
+        // pool connects on its own schedule, so normalise up front instead.
+        profile: profile_for_secret(profile, password.as_deref()),
+        password,
+        pool: state.sftp.clone(),
+    })
+}
+
+/// Run blocking work on the runtime's blocking pool.
+///
+/// Tauri executes plain synchronous commands on the **main thread**, so any
+/// command that touches the network or the filesystem must go through here or
+/// it will freeze the window for the duration of the call.
+async fn blocking<T, F>(task: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tauri::async_runtime::spawn_blocking(task).await {
+        Ok(result) => result,
+        Err(error) => Err(format!("后台任务执行失败: {}", error)),
+    }
 }
 
 #[tauri::command]
@@ -547,7 +645,8 @@ fn save_profile(
     };
 
     if invalidate_sftp {
-        lock(&state.sftp_sessions)?.remove(&profile_id);
+        state.sftp.invalidate(profile_id);
+        lock(&state.server_status_cache)?.remove(&profile_id);
     }
 
     Ok(output)
@@ -598,7 +697,8 @@ fn import_profiles(
             password_cache.remove(&id);
         }
     }
-    lock(&state.sftp_sessions)?.clear();
+    state.sftp.retain_profiles(&active_ids);
+    lock(&state.server_status_cache)?.clear();
 
     Ok(output)
 }
@@ -645,7 +745,8 @@ fn delete_profile(
 
     storage::delete_password(&removed.0).map_err(to_string)?;
     lock(&state.password_cache)?.remove(&id);
-    lock(&state.sftp_sessions)?.remove(&id);
+    state.sftp.invalidate(id);
+    lock(&state.server_status_cache)?.remove(&id);
     Ok(removed.1)
 }
 
@@ -754,16 +855,7 @@ fn terminal_drain(
     let terminal = terminals
         .get_mut(&id)
         .ok_or_else(|| "终端不存在或已关闭".to_owned())?;
-    let output = terminal.drain_output();
-    Ok(TerminalDrain {
-        id: terminal.id.to_string(),
-        status: status_name(terminal.status).to_owned(),
-        status_label: terminal.status.label(),
-        output,
-        last_error: terminal.last_error.clone(),
-        host_key_issue: terminal.host_key_issue.clone(),
-        current_directory: terminal.current_directory.clone(),
-    })
+    Ok(drain_terminal(terminal))
 }
 
 #[tauri::command]
@@ -854,6 +946,10 @@ fn terminal_send(request: SendRequest, state: State<'_, AppRuntime>) -> Result<(
         .ok_or_else(|| "终端不存在或已关闭".to_owned())?;
     let bytes = terminal.encode_input(&request.data);
     terminal.send(bytes);
+    drop(terminals);
+    // The response to a keystroke lands within a few milliseconds; wake the
+    // pump now so the idle backoff never becomes visible echo latency.
+    state.terminal_pump.notify();
     Ok(())
 }
 
@@ -881,18 +977,21 @@ fn close_terminal(terminal_id: String, state: State<'_, AppRuntime>) -> Result<(
 }
 
 #[tauri::command]
-fn list_local_dir(path: String) -> Result<Vec<FileEntry>, String> {
-    read_local_dir(&path).map_err(to_string)
+async fn list_local_dir(path: String) -> Result<Vec<FileEntry>, String> {
+    blocking(move || read_local_dir(&path).map_err(to_string)).await
 }
 
 #[tauri::command]
-fn search_local(request: LocalSearchRequest) -> Result<Vec<FileEntry>, String> {
-    search_local_impl(
-        &request.root,
-        &request.query,
-        request.max_results.unwrap_or(200),
-    )
-    .map_err(to_string)
+async fn search_local(request: LocalSearchRequest) -> Result<Vec<FileEntry>, String> {
+    blocking(move || {
+        search_local_impl(
+            &request.root,
+            &request.query,
+            request.max_results.unwrap_or(200),
+        )
+        .map_err(to_string)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -906,8 +1005,8 @@ fn local_parent(path: String) -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn open_local_path(request: LocalOpenRequest) -> Result<(), String> {
-    open_local_path_impl(&request.path, request.reveal).map_err(to_string)
+async fn open_local_path(request: LocalOpenRequest) -> Result<(), String> {
+    blocking(move || open_local_path_impl(&request.path, request.reveal).map_err(to_string)).await
 }
 
 #[tauri::command]
@@ -926,58 +1025,58 @@ fn create_local_symlink(request: LocalSymlinkRequest) -> Result<String, String> 
 }
 
 #[tauri::command]
-fn remove_local_path(request: LocalRemoveRequest) -> Result<(), String> {
-    remove_local_path_impl(&request.path, request.is_dir).map_err(to_string)
+async fn remove_local_path(request: LocalRemoveRequest) -> Result<(), String> {
+    blocking(move || remove_local_path_impl(&request.path, request.is_dir).map_err(to_string)).await
 }
 
 #[tauri::command]
-fn duplicate_local_path(request: LocalDuplicateRequest) -> Result<String, String> {
-    duplicate_local_path_impl(&request.path, &request.new_name).map_err(to_string)
+async fn duplicate_local_path(request: LocalDuplicateRequest) -> Result<String, String> {
+    blocking(move || duplicate_local_path_impl(&request.path, &request.new_name).map_err(to_string)).await
 }
 
 #[tauri::command]
-fn copy_local_path(request: LocalCopyRequest) -> Result<String, String> {
-    copy_local_path_impl(&request.path, &request.target_path).map_err(to_string)
+async fn copy_local_path(request: LocalCopyRequest) -> Result<String, String> {
+    blocking(move || copy_local_path_impl(&request.path, &request.target_path).map_err(to_string)).await
 }
 
 #[tauri::command]
-fn move_local_path(request: LocalMoveRequest) -> Result<String, String> {
-    move_local_path_impl(&request.path, &request.target_path).map_err(to_string)
+async fn move_local_path(request: LocalMoveRequest) -> Result<String, String> {
+    blocking(move || move_local_path_impl(&request.path, &request.target_path).map_err(to_string)).await
 }
 
 #[tauri::command]
-fn touch_local_path(request: LocalTouchRequest) -> Result<(), String> {
-    touch_local_path_impl(&request.path, request.mtime, request.recursive).map_err(to_string)
+async fn touch_local_path(request: LocalTouchRequest) -> Result<(), String> {
+    blocking(move || touch_local_path_impl(&request.path, request.mtime, request.recursive).map_err(to_string)).await
 }
 
 #[tauri::command]
-fn chmod_local_path(request: LocalChmodRequest) -> Result<(), String> {
-    chmod_local_path_impl(&request.path, request.mode, request.recursive).map_err(to_string)
+async fn chmod_local_path(request: LocalChmodRequest) -> Result<(), String> {
+    blocking(move || chmod_local_path_impl(&request.path, request.mode, request.recursive).map_err(to_string)).await
 }
 
 #[tauri::command]
-fn local_path_stats(request: LocalPathStatsRequest) -> Result<LocalPathStats, String> {
-    local_path_stats_impl(&request.path).map_err(to_string)
+async fn local_path_stats(request: LocalPathStatsRequest) -> Result<LocalPathStats, String> {
+    blocking(move || local_path_stats_impl(&request.path).map_err(to_string)).await
 }
 
 #[tauri::command]
-fn read_local_file(request: LocalReadFileRequest) -> Result<LocalTextFile, String> {
-    read_local_file_impl(&request.path).map_err(to_string)
+async fn read_local_file(request: LocalReadFileRequest) -> Result<LocalTextFile, String> {
+    blocking(move || read_local_file_impl(&request.path).map_err(to_string)).await
 }
 
 #[tauri::command]
-fn read_local_file_tail(request: LocalReadFileRequest) -> Result<LocalTextFile, String> {
-    read_local_file_tail_impl(&request.path).map_err(to_string)
+async fn read_local_file_tail(request: LocalReadFileRequest) -> Result<LocalTextFile, String> {
+    blocking(move || read_local_file_tail_impl(&request.path).map_err(to_string)).await
 }
 
 #[tauri::command]
-fn write_local_file(request: LocalWriteFileRequest) -> Result<(), String> {
-    write_local_file_impl(&request.path, &request.content).map_err(to_string)
+async fn write_local_file(request: LocalWriteFileRequest) -> Result<(), String> {
+    blocking(move || write_local_file_impl(&request.path, &request.content).map_err(to_string)).await
 }
 
 #[tauri::command]
-fn local_file_sha256(request: LocalReadFileRequest) -> Result<String, String> {
-    local_file_sha256_impl(&request.path).map_err(to_string)
+async fn local_file_sha256(request: LocalReadFileRequest) -> Result<String, String> {
+    blocking(move || local_file_sha256_impl(&request.path).map_err(to_string)).await
 }
 
 #[tauri::command]
@@ -986,62 +1085,112 @@ fn rename_local_path(request: LocalRenameRequest) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn list_remote_dir(
+async fn list_remote_dir(
     request: SftpRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<Vec<FileEntry>, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    let result = with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.list_dir(&request.path)
-    });
-    match result {
-        Ok(entries) => Ok(entries),
-        Err(error) if matches!(profile.auth, AuthProfile::KeyFile { .. }) => {
-            system_ssh_list_dir(&profile, &request.path)
-                .map_err(|fallback| format!("{}；OpenSSH fallback 失败: {}", error, fallback))
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    let path = request.path;
+    blocking(move || {
+        let SftpContext {
+            profile,
+            password,
+            pool,
+        } = context;
+        match pool.with(&profile, password.as_deref(), |connection| {
+            connection.list_dir(&path)
+        }) {
+            Ok(entries) => Ok(entries),
+            Err(error) if matches!(profile.auth, AuthProfile::KeyFile { .. }) => {
+                system_ssh_list_dir(&profile, &path)
+                    .map_err(|fallback| format!("{}；OpenSSH fallback 失败: {}", error, fallback))
+            }
+            Err(error) => Err(error),
         }
-        Err(error) => Err(error),
-    }
+    })
+    .await
 }
 
 #[tauri::command]
-fn remote_home(request: RemoteHomeRequest, state: State<'_, AppRuntime>) -> Result<String, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    let result = with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.home_dir()
-    });
-    match result {
-        Ok(home) => Ok(home),
-        Err(error) if matches!(profile.auth, AuthProfile::KeyFile { .. }) => {
-            system_ssh_remote_home(&profile)
-                .map_err(|fallback| format!("{}；OpenSSH fallback 失败: {}", error, fallback))
+async fn remote_home(
+    request: RemoteHomeRequest,
+    state: State<'_, AppRuntime>,
+) -> Result<String, String> {
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        let SftpContext {
+            profile,
+            password,
+            pool,
+        } = context;
+        match pool.with(&profile, password.as_deref(), |connection| {
+            connection.home_dir()
+        }) {
+            Ok(home) => Ok(home),
+            Err(error) if matches!(profile.auth, AuthProfile::KeyFile { .. }) => {
+                system_ssh_remote_home(&profile)
+                    .map_err(|fallback| format!("{}；OpenSSH fallback 失败: {}", error, fallback))
+            }
+            Err(error) => Err(error),
         }
-        Err(error) => Err(error),
-    }
+    })
+    .await
 }
 
 #[tauri::command]
-fn server_status(
+async fn server_status(
     request: RemoteHomeRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<ServerStatusView, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    if matches!(profile.protocol, SessionProtocol::LocalShell) {
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    if matches!(context.profile.protocol, SessionProtocol::LocalShell) {
         return Ok(local_server_status());
     }
 
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    let output = match ssh_exec_capture(&profile, password.as_deref(), SERVER_STATUS_COMMAND) {
-        Ok(output) => output,
-        Err(error) if matches!(profile.auth, AuthProfile::KeyFile { .. }) => {
-            system_ssh_output(&profile, SERVER_STATUS_COMMAND)
-                .map_err(|fallback| format!("{}；OpenSSH fallback 失败: {}", error, fallback))?
-        }
-        Err(error) => return Err(error),
+    // Opening the overview panel and switching profiles both fire this, often
+    // within the same tick; serve those from cache rather than re-running the
+    // remote command.
+    let profile_id = context.profile.id;
+    let cached_view = {
+        let cache = lock(&state.server_status_cache)?;
+        cache
+            .get(&profile_id)
+            .filter(|cached| cached.fetched_at.elapsed() < SERVER_STATUS_TTL)
+            .map(|cached| cached.view.clone())
     };
-    Ok(parse_server_status(&output))
+    if let Some(view) = cached_view {
+        return Ok(view);
+    }
+
+    let view = blocking(move || {
+        let SftpContext {
+            profile,
+            password,
+            pool,
+        } = context;
+        // The pooled session is already authenticated, so this is one extra
+        // channel rather than a fresh TCP connect, key exchange and auth.
+        let output = match pool.exec(&profile, password.as_deref(), SERVER_STATUS_COMMAND) {
+            Ok(output) => output,
+            Err(error) if matches!(profile.auth, AuthProfile::KeyFile { .. }) => {
+                system_ssh_output(&profile, SERVER_STATUS_COMMAND).map_err(|fallback| {
+                    format!("{}；OpenSSH fallback 失败: {}", error, fallback)
+                })?
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(parse_server_status(&output))
+    })
+    .await?;
+
+    lock(&state.server_status_cache)?.insert(
+        profile_id,
+        CachedServerStatus {
+            view: view.clone(),
+            fetched_at: Instant::now(),
+        },
+    );
+    Ok(view)
 }
 
 #[tauri::command]
@@ -1050,243 +1199,334 @@ fn disconnect_sftp_session(
     state: State<'_, AppRuntime>,
 ) -> Result<(), String> {
     let id = parse_uuid(&request.profile_id)?;
-    lock(&state.sftp_sessions)?.remove(&id);
+    state.sftp.invalidate(id);
+    lock(&state.server_status_cache)?.remove(&id);
     Ok(())
 }
 
 #[tauri::command]
-fn search_remote(
+async fn search_remote(
     request: RemoteSearchRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<Vec<FileEntry>, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.search(
-            &request.root,
-            &request.query,
-            request.max_results.unwrap_or(200),
-        )
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    let RemoteSearchRequest {
+        root,
+        query,
+        max_results,
+        ..
+    } = request;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.search(&root, &query, max_results.unwrap_or(200))
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn upload_file(request: TransferRequest, state: State<'_, AppRuntime>) -> Result<(), String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    sftp_service::upload_file(
-        &profile,
-        password.as_deref(),
-        &request.local_path,
-        &request.remote_path,
-    )
-    .map_err(to_string)
+async fn upload_file(
+    request: TransferRequest,
+    state: State<'_, AppRuntime>,
+) -> Result<(), String> {
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    let TransferRequest {
+        local_path,
+        remote_path,
+        ..
+    } = request;
+    blocking(move || {
+        sftp_service::upload_file(
+            &context.profile,
+            context.password.as_deref(),
+            &local_path,
+            &remote_path,
+        )
+        .map_err(to_string)
+    })
+    .await
 }
 
 #[tauri::command]
-fn download_file(request: TransferRequest, state: State<'_, AppRuntime>) -> Result<String, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    sftp_service::download_file(
-        &profile,
-        password.as_deref(),
-        &request.remote_path,
-        &request.local_path,
-    )
-    .map(|path| path.display().to_string())
-    .map_err(to_string)
+async fn download_file(
+    request: TransferRequest,
+    state: State<'_, AppRuntime>,
+) -> Result<String, String> {
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    let TransferRequest {
+        local_path,
+        remote_path,
+        ..
+    } = request;
+    blocking(move || {
+        sftp_service::download_file(
+            &context.profile,
+            context.password.as_deref(),
+            &remote_path,
+            &local_path,
+        )
+        .map(|path| path.display().to_string())
+        .map_err(to_string)
+    })
+    .await
 }
 
 #[tauri::command]
-fn create_remote_dir(
+async fn create_remote_dir(
     request: RemoteMkdirRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<(), String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.create_dir(&request.parent, &request.name)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.create_dir(&request.parent, &request.name)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn remove_remote_path(
+async fn remove_remote_path(
     request: RemoteRemoveRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<(), String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.remove_path(&request.path, request.is_dir, request.recursive)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.remove_path(&request.path, request.is_dir, request.recursive)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn rename_remote_path(
+async fn rename_remote_path(
     request: RemoteRenameRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<String, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.rename_path(&request.path, &request.new_name)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.rename_path(&request.path, &request.new_name)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn duplicate_remote_path(
+async fn duplicate_remote_path(
     request: RemoteDuplicateRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<String, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.duplicate_path(&request.path, request.is_dir, &request.new_name)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.duplicate_path(&request.path, request.is_dir, &request.new_name)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn copy_remote_path(
+async fn copy_remote_path(
     request: RemoteCopyRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<String, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.copy_path(&request.path, &request.target_path, request.is_dir)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.copy_path(&request.path, &request.target_path, request.is_dir)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn move_remote_path(
+async fn move_remote_path(
     request: RemoteMoveRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<String, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.move_path(&request.path, &request.target_path)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.move_path(&request.path, &request.target_path)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn chmod_remote_path(
+async fn chmod_remote_path(
     request: RemoteChmodRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<(), String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.chmod_path(&request.path, request.mode, request.recursive)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.chmod_path(&request.path, request.mode, request.recursive)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn chown_remote_path(
+async fn chown_remote_path(
     request: RemoteChownRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<(), String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.chown_path(&request.path, request.uid, request.gid, request.recursive)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.chown_path(&request.path, request.uid, request.gid, request.recursive)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn touch_remote_path(
+async fn touch_remote_path(
     request: RemoteTouchRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<(), String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.touch_path(&request.path, request.mtime, request.recursive)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.touch_path(&request.path, request.mtime, request.recursive)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn remote_path_stats(
+async fn remote_path_stats(
     request: RemotePathStatsRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<sftp_service::RemotePathStats, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.path_stats(&request.path)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.path_stats(&request.path)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn create_remote_file(
+async fn create_remote_file(
     request: RemoteCreateFileRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<String, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.create_file(&request.parent, &request.name)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.create_file(&request.parent, &request.name)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn create_remote_symlink(
+async fn create_remote_symlink(
     request: RemoteSymlinkRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<String, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.create_symlink(&request.parent, &request.name, &request.target)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.create_symlink(&request.parent, &request.name, &request.target)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn read_remote_file(
+async fn read_remote_file(
     request: RemoteReadFileRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<sftp_service::RemoteTextFile, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.read_text_file(&request.path)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.read_text_file(&request.path)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn read_remote_file_tail(
+async fn read_remote_file_tail(
     request: RemoteReadFileRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<sftp_service::RemoteTextFile, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.read_text_file_tail(&request.path)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.read_text_file_tail(&request.path)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn write_remote_file(
+async fn write_remote_file(
     request: RemoteWriteFileRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<(), String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.write_text_file(&request.path, &request.content)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.write_text_file(&request.path, &request.content)
+            })
     })
+    .await
 }
 
 #[tauri::command]
-fn remote_file_sha256(
+async fn remote_file_sha256(
     request: RemoteReadFileRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<String, String> {
-    let profile = profile_for_transfer(&request.profile_id, request.password.as_deref(), &state)?;
-    let password = resolve_password(&profile, request.password.as_deref(), &state)?;
-    with_sftp(&profile, password.as_deref(), &state, |connection| {
-        connection.file_sha256(&request.path)
+    let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
+    blocking(move || {
+        context
+            .pool
+            .with(&context.profile, context.password.as_deref(), |connection| {
+                connection.file_sha256(&request.path)
+            })
     })
+    .await
 }
 
 #[tauri::command]
@@ -1607,23 +1847,27 @@ fn main() {
     let store = SessionStore::new();
     let profiles = store.load_or_seed();
     let settings = storage::load_settings();
+    let terminal_pump = Arc::new(PumpSignal::default());
     let runtime = AppRuntime {
         store,
         profiles: Mutex::new(profiles),
         terminals: Mutex::new(HashMap::new()),
-        sftp_sessions: Mutex::new(HashMap::new()),
+        sftp: Arc::new(sftp_pool::SftpPool::new()),
+        server_status_cache: Mutex::new(HashMap::new()),
         password_cache: Mutex::new(HashMap::new()),
         settings: Mutex::new(settings),
         transfers: Mutex::new(HashMap::new()),
+        terminal_pump: terminal_pump.clone(),
         allow_main_close: AtomicBool::new(false),
     };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
                 window.set_icon(rustshell_window_icon())?;
             }
+            spawn_terminal_pump(app.handle().clone(), terminal_pump);
             let tray_menu = MenuBuilder::new(app)
                 .text("show-main", "显示 RustShell")
                 .separator()
@@ -1779,26 +2023,6 @@ printf 'cpu=%s cores\n' "$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null ||
 printf 'memory=%s\n' "$(free -h 2>/dev/null | awk '/^Mem:/ {print $3 " / " $2 " used"}')"
 printf 'disk=%s\n' "$(df -h / 2>/dev/null | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')"
 "#;
-
-fn ssh_exec_capture(
-    profile: &SessionProfile,
-    password: Option<&str>,
-    command: &str,
-) -> Result<String, String> {
-    let session = ssh::establish(profile, password).map_err(|error| error.to_string())?;
-    let mut channel = session
-        .channel_session()
-        .map_err(|error| format!("无法创建 SSH 命令通道: {}", error))?;
-    channel
-        .exec(command)
-        .map_err(|error| format!("无法执行服务器状态命令: {}", error))?;
-    let mut output = String::new();
-    channel
-        .read_to_string(&mut output)
-        .map_err(|error| format!("读取服务器状态失败: {}", error))?;
-    channel.wait_close().ok();
-    Ok(output)
-}
 
 fn system_ssh_remote_home(profile: &SessionProfile) -> Result<String, String> {
     let output = system_ssh_output(profile, r#"printf '%s\n' "$HOME""#)?;
@@ -1988,7 +2212,91 @@ fn launch_terminal(
     terminal.attach(running);
     let view = snapshot_terminal(&mut terminal);
     lock(&state.terminals)?.insert(terminal.id, terminal);
+    state.terminal_pump.notify();
     Ok(view)
+}
+
+/// Drains one terminal into the payload shape the frontend consumes.
+fn drain_terminal(terminal: &mut TerminalModel) -> TerminalDrain {
+    let output = terminal.drain_output();
+    TerminalDrain {
+        id: terminal.id.to_string(),
+        status: status_name(terminal.status).to_owned(),
+        status_label: terminal.status.label(),
+        output,
+        last_error: terminal.last_error.clone(),
+        host_key_issue: terminal.host_key_issue.clone(),
+        current_directory: terminal.current_directory.clone(),
+    }
+}
+
+/// Pushes terminal output to the webview instead of having it poll.
+///
+/// Polling cost the main thread an IPC round trip every 32 ms per visible
+/// terminal whether or not anything had happened. This thread instead sits on a
+/// condvar, wakes the moment the user types, and backs off when the session
+/// falls quiet.
+fn spawn_terminal_pump(app: AppHandle, signal: Arc<PumpSignal>) {
+    let spawned = thread::Builder::new()
+        .name("terminal-pump".to_owned())
+        .spawn(move || {
+            let mut last_metadata: HashMap<Uuid, TerminalMetadata> = HashMap::new();
+            let mut idle_rounds: u32 = 0;
+
+            loop {
+                let mut pending: Vec<(Uuid, TerminalDrain)> = Vec::new();
+                {
+                    // `try_state` rather than `state` so a teardown race ends the
+                    // thread quietly instead of panicking.
+                    let Some(state) = app.try_state::<AppRuntime>() else {
+                        return;
+                    };
+                    let mut terminals = lock_poison_ok(&state.terminals);
+                    last_metadata.retain(|id, _| terminals.contains_key(id));
+                    for (id, terminal) in terminals.iter_mut() {
+                        let drain = drain_terminal(terminal);
+                        let metadata = TerminalMetadata::of(&drain);
+                        let changed = last_metadata.get(id) != Some(&metadata);
+                        if changed {
+                            last_metadata.insert(*id, metadata);
+                        }
+                        if changed || !drain.output.is_empty() {
+                            pending.push((*id, drain));
+                        }
+                    }
+                }
+
+                if pending.is_empty() {
+                    idle_rounds = idle_rounds.saturating_add(1);
+                } else {
+                    idle_rounds = 0;
+                    for (id, drain) in pending {
+                        app.emit(&terminal_event_name(id), drain).ok();
+                    }
+                }
+
+                signal.wait(terminal_pump_interval(idle_rounds));
+            }
+        });
+
+    if let Err(error) = spawned {
+        tracing::error!("failed to spawn terminal pump: {}", error);
+    }
+}
+
+fn terminal_event_name(terminal_id: Uuid) -> String {
+    format!("terminal://output/{}", terminal_id)
+}
+
+/// Fast while a session is producing output, relaxed once it goes quiet. User
+/// input bypasses this entirely by notifying the condvar.
+fn terminal_pump_interval(idle_rounds: u32) -> Duration {
+    let millis = match idle_rounds {
+        0..=40 => 8,
+        41..=200 => 24,
+        _ => 60,
+    };
+    Duration::from_millis(millis)
 }
 
 fn mark_profile_connected(profile_id: Uuid, state: &State<'_, AppRuntime>) -> Result<(), String> {
@@ -2092,93 +2400,6 @@ fn resolve_password(
     }
 
     Ok(None)
-}
-
-fn with_sftp<T, F>(
-    profile: &SessionProfile,
-    password: Option<&str>,
-    state: &State<'_, AppRuntime>,
-    mut action: F,
-) -> Result<T, String>
-where
-    F: FnMut(&mut sftp_service::SftpConnection) -> anyhow::Result<T>,
-{
-    let effective_profile = profile_for_secret(profile.clone(), password);
-
-    // Fast path: reuse an existing session under the lock only.
-    {
-        let mut sessions = lock(&state.sftp_sessions)?;
-        prune_sftp_sessions(&mut sessions, Some(profile.id));
-        if let Some(cached) = sessions.get_mut(&profile.id) {
-            cached.last_used = Instant::now();
-            match action(&mut cached.connection) {
-                Ok(value) => return Ok(value),
-                Err(_) => {
-                    // Drop dead session; reconnect outside the lock below.
-                    sessions.remove(&profile.id);
-                }
-            }
-        }
-    }
-
-    // Connect outside the sessions mutex so concurrent terminal/SFTP work
-    // cannot freeze the whole app while SSH/SFTP handshakes are in progress.
-    let connection =
-        sftp_service::SftpConnection::connect(&effective_profile, password).map_err(to_string)?;
-
-    let mut sessions = lock(&state.sftp_sessions)?;
-    // Another caller may have inserted a fresh session while we connected.
-    if let Some(cached) = sessions.get_mut(&profile.id) {
-        cached.last_used = Instant::now();
-        match action(&mut cached.connection) {
-            Ok(value) => return Ok(value),
-            Err(_) => {
-                sessions.remove(&profile.id);
-            }
-        }
-    }
-
-    sessions.insert(
-        profile.id,
-        CachedSftpConnection {
-            connection,
-            last_used: Instant::now(),
-        },
-    );
-    prune_sftp_sessions(&mut sessions, Some(profile.id));
-    let cached = sessions
-        .get_mut(&profile.id)
-        .ok_or_else(|| "SFTP 会话不存在".to_owned())?;
-    cached.last_used = Instant::now();
-    action(&mut cached.connection).map_err(to_string)
-}
-
-fn prune_sftp_sessions(sessions: &mut HashMap<Uuid, CachedSftpConnection>, keep: Option<Uuid>) {
-    let now = Instant::now();
-    sessions.retain(|id, cached| {
-        Some(*id) == keep || now.duration_since(cached.last_used) <= SFTP_IDLE_TIMEOUT
-    });
-
-    if sessions.len() <= SFTP_MAX_SESSIONS {
-        return;
-    }
-
-    let mut candidates: Vec<_> = sessions
-        .iter()
-        .filter_map(|(id, cached)| {
-            if Some(*id) == keep {
-                None
-            } else {
-                Some((*id, cached.last_used))
-            }
-        })
-        .collect();
-    candidates.sort_by_key(|(_, last_used)| *last_used);
-
-    let remove_count = sessions.len().saturating_sub(SFTP_MAX_SESSIONS);
-    for (id, _) in candidates.into_iter().take(remove_count) {
-        sessions.remove(&id);
-    }
 }
 
 fn snapshot_transfer(task: &TransferTask) -> TransferView {

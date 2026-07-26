@@ -1,3 +1,4 @@
+pub mod sftp_pool;
 pub mod sftp_service;
 pub mod ssh;
 pub mod storage;

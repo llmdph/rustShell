@@ -74,6 +74,9 @@ export type TerminalDrain = {
   currentDirectory?: string | null;
 };
 
+/** Event the backend pump emits per terminal. Must match `terminal_event_name` in main.rs. */
+export const terminalOutputEvent = (terminalId: string) => `terminal://output/${terminalId}`;
+
 export type ServerStatus = {
   hostname: string;
   os: string;

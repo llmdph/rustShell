@@ -106,7 +106,11 @@ impl HistoryBuffer {
 
     pub fn push(&mut self, bytes: &[u8]) {
         self.data.extend_from_slice(bytes);
-        if self.data.len() > self.cap {
+        // `drain` memmoves the whole buffer, so trimming on every push would
+        // cost O(cap) per chunk once full — roughly a megabyte moved per 16 KiB
+        // of output. Let the buffer overshoot and trim in one larger step
+        // instead, which amortises to O(1) per byte.
+        if self.data.len() > self.cap + self.cap / 4 {
             let drop = self.data.len() - self.cap;
             self.data.drain(..drop);
             self.start_offset += drop as u64;
@@ -263,7 +267,8 @@ impl TerminalModel {
 
     fn push_pending_output(&mut self, bytes: &[u8]) {
         self.pending_output.extend_from_slice(bytes);
-        if self.pending_output.len() > TERMINAL_PENDING_CAP {
+        // Same amortisation as `HistoryBuffer::push`: overshoot, then trim once.
+        if self.pending_output.len() > TERMINAL_PENDING_CAP + TERMINAL_PENDING_CAP / 4 {
             let drop = self.pending_output.len() - TERMINAL_PENDING_CAP;
             self.pending_output.drain(..drop);
             if self.pending_output.capacity() > TERMINAL_PENDING_CAP * 2 {
@@ -273,6 +278,19 @@ impl TerminalModel {
     }
 
     fn detect_current_directory(&mut self, bytes: &[u8]) -> Option<String> {
+        // Terminal output is dense with CSI colour codes, so testing for the
+        // OSC introducer specifically — rather than any ESC — keeps the common
+        // case to a cheap two-byte scan with no allocation and no lossy UTF-8
+        // conversion of the whole window.
+        if self.osc_scan_buffer.is_empty() && !contains_osc_start(bytes) {
+            // A trailing ESC may be the first half of an introducer that
+            // continues in the next chunk.
+            if bytes.last() == Some(&ESC) {
+                self.osc_scan_buffer.push(ESC);
+            }
+            return None;
+        }
+
         self.osc_scan_buffer.extend_from_slice(bytes);
         if self.osc_scan_buffer.len() > TERMINAL_OSC_SCAN_CAP {
             let drop = self.osc_scan_buffer.len() - TERMINAL_OSC_SCAN_CAP;
@@ -281,7 +299,18 @@ impl TerminalModel {
                 self.osc_scan_buffer.shrink_to(TERMINAL_OSC_SCAN_CAP);
             }
         }
-        detect_current_directory(&self.osc_scan_buffer)
+
+        let found = detect_current_directory(&self.osc_scan_buffer);
+        // Carry only an unterminated trailing sequence; anything already
+        // terminated has been consumed and must not be rescanned forever.
+        match pending_osc_start(&self.osc_scan_buffer) {
+            Some(0) => {}
+            Some(index) => {
+                self.osc_scan_buffer.drain(..index);
+            }
+            None => self.osc_scan_buffer.clear(),
+        }
+        found
     }
 
     pub fn screen_text(&self) -> String {
@@ -320,6 +349,27 @@ impl TerminalModel {
             command_tx.send(TerminalCommand::Shutdown).ok();
         }
     }
+}
+
+const ESC: u8 = 0x1b;
+const BEL: u8 = 0x07;
+
+fn contains_osc_start(bytes: &[u8]) -> bool {
+    bytes.windows(2).any(|pair| pair == [ESC, b']'])
+}
+
+/// Start index of a trailing OSC sequence that has not been terminated yet, so
+/// its remainder can be carried into the next chunk. `None` means the buffer
+/// holds nothing worth keeping.
+fn pending_osc_start(bytes: &[u8]) -> Option<usize> {
+    if bytes.last() == Some(&ESC) {
+        return Some(bytes.len() - 1);
+    }
+
+    let start = bytes.windows(2).rposition(|pair| pair == [ESC, b']'])?;
+    let terminated = bytes[start..].iter().any(|byte| *byte == BEL)
+        || bytes[start..].windows(2).any(|pair| pair == [ESC, b'\\']);
+    (!terminated).then_some(start)
 }
 
 fn detect_current_directory(bytes: &[u8]) -> Option<String> {
@@ -514,6 +564,40 @@ mod tests {
 
         assert_eq!(decode_terminal_stream(&mut decoder, &bytes[..1]), "");
         assert_eq!(decode_terminal_stream(&mut decoder, &bytes[1..]), "中");
+    }
+
+    #[test]
+    fn osc_scan_buffer_stays_empty_for_plain_colour_output() {
+        let mut terminal = TerminalModel::new(SessionProfile::new_local(), TerminalSize::default());
+
+        assert_eq!(
+            terminal.detect_current_directory(b"\x1b[32mgreen\x1b[0m plain text"),
+            None
+        );
+        assert!(terminal.osc_scan_buffer.is_empty());
+    }
+
+    #[test]
+    fn osc_scan_buffer_reassembles_sequence_split_across_chunks() {
+        let mut terminal = TerminalModel::new(SessionProfile::new_local(), TerminalSize::default());
+
+        assert_eq!(terminal.detect_current_directory(b"\x1b]7;file:///srv"), None);
+        assert_eq!(
+            terminal.detect_current_directory(b"/app\x07$ "),
+            Some("/srv/app".to_owned())
+        );
+        // The completed sequence must not linger and be reported again.
+        assert!(terminal.osc_scan_buffer.is_empty());
+        assert_eq!(terminal.detect_current_directory(b"ls -la\r\n"), None);
+    }
+
+    #[test]
+    fn pending_osc_start_detects_terminated_and_partial_sequences() {
+        assert_eq!(pending_osc_start(b"\x1b]7;file:///a\x07"), None);
+        assert_eq!(pending_osc_start(b"\x1b]7;file:///a\x1b\\"), None);
+        assert_eq!(pending_osc_start(b"plain output"), None);
+        assert_eq!(pending_osc_start(b"noise\x1b]7;file:///a"), Some(5));
+        assert_eq!(pending_osc_start(b"noise\x1b"), Some(5));
     }
 
     #[test]

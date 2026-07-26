@@ -1,9 +1,10 @@
+import { listen as listenTauriEvent } from "@tauri-apps/api/event";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { useCallback, useEffect, useRef, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 
 import { clampNumber } from "@/lib/math";
-import { api, type AppSettings, type TerminalDrain, type TerminalView } from "../../api";
+import { api, terminalOutputEvent, type AppSettings, type TerminalDrain, type TerminalView } from "../../api";
 
 type XtermViewProps = {
   terminal: TerminalView;
@@ -43,10 +44,11 @@ function xtermTheme(theme: AppSettings["theme"], backgroundAlpha = 100) {
   };
 }
 
-const HIDDEN_DRAIN_DELAY = 250;
-const VISIBLE_DRAIN_WARM_IDLE_DELAY = 32;
-const VISIBLE_DRAIN_IDLE_DELAY = 80;
-const VISIBLE_DRAIN_COLD_IDLE_DELAY = 160;
+/// Output arrives as a push event from the backend pump. This poll only exists
+/// as a safety net for output that lands between mount and subscription, so it
+/// runs rarely and skips entirely while events are flowing.
+const DRAIN_SAFETY_POLL_DELAY = 2000;
+const DRAIN_EVENT_STALE_AFTER = 1500;
 
 export function XtermView({ terminal, settings, active, visible, paneStyle, terminalBackgroundAlpha, onActivate, onDrain, onReplayConsumed }: XtermViewProps) {
   const shown = visible ?? active;
@@ -323,66 +325,74 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
   useEffect(() => {
     let stopped = false;
     let timer = 0;
+    let unlisten: (() => void) | null = null;
     const fast = shown;
-    let idleRounds = 0;
+    let lastEventAt = 0;
     let lastStatus = terminal.status;
     let lastError = terminal.lastError ?? "";
     let lastHostKey = terminal.hostKeyIssue?.fingerprint ?? "";
     let lastDirectory = terminal.currentDirectory ?? "";
 
-    const idleDelay = () => {
-      if (!fast) return HIDDEN_DRAIN_DELAY;
-      if (idleRounds < 4) return VISIBLE_DRAIN_WARM_IDLE_DELAY;
-      if (idleRounds < 20) return VISIBLE_DRAIN_IDLE_DELAY;
-      return VISIBLE_DRAIN_COLD_IDLE_DELAY;
+    const consume = (drain: TerminalDrain) => {
+      if (stopped) return;
+      if (drain.output) {
+        if (fast) {
+          scheduleDrainWrite(drain.output);
+        } else {
+          drainOutputRef.current += drain.output;
+        }
+      }
+      const nextError = drain.lastError ?? "";
+      const nextHostKey = drain.hostKeyIssue?.fingerprint ?? "";
+      const nextDirectory = drain.currentDirectory ?? "";
+      const metadataChanged =
+        drain.status !== lastStatus ||
+        nextError !== lastError ||
+        nextHostKey !== lastHostKey ||
+        nextDirectory !== lastDirectory;
+      if (metadataChanged) {
+        lastStatus = drain.status;
+        lastError = nextError;
+        lastHostKey = nextHostKey;
+        lastDirectory = nextDirectory;
+        onDrainRef.current(drain);
+      }
     };
 
-    const drainLoop = async () => {
-      let nextDelay = idleDelay();
+    void listenTauriEvent<TerminalDrain>(terminalOutputEvent(terminal.id), (event) => {
+      lastEventAt = Date.now();
+      consume(event.payload);
+    })
+      .then((dispose) => {
+        if (stopped) dispose();
+        else unlisten = dispose;
+      })
+      .catch(() => undefined);
+
+    // Catch up on anything the backend produced before the listener attached,
+    // then only re-check if the push channel has gone quiet unexpectedly.
+    const safetyPoll = async (initial: boolean) => {
+      if (!initial && Date.now() - lastEventAt < DRAIN_EVENT_STALE_AFTER) {
+        timer = window.setTimeout(() => void safetyPoll(false), DRAIN_SAFETY_POLL_DELAY);
+        return;
+      }
       try {
-        const drain = await api.terminalDrain(terminal.id);
-        const hasOutput = Boolean(drain.output);
-        if (hasOutput) {
-          if (fast) {
-            scheduleDrainWrite(drain.output);
-          } else {
-            drainOutputRef.current += drain.output;
-          }
-        }
-        const nextError = drain.lastError ?? "";
-        const nextHostKey = drain.hostKeyIssue?.fingerprint ?? "";
-        const nextDirectory = drain.currentDirectory ?? "";
-        const metadataChanged =
-          drain.status !== lastStatus ||
-          nextError !== lastError ||
-          nextHostKey !== lastHostKey ||
-          nextDirectory !== lastDirectory;
-        if (metadataChanged) {
-          lastStatus = drain.status;
-          lastError = nextError;
-          lastHostKey = nextHostKey;
-          lastDirectory = nextDirectory;
-          onDrainRef.current(drain);
-        }
-        if (hasOutput || metadataChanged) {
-          idleRounds = 0;
-          nextDelay = fast && hasOutput ? 0 : idleDelay();
-        } else {
-          idleRounds += 1;
-          nextDelay = idleDelay();
-        }
+        consume(await api.terminalDrain(terminal.id));
       } catch {
         stopped = true;
+        return;
       }
       if (!stopped) {
-        timer = window.setTimeout(drainLoop, nextDelay);
+        timer = window.setTimeout(() => void safetyPoll(false), DRAIN_SAFETY_POLL_DELAY);
       }
     };
 
-    timer = window.setTimeout(drainLoop, 0);
+    void safetyPoll(true);
+
     return () => {
       stopped = true;
       window.clearTimeout(timer);
+      unlisten?.();
     };
   }, [active, shown, scheduleDrainWrite, terminal.id]);
 

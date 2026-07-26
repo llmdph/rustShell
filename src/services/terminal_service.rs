@@ -4,7 +4,7 @@ use crate::core::{
 };
 use crate::services::ssh::{self, ConnectFailure};
 use anyhow::{Context, Result};
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use portable_pty::{CommandBuilder, PtySize};
 use ssh2::ErrorCode;
 use std::{
@@ -364,36 +364,47 @@ fn run_ssh_shell(
     event_tx.send(TerminalEvent::Connected).ok();
 
     let mut buffer = [0_u8; 16 * 1024];
+    let mut idle_rounds: u32 = 0;
     loop {
         while let Ok(command) = command_rx.try_recv() {
-            match command {
-                TerminalCommand::Write(bytes) => {
-                    write_ssh_all(&mut channel, &bytes)?;
+            if apply_ssh_command(&mut channel, command)? {
+                return Ok(());
+            }
+            idle_rounds = 0;
+        }
+
+        let idle = match channel.read(&mut buffer) {
+            Ok(0) if channel.eof() => break,
+            Ok(0) => true,
+            Ok(read) => {
+                idle_rounds = 0;
+                event_tx
+                    .send(TerminalEvent::Output(buffer[..read].to_vec()))
+                    .ok();
+                false
+            }
+            Err(error) if is_would_block(&error) => true,
+            Err(error) => return Err(error).context("failed to read SSH channel"),
+        };
+
+        // Nothing to read: park instead of spinning. Waiting on the command
+        // channel means a keystroke wakes us immediately, so the backoff only
+        // ever delays *unsolicited* server output.
+        if idle {
+            idle_rounds = idle_rounds.saturating_add(1);
+            match command_rx.recv_timeout(ssh_poll_interval(idle_rounds)) {
+                Ok(command) => {
+                    if apply_ssh_command(&mut channel, command)? {
+                        return Ok(());
+                    }
+                    idle_rounds = 0;
                 }
-                TerminalCommand::Resize(next_size) => {
-                    channel
-                        .request_pty_size(next_size.cols as u32, next_size.rows as u32, None, None)
-                        .context("failed to resize SSH PTY")?;
-                }
-                TerminalCommand::Shutdown => {
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
                     channel.close().ok();
                     return Ok(());
                 }
             }
-        }
-
-        match channel.read(&mut buffer) {
-            Ok(0) if channel.eof() => break,
-            Ok(0) => thread::sleep(Duration::from_millis(1)),
-            Ok(n) => {
-                event_tx
-                    .send(TerminalEvent::Output(buffer[..n].to_vec()))
-                    .ok();
-            }
-            Err(error) if is_would_block(&error) => {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) => return Err(error).context("failed to read SSH channel"),
         }
     }
 
@@ -402,6 +413,40 @@ fn run_ssh_shell(
         .send(TerminalEvent::Disconnected { exit_code: code })
         .ok();
     Ok(())
+}
+
+/// Applies one command to the channel. Returns `true` when the terminal should
+/// shut down.
+fn apply_ssh_command(channel: &mut ssh2::Channel, command: TerminalCommand) -> Result<bool> {
+    match command {
+        TerminalCommand::Write(bytes) => {
+            write_ssh_all(channel, &bytes)?;
+            Ok(false)
+        }
+        TerminalCommand::Resize(size) => {
+            channel
+                .request_pty_size(size.cols as u32, size.rows as u32, None, None)
+                .context("failed to resize SSH PTY")?;
+            Ok(false)
+        }
+        TerminalCommand::Shutdown => {
+            channel.close().ok();
+            Ok(true)
+        }
+    }
+}
+
+/// How long to wait for socket data before checking again. Stays tight while a
+/// session is streaming and relaxes once it goes quiet, which takes an idle
+/// terminal from ~1000 wakeups per second down to ~25.
+fn ssh_poll_interval(idle_rounds: u32) -> Duration {
+    let millis = match idle_rounds {
+        0..=32 => 2,
+        33..=160 => 8,
+        161..=600 => 20,
+        _ => 40,
+    };
+    Duration::from_millis(millis)
 }
 
 fn write_ssh_all(channel: &mut ssh2::Channel, mut bytes: &[u8]) -> Result<()> {
