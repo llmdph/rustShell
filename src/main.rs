@@ -2010,6 +2010,19 @@ fn main() {
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
                 window.set_icon(rustshell_window_icon())?;
+                // The window starts hidden and the frontend reveals it after
+                // first paint. If the webview wedges before that, show anyway
+                // rather than leaving the user with no window at all.
+                let reveal_fallback = window.clone();
+                thread::Builder::new()
+                    .name("main-window-reveal-fallback".to_owned())
+                    .spawn(move || {
+                        thread::sleep(Duration::from_millis(4000));
+                        if !reveal_fallback.is_visible().unwrap_or(true) {
+                            let _ = reveal_fallback.show();
+                        }
+                    })
+                    .ok();
             }
             spawn_terminal_pump(app.handle().clone(), terminal_pump);
             let tray_menu = MenuBuilder::new(app)

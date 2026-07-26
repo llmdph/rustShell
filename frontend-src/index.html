@@ -4,6 +4,20 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>RustShell</title>
+    <!-- Critical pre-paint: the window stays hidden until React has painted,
+         but if anything shows early (dev reloads, fallback reveal), the frame
+         must already be ink instead of flashing white. -->
+    <style>
+      html {
+        color-scheme: dark;
+        background: #101413;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
