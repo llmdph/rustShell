@@ -3252,6 +3252,7 @@ export default function App() {
             serverStatus={serverStatus}
             serverStatusLoading={serverStatusLoading}
             serverStatusError={serverStatusError}
+            linkStatus={activeTab?.status ?? null}
             onSearchChange={setSessionSearch}
             onExpand={() => setLeftPanelCollapsed(false)}
             onCollapse={() => setLeftPanelCollapsed(true)}

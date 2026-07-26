@@ -9,7 +9,15 @@ type ConnectionOverviewProps = {
   serverStatus: ServerStatus | null;
   serverStatusLoading: boolean;
   serverStatusError: string;
+  linkStatus?: "disconnected" | "connecting" | "connected" | "failed" | null;
   onRefreshServerStatus: () => void;
+};
+
+const linkStatusLabel: Record<NonNullable<ConnectionOverviewProps["linkStatus"]>, string> = {
+  connected: "已连接",
+  connecting: "连接中",
+  disconnected: "未连接",
+  failed: "连接失败"
 };
 
 export function ConnectionOverview({
@@ -17,12 +25,21 @@ export function ConnectionOverview({
   serverStatus,
   serverStatusLoading,
   serverStatusError,
+  linkStatus,
   onRefreshServerStatus
 }: ConnectionOverviewProps) {
   return (
     <section className="mt-0 border-t border-border/70 pt-2">
       <div className="mb-1.5 flex min-w-0 items-center justify-between gap-2">
-        <h3 className="m-0 text-[13px] font-semibold">连接概览</h3>
+        <div className="flex min-w-0 items-center gap-1.5">
+          <h3 className="m-0 text-[13px] font-semibold">连接概览</h3>
+          {linkStatus != null && (
+            <>
+              <span className={"signal-dot signal-dot--" + linkStatus} />
+              <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">{linkStatusLabel[linkStatus]}</span>
+            </>
+          )}
+        </div>
         <IconButton
           className="h-6 min-w-6 p-0"
           title="刷新服务器状态"

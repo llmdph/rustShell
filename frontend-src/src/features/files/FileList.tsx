@@ -1,5 +1,5 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Folder, Link2 } from "lucide-react";
+import { File, Folder, Link2 } from "lucide-react";
 import { memo, useLayoutEffect, useMemo, useRef, type CSSProperties, type DragEvent, type KeyboardEvent, type MouseEvent } from "react";
 
 import type { FileEntry } from "@/api";
@@ -289,7 +289,7 @@ const FileRow = memo(function FileRow({
           .join(" · ")}
       >
         <span className="inline-flex w-full min-w-0 items-center gap-[5px]">
-          {file.fileType === "symlink" ? <Link2 size={13} className="shrink-0" /> : file.isDir ? <Folder size={13} className="shrink-0" /> : <span className="h-2.5 w-[7px] shrink-0 rounded-[1px] bg-muted-foreground" />}
+          {file.fileType === "symlink" ? <Link2 size={13} className="shrink-0" /> : file.isDir ? <Folder size={13} className="shrink-0" /> : <File size={13} className="shrink-0 text-muted-foreground" />}
           <span className="min-w-0 flex-1 truncate">{file.name}</span>
           {compareText && <span className="max-w-24 shrink-0 truncate rounded-[3px] bg-secondary px-1 py-px text-[11px] text-muted-foreground @max-[450px]/file-list:hidden" title={compareDetail || compareText}>{compareText}</span>}
           {file.linkTarget && <span className="min-w-0 truncate text-muted-foreground @max-[560px]/file-list:hidden">-&gt; {file.linkTarget}</span>}

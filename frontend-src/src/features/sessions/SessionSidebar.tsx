@@ -17,6 +17,7 @@ type SessionSidebarProps = {
   serverStatus: ServerStatus | null;
   serverStatusLoading: boolean;
   serverStatusError: string;
+  linkStatus?: "disconnected" | "connecting" | "connected" | "failed" | null;
   onSearchChange: (value: string) => void;
   onExpand: () => void;
   onCollapse: () => void;
@@ -42,6 +43,7 @@ export function SessionSidebar({
   serverStatus,
   serverStatusLoading,
   serverStatusError,
+  linkStatus,
   onSearchChange,
   onExpand,
   onCollapse,
@@ -118,6 +120,7 @@ export function SessionSidebar({
             serverStatus={serverStatus}
             serverStatusLoading={serverStatusLoading}
             serverStatusError={serverStatusError}
+            linkStatus={linkStatus}
             onRefreshServerStatus={onRefreshServerStatus}
           />
         </>

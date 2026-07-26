@@ -32,10 +32,10 @@ type TerminalTabsProps = {
 };
 
 const statusDotClass: Record<TerminalView["status"], string> = {
-  disconnected: "bg-muted-foreground",
-  connected: "bg-emerald-500",
-  connecting: "bg-yellow-500",
-  failed: "bg-destructive"
+  disconnected: "signal-dot--disconnected",
+  connected: "signal-dot--connected",
+  connecting: "signal-dot--connecting",
+  failed: "signal-dot--failed"
 };
 
 function tabIdFromDrag(event: DragEvent<HTMLElement>) {
@@ -240,7 +240,7 @@ export function TerminalTabs({
               }
             }}
           >
-            <span className={cn("size-1.5 flex-none rounded-full", statusDotClass[tab.status])} />
+            <span className={cn("signal-dot", statusDotClass[tab.status])} />
             <span className="min-w-0 flex-1 truncate text-xs">{tab.title}</span>
             <button
               type="button"
