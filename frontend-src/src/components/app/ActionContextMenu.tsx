@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 
 import {
   ContextMenu,
@@ -13,22 +13,34 @@ export type FileAction =
   | { type?: "action"; label: string; icon: ReactNode; onClick: () => void; disabled?: boolean; danger?: boolean };
 
 type ActionContextMenuProps = {
-  actions: FileAction[];
+  /**
+   * Pass a getter when this menu is attached to a list row. Callers that build
+   * their action list inline can keep passing the array; callers that need a
+   * stable prop (so the row can be memoised) pass a stable getter instead, and
+   * it is only invoked when the menu opens — so it still sees fresh state.
+   */
+  actions: FileAction[] | (() => FileAction[]);
   children: ReactNode;
 };
 
 export function ActionContextMenu({ actions, children }: ActionContextMenuProps) {
+  const [open, setOpen] = useState(false);
+
   return (
-    <ContextMenu>
+    <ContextMenu onOpenChange={setOpen}>
       <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-      <FileContextMenu actions={actions} />
+      {/* Content stays mounted so Radix's positioning and presence behaviour is
+          unchanged; only the items are built on demand. */}
+      <ContextMenuContent className="w-56 max-w-[min(22rem,calc(100vw-1rem))]">
+        {open ? <FileContextMenuItems actions={typeof actions === "function" ? actions() : actions} /> : null}
+      </ContextMenuContent>
     </ContextMenu>
   );
 }
 
-function FileContextMenu({ actions }: { actions: FileAction[] }) {
+function FileContextMenuItems({ actions }: { actions: FileAction[] }) {
   return (
-    <ContextMenuContent className="w-56 max-w-[min(22rem,calc(100vw-1rem))]">
+    <>
       {actions.map((action, index) =>
         action.type === "separator" ? (
           <ContextMenuSeparator key={`separator-${index}`} />
@@ -46,6 +58,6 @@ function FileContextMenu({ actions }: { actions: FileAction[] }) {
           </ContextMenuItem>
         )
       )}
-    </ContextMenuContent>
+    </>
   );
 }

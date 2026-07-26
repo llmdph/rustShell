@@ -1,6 +1,6 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Cable, ChevronRight, Copy, Folder, FolderPlus, KeyRound, Monitor, Settings, Trash2 } from "lucide-react";
-import { memo, useRef, type CSSProperties } from "react";
+import { memo, useLayoutEffect, useMemo, useRef, type CSSProperties } from "react";
 
 import type { Profile } from "@/api";
 import { ActionContextMenu, type FileAction } from "@/components/app/ActionContextMenu";
@@ -48,65 +48,105 @@ export function SessionTree({
     overscan: 16
   });
 
-  const contextActions = (profile: Profile): FileAction[] => [
-    {
-      label: "连接",
-      icon: <Monitor size={14} />,
-      onClick: () => onConnect(profile)
-    },
-    {
-      label: "输入密码并连接",
-      icon: <KeyRound size={14} />,
-      onClick: () => onSecret(profile),
-      disabled: isLocalProtocol(profile.protocol)
-    },
-    { type: "separator" },
-    {
-      label: "属性",
-      icon: <Settings size={14} />,
-      onClick: () => onEdit(profile)
-    },
-    {
-      label: "复制连接命令",
-      icon: <Copy size={14} />,
-      onClick: () => onCopyCommand(profile)
-    },
-    {
-      label: "复制会话",
-      icon: <Copy size={14} />,
-      onClick: () => onDuplicate(profile)
-    },
-    { type: "separator" },
-    {
-      label: "删除",
-      icon: <Trash2 size={14} />,
-      onClick: () => onDelete(profile),
-      danger: true
-    }
-  ];
+  // Same problem as FileList: these action builders and the row callbacks are
+  // rebuilt every render, which defeated the row memos and re-rendered every
+  // visible row on any app state change. Reach them through a ref refreshed
+  // after commit so the rows can take stable props without going stale.
+  const latestRef = useRef({
+    onConnect,
+    onSecret,
+    onEdit,
+    onCopyCommand,
+    onDuplicate,
+    onDelete,
+    onSelect,
+    onCreateProfile,
+    addFolder,
+    deleteFolder,
+    toggleGroup
+  });
+  useLayoutEffect(() => {
+    latestRef.current = {
+      onConnect,
+      onSecret,
+      onEdit,
+      onCopyCommand,
+      onDuplicate,
+      onDelete,
+      onSelect,
+      onCreateProfile,
+      addFolder,
+      deleteFolder,
+      toggleGroup
+    };
+  });
 
-  const folderActions = (path: string): FileAction[] => [
-    {
-      label: "新建目录",
-      icon: <FolderPlus size={14} />,
-      onClick: () => addFolder(path)
-    },
-    {
-      label: "新建连接",
-      icon: <Cable size={14} />,
-      onClick: () => onCreateProfile(path)
-    },
-    { type: "separator" },
-    {
-      label: "删除目录",
-      icon: <Trash2 size={14} />,
-      onClick: () => {
-        void deleteFolder(path);
-      },
-      disabled: isProtectedSessionFolder(path),
-      danger: true
-    }
-  ];
+  const rowCallbacks = useMemo(
+    () => ({
+      onSelect: (profile: Profile) => latestRef.current.onSelect(profile),
+      onConnect: (profile: Profile) => latestRef.current.onConnect(profile),
+      onToggleFolder: (path: string) => latestRef.current.toggleGroup(path),
+      getProfileActions: (profile: Profile): FileAction[] => [
+        {
+          label: "连接",
+          icon: <Monitor size={14} />,
+          onClick: () => latestRef.current.onConnect(profile)
+        },
+        {
+          label: "输入密码并连接",
+          icon: <KeyRound size={14} />,
+          onClick: () => latestRef.current.onSecret(profile),
+          disabled: isLocalProtocol(profile.protocol)
+        },
+        { type: "separator" },
+        {
+          label: "属性",
+          icon: <Settings size={14} />,
+          onClick: () => latestRef.current.onEdit(profile)
+        },
+        {
+          label: "复制连接命令",
+          icon: <Copy size={14} />,
+          onClick: () => latestRef.current.onCopyCommand(profile)
+        },
+        {
+          label: "复制会话",
+          icon: <Copy size={14} />,
+          onClick: () => latestRef.current.onDuplicate(profile)
+        },
+        { type: "separator" },
+        {
+          label: "删除",
+          icon: <Trash2 size={14} />,
+          onClick: () => latestRef.current.onDelete(profile),
+          danger: true
+        }
+      ],
+      getFolderActions: (path: string): FileAction[] => [
+        {
+          label: "新建目录",
+          icon: <FolderPlus size={14} />,
+          onClick: () => latestRef.current.addFolder(path)
+        },
+        {
+          label: "新建连接",
+          icon: <Cable size={14} />,
+          onClick: () => latestRef.current.onCreateProfile(path)
+        },
+        { type: "separator" },
+        {
+          label: "删除目录",
+          icon: <Trash2 size={14} />,
+          onClick: () => {
+            void latestRef.current.deleteFolder(path);
+          },
+          disabled: isProtectedSessionFolder(path),
+          danger: true
+        }
+      ]
+    }),
+    []
+  );
 
   const renderTreeItem = (item: SessionTreeItem, style: CSSProperties) => {
     if (item.kind === "folder") {
@@ -117,8 +157,9 @@ export function SessionTree({
           collapsed={item.collapsed}
           indent={3 + item.depth * 13}
           style={style}
-          actions={folderActions(item.node.path)}
-          onToggle={() => toggleGroup(item.node.path)}
+          path={item.node.path}
+          getActions={rowCallbacks.getFolderActions}
+          onToggle={rowCallbacks.onToggleFolder}
         />
       );
     }
@@ -131,9 +172,9 @@ export function SessionTree({
         active={profile.id === activeProfileId}
         indent={20 + item.depth * 13}
         style={style}
-        actions={contextActions(profile)}
-        onSelect={onSelect}
-        onConnect={onConnect}
+        getActions={rowCallbacks.getProfileActions}
+        onSelect={rowCallbacks.onSelect}
+        onConnect={rowCallbacks.onConnect}
       />
     );
   };
@@ -161,22 +202,24 @@ const SessionFolderRow = memo(function SessionFolderRow({
   collapsed,
   indent,
   style,
-  actions,
+  path,
+  getActions,
   onToggle
 }: {
   name: string;
   collapsed: boolean;
   indent: number;
   style: CSSProperties;
-  actions: FileAction[];
-  onToggle: () => void;
+  path: string;
+  getActions: (path: string) => FileAction[];
+  onToggle: (path: string) => void;
 }) {
   return (
-    <ActionContextMenu actions={actions}>
+    <ActionContextMenu actions={() => getActions(path)}>
       <button
         className="grid h-5 w-full grid-cols-[12px_14px_minmax(0,1fr)] items-center gap-0.5 rounded-[2px] border-0 bg-transparent pr-[3px] text-left text-xs font-semibold leading-none text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
         style={{ ...style, paddingLeft: indent }}
-        onClick={onToggle}
+        onClick={() => onToggle(path)}
         title={collapsed ? "展开目录" : "收起目录"}
       >
         <ChevronRight className={cn("text-muted-foreground/90 transition-transform duration-150", !collapsed && "rotate-90")} size={11} />
@@ -192,7 +235,7 @@ const SessionProfileRow = memo(function SessionProfileRow({
   active,
   indent,
   style,
-  actions,
+  getActions,
   onSelect,
   onConnect
 }: {
@@ -200,12 +243,12 @@ const SessionProfileRow = memo(function SessionProfileRow({
   active: boolean;
   indent: number;
   style: CSSProperties;
-  actions: FileAction[];
+  getActions: (profile: Profile) => FileAction[];
   onSelect: (profile: Profile) => void;
   onConnect: (profile: Profile) => void;
 }) {
   return (
-    <ActionContextMenu actions={actions}>
+    <ActionContextMenu actions={() => getActions(profile)}>
       <button
         className={cn(
           "grid min-h-5 w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-[5px] rounded-[1px] border-0 bg-transparent pr-1 text-left text-xs leading-none text-foreground transition-colors hover:bg-muted/70",

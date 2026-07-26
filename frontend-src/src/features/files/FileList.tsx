@@ -1,6 +1,6 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Folder, Link2 } from "lucide-react";
-import { memo, useMemo, useRef, type CSSProperties, type DragEvent, type KeyboardEvent, type MouseEvent } from "react";
+import { memo, useLayoutEffect, useMemo, useRef, type CSSProperties, type DragEvent, type KeyboardEvent, type MouseEvent } from "react";
 
 import type { FileEntry } from "@/api";
 import { ActionContextMenu, type FileAction } from "@/components/app/ActionContextMenu";
@@ -82,6 +82,60 @@ export function FileList({
 }: FileListProps) {
   const selectedPathSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
   const listBodyRef = useRef<HTMLDivElement | null>(null);
+
+  // App rebuilds `contextActions` and most of these callbacks on every render,
+  // which defeated `FileRow`'s memo and re-rendered every visible row (~59 per
+  // pane) on any state change anywhere in the app. Route them through a ref that
+  // is refreshed after each commit and hand the rows stable wrappers instead.
+  // Because the ref always holds the latest props, the handlers cannot go stale.
+  const latestRef = useRef({
+    contextActions,
+    compareMarkLabel,
+    formatOwner,
+    formatSize,
+    formatFileDateTime,
+    formatEntrySymbolicMode,
+    onSelect,
+    onOpen,
+    onDragStart,
+    onDragEnd,
+    onContextMenu
+  });
+  useLayoutEffect(() => {
+    latestRef.current = {
+      contextActions,
+      compareMarkLabel,
+      formatOwner,
+      formatSize,
+      formatFileDateTime,
+      formatEntrySymbolicMode,
+      onSelect,
+      onOpen,
+      onDragStart,
+      onDragEnd,
+      onContextMenu
+    };
+  });
+
+  const rowProps = useMemo(
+    () => ({
+      getContextActions: () => latestRef.current.contextActions,
+      compareMarkLabel: (mark: FileCompareMark) => latestRef.current.compareMarkLabel(mark),
+      formatOwner: (file: FileEntry) => latestRef.current.formatOwner(file),
+      formatSize: (size: number) => latestRef.current.formatSize(size),
+      formatFileDateTime: (value: string, withSeconds?: boolean) =>
+        latestRef.current.formatFileDateTime(value, withSeconds),
+      formatEntrySymbolicMode: (file: FileEntry) => latestRef.current.formatEntrySymbolicMode(file),
+      onSelect: (file: FileEntry, event: MouseEvent<HTMLButtonElement>) => latestRef.current.onSelect(file, event),
+      onOpen: (file: FileEntry) => latestRef.current.onOpen(file),
+      onDragStart: (file: FileEntry, event: DragEvent<HTMLButtonElement>) =>
+        latestRef.current.onDragStart(file, event),
+      onDragEnd: () => latestRef.current.onDragEnd(),
+      onContextMenu: (event: MouseEvent, file?: FileEntry, alreadySelected?: boolean) =>
+        latestRef.current.onContextMenu(event, file, alreadySelected)
+    }),
+    []
+  );
   const rowVirtualizer = useVirtualizer({
     count: files.length,
     getItemKey: (index) => files[index]?.path ?? index,
@@ -157,17 +211,7 @@ export function FileList({
                     left: 0,
                     transform: `translateY(${virtualRow.start}px)`
                   }}
-                  contextActions={contextActions}
-                  compareMarkLabel={compareMarkLabel}
-                  formatOwner={formatOwner}
-                  formatSize={formatSize}
-                  formatFileDateTime={formatFileDateTime}
-                  formatEntrySymbolicMode={formatEntrySymbolicMode}
-                  onSelect={onSelect}
-                  onOpen={onOpen}
-                  onDragStart={onDragStart}
-                  onDragEnd={onDragEnd}
-                  onContextMenu={onContextMenu}
+                  {...rowProps}
                 />
               );
             })}
@@ -184,7 +228,8 @@ type FileRowProps = {
   selected: boolean;
   primary: boolean;
   style: CSSProperties;
-  contextActions: FileAction[];
+  /** Stable getter; invoked only when the row's context menu opens. */
+  getContextActions: () => FileAction[];
   compareMarkLabel: (mark: FileCompareMark) => string;
   formatOwner: (file: FileEntry) => string;
   formatSize: (size: number) => string;
@@ -203,7 +248,7 @@ const FileRow = memo(function FileRow({
   selected,
   primary,
   style,
-  contextActions,
+  getContextActions,
   compareMarkLabel,
   formatOwner,
   formatSize,
@@ -219,7 +264,7 @@ const FileRow = memo(function FileRow({
   const compareDetail = compareMark?.detail ?? "";
 
   return (
-    <ActionContextMenu actions={contextActions}>
+    <ActionContextMenu actions={getContextActions}>
       <button
         style={style}
         className={cn(
@@ -264,7 +309,7 @@ function areFileRowPropsEqual(prev: FileRowProps, next: FileRowProps) {
     prev.compareMark === next.compareMark &&
     prev.selected === next.selected &&
     prev.primary === next.primary &&
-    prev.contextActions === next.contextActions &&
+    prev.getContextActions === next.getContextActions &&
     prev.compareMarkLabel === next.compareMarkLabel &&
     prev.formatOwner === next.formatOwner &&
     prev.formatSize === next.formatSize &&
