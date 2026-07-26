@@ -188,8 +188,21 @@ export function transferAuditRecords(transfers: TransferView[], history: Transfe
   });
 }
 
-export function sameTransferList(left: TransferView[], right: TransferView[]) {
-  return left.length === right.length && transferListSignature(left) === transferListSignature(right);
+/**
+ * With `includeProgress: false`, lists that differ only in progress counters
+ * (transferred/speed/eta) compare equal. Used to skip re-renders while nothing
+ * that is actually on screen can change.
+ */
+export function sameTransferList(
+  left: TransferView[],
+  right: TransferView[],
+  options?: { includeProgress?: boolean }
+) {
+  const includeProgress = options?.includeProgress ?? true;
+  return (
+    left.length === right.length &&
+    transferListSignature(left, includeProgress) === transferListSignature(right, includeProgress)
+  );
 }
 
 export function transferPercent(transfer: TransferView) {
@@ -206,16 +219,16 @@ function escapeCsvCell(value: string) {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
-function transferListSignature(transfers: TransferView[]) {
+function transferListSignature(transfers: TransferView[], includeProgress: boolean) {
   return transfers
     .map((transfer) =>
       [
         transfer.id,
         transfer.status,
-        transfer.transferred,
-        transfer.total,
-        transfer.speedBps,
-        transfer.etaSeconds ?? "",
+        includeProgress ? transfer.transferred : "",
+        includeProgress ? transfer.total : "",
+        includeProgress ? transfer.speedBps : "",
+        includeProgress ? transfer.etaSeconds ?? "" : "",
         transfer.attempts,
         transfer.message ?? "",
         transfer.finishedAt ?? ""

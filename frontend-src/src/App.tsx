@@ -217,7 +217,7 @@ export default function App() {
     setTransferHistory,
     transfersRef,
     refreshTransfers
-  } = useTransferState();
+  } = useTransferState({ detailed: dialog === "transfers" });
   const [transferConflict, setTransferConflict] = useState<TransferConflictStrategy>("overwrite");
   const [terminalCommands, setTerminalCommands] = useState<Record<string, string>>({});
   const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);

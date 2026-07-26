@@ -1,4 +1,4 @@
-import { useRef, useState, type CSSProperties, type DragEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type DragEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from "react";
 
 import type { AppSettings, TerminalDrain, TerminalView } from "@/api";
 import { cn } from "@/lib/utils";
@@ -115,6 +115,22 @@ export function TerminalArea({
   const secondaryTabsRef = useRef<HTMLDivElement | null>(null);
   const [dropTarget, setDropTarget] = useState<TerminalSplitDropTarget | null>(null);
   const [insertTarget, setInsertTarget] = useState<TabInsertTarget | null>(null);
+  // Tab-drag pointermove can fire at a few hundred Hz; each sample forced a
+  // layout (getBoundingClientRect per tab) and committed a fresh object, so the
+  // whole terminal area — every XtermView included — re-rendered per event.
+  // Coalesce samples to one per frame and bail out when the marker is unmoved.
+  const tabDragFrameRef = useRef(0);
+  const tabDragSampleRef = useRef<{ tabId: string; point: TerminalTabDragPoint } | null>(null);
+
+  const cancelTabDragFrame = () => {
+    if (tabDragFrameRef.current) {
+      window.cancelAnimationFrame(tabDragFrameRef.current);
+      tabDragFrameRef.current = 0;
+    }
+    tabDragSampleRef.current = null;
+  };
+
+  useEffect(() => cancelTabDragFrame, []);
   const splitPaneTabIdSet = new Set(splitPaneTabIds);
   const primaryPaneTabs = splitPaneTabIds.length > 0 ? tabs.filter((tab) => !splitPaneTabIdSet.has(tab.id)) : tabs;
   const splitPaneTabs =
@@ -213,18 +229,37 @@ export function TerminalArea({
   };
 
   const handleTabPointerDrag = (tabId: string, point: TerminalTabDragPoint) => {
-    if (!tabs.some((tab) => tab.id === tabId)) return;
-    const nextInsertTarget = tabInsertTargetAtPoint(tabId, point);
-    if (nextInsertTarget) {
-      setInsertTarget(nextInsertTarget);
-      setDropTarget(null);
-      return;
-    }
-    setInsertTarget(null);
-    setDropTarget(splitTargetAtPoint(point));
+    tabDragSampleRef.current = { tabId, point };
+    if (tabDragFrameRef.current) return;
+    tabDragFrameRef.current = window.requestAnimationFrame(() => {
+      tabDragFrameRef.current = 0;
+      const sample = tabDragSampleRef.current;
+      if (!sample || !tabs.some((tab) => tab.id === sample.tabId)) return;
+      const nextInsertTarget = tabInsertTargetAtPoint(sample.tabId, sample.point);
+      if (nextInsertTarget) {
+        // Marker positions are quantized to tab edges, so most frames produce
+        // identical values; returning `current` lets React skip the render.
+        setInsertTarget((current) =>
+          current &&
+          current.pane === nextInsertTarget.pane &&
+          current.index === nextInsertTarget.index &&
+          current.left === nextInsertTarget.left &&
+          current.top === nextInsertTarget.top &&
+          current.height === nextInsertTarget.height
+            ? current
+            : nextInsertTarget
+        );
+        setDropTarget(null);
+        return;
+      }
+      setInsertTarget(null);
+      setDropTarget(splitTargetAtPoint(sample.point));
+    });
   };
 
   const handleTabPointerDrop = (tabId: string, point: TerminalTabDragPoint) => {
+    // A frame queued before the drop must not resurrect the marker afterwards.
+    cancelTabDragFrame();
     setDropTarget(null);
     setInsertTarget(null);
     if (!tabs.some((tab) => tab.id === tabId)) return;
@@ -395,6 +430,7 @@ export function TerminalArea({
         onDragOver={handleStackDragOver}
         onDragLeave={(event) => {
           if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+          cancelTabDragFrame();
           setDropTarget(null);
           setInsertTarget(null);
         }}

@@ -34,6 +34,18 @@ import type {
 } from "@/features/files/filePaneTypes";
 import { bookmarkLabel, loadPathBookmarks, savePathBookmarks, upsertBookmark } from "@/features/files/pathBookmarks";
 
+/**
+ * Stable stand-in while directory comparison is switched off (the default).
+ * Building the real thing walks both full listings into several Maps/Sets —
+ * thousands of allocations per directory change for a feature that isn't on.
+ * The summary UI only renders when the toggle is on, so this is invisible.
+ */
+const EMPTY_DIRECTORY_COMPARE: ReturnType<typeof buildDirectoryCompare> = {
+  local: new Map(),
+  remote: new Map(),
+  summary: { same: 0, different: 0, onlyLocal: 0, onlyRemote: 0 }
+};
+
 type PromptText = (title: string, options?: { defaultValue?: string }) => Promise<string | null>;
 type PushToast = (tone: "success" | "info" | "error", text: string) => void;
 
@@ -106,8 +118,11 @@ export function useFilePaneState({
     [deferredRemoteFilter, remoteFiles, remoteSort, showRemoteHidden]
   );
   const directoryCompare = useMemo(
-    () => buildDirectoryCompare(baseVisibleLocalFiles, baseVisibleRemoteFiles),
-    [baseVisibleLocalFiles, baseVisibleRemoteFiles]
+    () =>
+      compareDirectories
+        ? buildDirectoryCompare(baseVisibleLocalFiles, baseVisibleRemoteFiles)
+        : EMPTY_DIRECTORY_COMPARE,
+    [baseVisibleLocalFiles, baseVisibleRemoteFiles, compareDirectories]
   );
   const visibleLocalFiles = useMemo(
     () => filterCompareView(baseVisibleLocalFiles, directoryCompare.local, activeCompareView),
