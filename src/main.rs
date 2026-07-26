@@ -58,6 +58,10 @@ struct AppRuntime {
     /// Behind an `Arc` so blocking commands can hand an owned handle to
     /// `spawn_blocking` instead of borrowing from `State`.
     sftp: Arc<sftp_pool::SftpPool>,
+    /// Transfers get their own pool. Sharing the browsing pool would let a
+    /// multi-gigabyte upload hold the per-profile lock and stall every
+    /// directory listing for that host.
+    transfer_sftp: Arc<sftp_pool::SftpPool>,
     server_status_cache: Mutex<HashMap<Uuid, CachedServerStatus>>,
     password_cache: Mutex<HashMap<Uuid, String>>,
     settings: Mutex<AppSettings>,
@@ -1583,38 +1587,48 @@ fn start_transfer_with_attempts(
     let worker_source = task.source.clone();
     let worker_target = task.target.clone();
     let worker_attempts = attempts.max(1);
+    let worker_pool = state.transfer_sftp.clone();
     thread::Builder::new()
         .name(format!("transfer-{}", id))
+        // The UI enqueues one transfer per file, so a large selection spawns a
+        // lot of these; most sit blocked on the pool's per-profile lock. They
+        // do not need the default 8 MiB of reserved stack each.
+        .stack_size(512 * 1024)
         .spawn(move || {
-            let state_for_progress = transfer_state.clone();
-            let result = match worker_direction {
-                TransferDirection::Upload => sftp_service::upload_file_with_progress_with_strategy(
-                    &worker_profile,
-                    password.as_deref(),
-                    &worker_local_path,
-                    &worker_remote_path,
-                    worker_conflict,
-                    cancel.clone(),
-                    move |transferred, total| {
-                        update_transfer_progress(&state_for_progress, transferred, total);
-                    },
-                )
-                .map(Some),
-                TransferDirection::Download => {
-                    sftp_service::download_file_with_progress_with_strategy(
-                        &worker_profile,
-                        password.as_deref(),
-                        &worker_remote_path,
-                        &worker_local_path,
-                        worker_conflict,
-                        cancel.clone(),
-                        move |transferred, total| {
-                            update_transfer_progress(&state_for_progress, transferred, total);
-                        },
-                    )
-                    .map(|path| Some(path.display().to_string()))
+            let mut on_progress = {
+                let state_for_progress = transfer_state.clone();
+                move |transferred: u64, total: u64| {
+                    update_transfer_progress(&state_for_progress, transferred, total);
                 }
             };
+            // Route through the transfer pool so a queued batch reuses one
+            // authenticated session. Connecting per file meant a 200-file
+            // selection fired 200 concurrent handshakes, which is both slow and
+            // liable to trip sshd's MaxStartups and drop transfers at random.
+            let result = worker_pool
+                .with(&worker_profile, password.as_deref(), |connection| {
+                    match worker_direction {
+                        TransferDirection::Upload => sftp_service::upload_with_sftp(
+                            connection.sftp(),
+                            &worker_local_path,
+                            &worker_remote_path,
+                            worker_conflict,
+                            cancel.clone(),
+                            &mut on_progress,
+                        )
+                        .map(Some),
+                        TransferDirection::Download => sftp_service::download_with_sftp(
+                            connection.sftp(),
+                            &worker_remote_path,
+                            &worker_local_path,
+                            worker_conflict,
+                            cancel.clone(),
+                            &mut on_progress,
+                        )
+                        .map(|path| Some(path.display().to_string())),
+                    }
+                })
+                .map_err(anyhow::Error::msg);
 
             let mut guard = lock_poison_ok(&transfer_state);
             match result {
@@ -1853,6 +1867,7 @@ fn main() {
         profiles: Mutex::new(profiles),
         terminals: Mutex::new(HashMap::new()),
         sftp: Arc::new(sftp_pool::SftpPool::new()),
+        transfer_sftp: Arc::new(sftp_pool::SftpPool::new()),
         server_status_cache: Mutex::new(HashMap::new()),
         password_cache: Mutex::new(HashMap::new()),
         settings: Mutex::new(settings),

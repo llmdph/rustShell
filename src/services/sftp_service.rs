@@ -36,6 +36,12 @@ impl SftpConnection {
         Ok(Self { session, sftp })
     }
 
+    /// The open SFTP channel, so transfer code can stream over this session
+    /// rather than opening one of its own.
+    pub fn sftp(&self) -> &ssh2::Sftp {
+        &self.sftp
+    }
+
     /// Run a shell command over this connection's SSH session and return its
     /// stdout. Opening another channel on an authenticated session costs one
     /// round trip, versus a full TCP connect plus handshake plus auth for a
@@ -574,19 +580,45 @@ pub fn upload_file_with_progress_with_strategy<F>(
     remote_dir: &str,
     conflict: TransferConflictStrategy,
     cancel: Arc<AtomicBool>,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<String>
 where
     F: FnMut(u64, u64),
 {
     let session = connect(profile, password)?;
     let sftp = session.sftp().context("failed to start SFTP subsystem")?;
+    upload_with_sftp(
+        &sftp,
+        local_path,
+        remote_dir,
+        conflict,
+        cancel,
+        on_progress,
+    )
+}
+
+/// Upload over an already-open SFTP channel.
+///
+/// Split out from the connecting wrapper so a transfer queue can reuse one
+/// authenticated session instead of paying a TCP connect plus handshake plus
+/// auth per file.
+pub fn upload_with_sftp<F>(
+    sftp: &ssh2::Sftp,
+    local_path: &str,
+    remote_dir: &str,
+    conflict: TransferConflictStrategy,
+    cancel: Arc<AtomicBool>,
+    mut on_progress: F,
+) -> Result<String>
+where
+    F: FnMut(u64, u64),
+{
     let local_path = Path::new(local_path);
     let file_name = local_path
         .file_name()
         .ok_or_else(|| anyhow!("local file name is missing"))?
         .to_string_lossy();
-    let remote_path = resolve_remote_child_path(&sftp, remote_dir, &file_name, conflict)?;
+    let remote_path = resolve_remote_child_path(sftp, remote_dir, &file_name, conflict)?;
 
     let total = local_total_size(local_path)?;
     let root_metadata = fs::symlink_metadata(local_path).ok();
@@ -597,7 +629,7 @@ where
         .is_some_and(|metadata| metadata.file_type().is_symlink())
     {
         upload_symlink(
-            &sftp,
+            sftp,
             local_path,
             Path::new(&remote_path),
             total,
@@ -610,9 +642,9 @@ where
         .as_ref()
         .is_some_and(|metadata| metadata.is_dir())
     {
-        ensure_remote_dir(&sftp, Path::new(&remote_path))?;
+        ensure_remote_dir(sftp, Path::new(&remote_path))?;
         upload_dir_recursive(
-            &sftp,
+            sftp,
             local_path,
             &remote_path,
             total,
@@ -623,11 +655,11 @@ where
         )
         .context("failed to upload directory")?;
         if let Some(metadata) = root_metadata.as_ref() {
-            preserve_remote_metadata(&sftp, Path::new(&remote_path), metadata);
+            preserve_remote_metadata(sftp, Path::new(&remote_path), metadata);
         }
     } else {
         upload_single_file(
-            &sftp,
+            sftp,
             local_path,
             Path::new(&remote_path),
             total,
@@ -686,13 +718,35 @@ pub fn download_file_with_progress_with_strategy<F>(
     local_dir: &str,
     conflict: TransferConflictStrategy,
     cancel: Arc<AtomicBool>,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<PathBuf>
 where
     F: FnMut(u64, u64),
 {
     let session = connect(profile, password)?;
     let sftp = session.sftp().context("failed to start SFTP subsystem")?;
+    download_with_sftp(
+        &sftp,
+        remote_path,
+        local_dir,
+        conflict,
+        cancel,
+        on_progress,
+    )
+}
+
+/// Download over an already-open SFTP channel. See [`upload_with_sftp`].
+pub fn download_with_sftp<F>(
+    sftp: &ssh2::Sftp,
+    remote_path: &str,
+    local_dir: &str,
+    conflict: TransferConflictStrategy,
+    cancel: Arc<AtomicBool>,
+    mut on_progress: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(u64, u64),
+{
     let file_name = Path::new(remote_path)
         .file_name()
         .ok_or_else(|| anyhow!("remote file name is missing"))?;
@@ -702,12 +756,12 @@ where
     let stat = sftp
         .lstat(remote_path)
         .with_context(|| format!("failed to stat remote path {}", remote_path.display()))?;
-    let total = remote_total_size(&sftp, remote_path)?;
+    let total = remote_total_size(sftp, remote_path)?;
     let mut transferred = 0_u64;
     on_progress(transferred, total);
     if stat.file_type().is_symlink() {
         download_symlink(
-            &sftp,
+            sftp,
             remote_path,
             &local_path,
             total,
@@ -720,7 +774,7 @@ where
         fs::create_dir_all(&local_path)
             .with_context(|| format!("failed to create {}", local_path.display()))?;
         download_dir_recursive(
-            &sftp,
+            sftp,
             &remote_path_text,
             &local_path,
             total,
@@ -734,7 +788,7 @@ where
         preserve_local_times(&local_path, stat.atime, stat.mtime);
     } else {
         download_single_file(
-            &sftp,
+            sftp,
             remote_path,
             &local_path,
             total,
