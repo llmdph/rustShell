@@ -59,7 +59,7 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  --radius: 0.625rem;
+  --radius: 0.5rem;
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -93,40 +93,51 @@
   --sidebar-ring: oklch(0.708 0 0);
   --font-sans: "Geist Variable", ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei UI", sans-serif;
   --font-mono: "Geist Mono Variable", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  /* Link-state semantics: the only chrome tokens allowed to carry color.
+   * --signal is a live link (phosphor green), --standby is negotiating (amber). */
+  --signal: oklch(0.60 0.15 152);
+  --standby: oklch(0.63 0.12 78);
+  /* Motion primitives shared across app chrome. */
+  --ease-spring: cubic-bezier(0.2, 0.9, 0.25, 1.04);
+  --ease-swift: cubic-bezier(0.33, 0, 0.2, 1);
 }
 
+/* Dark: phosphor-glass. Near-black surfaces with a subtle green-cold cast
+ * (hue 165); chrome stays ink and saturated green appears only via --signal. */
 .dark {
-  --background: oklch(0.145 0 0);
+  --background: oklch(0.135 0.006 165);
   --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
+  --card: oklch(0.172 0.007 165);
   --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
+  --popover: oklch(0.188 0.007 165);
   --popover-foreground: oklch(0.985 0 0);
   --primary: oklch(0.922 0 0);
   --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
+  --secondary: oklch(0.235 0.008 165);
   --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
+  --muted: oklch(0.235 0.008 165);
   --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
+  --accent: oklch(0.235 0.008 165);
   --accent-foreground: oklch(0.985 0 0);
   --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
+  --border: oklch(0.95 0.012 165 / 9%);
+  --input: oklch(0.95 0.012 165 / 13%);
+  --ring: oklch(0.62 0.03 160);
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.696 0.17 162.48);
   --chart-3: oklch(0.769 0.188 70.08);
   --chart-4: oklch(0.627 0.265 303.9);
   --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: oklch(0.205 0 0);
+  --sidebar: oklch(0.172 0.007 165);
   --sidebar-foreground: oklch(0.985 0 0);
   --sidebar-primary: oklch(0.488 0.243 264.376);
   --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent: oklch(0.235 0.008 165);
   --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-border: oklch(0.95 0.012 165 / 9%);
   --sidebar-ring: oklch(0.556 0 0);
+  --signal: oklch(0.85 0.16 152);
+  --standby: oklch(0.83 0.13 80);
 }
 
 @theme inline {
@@ -161,6 +172,8 @@
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
+  --color-signal: var(--signal);
+  --color-standby: var(--standby);
   --font-sans: var(--font-sans);
   --font-mono: var(--font-mono);
   --radius-sm: calc(var(--radius) - 4px);
@@ -381,4 +394,123 @@
 [data-app-bg] [data-xterm-host] .xterm-viewport,
 [data-app-bg] [data-xterm-host] .xterm-screen {
   background-color: var(--xterm-background, transparent) !important;
+}
+
+/* ---------- Signal desk: link-state lights & chrome motion ----------
+ * Color is reserved for link state: --signal (phosphor green) means live,
+ * --standby (amber) means negotiating, --destructive means failed. Components
+ * elsewhere reference these class names directly, so keep them stable. The
+ * prefers-reduced-motion block in @layer base already neutralizes every
+ * animation declared here; do not add another. */
+
+/* Link-state dot. Base carries geometry only; state modifiers add color and
+ * bloom on top. */
+.signal-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+/* Live link: phosphor core with a layered soft bloom. */
+.signal-dot--connected {
+  background: var(--signal);
+  box-shadow:
+    0 0 4px 1px color-mix(in oklab, var(--signal) 55%, transparent),
+    0 0 10px 2px color-mix(in oklab, var(--signal) 20%, transparent);
+}
+
+/* Negotiating: amber standby light breathing while the link comes up. The
+ * static bloom below is the resting (reduced-motion) appearance; the keyframes
+ * modulate it. */
+.signal-dot--connecting {
+  background: var(--standby);
+  box-shadow:
+    0 0 4px 1px color-mix(in oklab, var(--standby) 38%, transparent),
+    0 0 10px 2px color-mix(in oklab, var(--standby) 13%, transparent);
+  animation: signal-breathe 1.6s var(--ease-swift) infinite;
+}
+
+/* Failed: a dead light. Flat destructive fill, deliberately no bloom. */
+.signal-dot--failed {
+  background: var(--destructive);
+  box-shadow: none;
+}
+
+/* Disconnected: an unlit socket. Hollow ring, no fill, no color. */
+.signal-dot--disconnected {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--muted-foreground) 60%, transparent);
+}
+
+@keyframes signal-breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+    box-shadow:
+      0 0 3px 1px color-mix(in oklab, var(--standby) 28%, transparent),
+      0 0 8px 2px color-mix(in oklab, var(--standby) 10%, transparent);
+  }
+  50% {
+    opacity: 1;
+    box-shadow:
+      0 0 5px 2px color-mix(in oklab, var(--standby) 55%, transparent),
+      0 0 12px 3px color-mix(in oklab, var(--standby) 20%, transparent);
+  }
+}
+
+/* Variable-weight shimmer for wordmark glyphs. Runs on the mono face, whose
+ * advance widths are weight-invariant, so glyphs never reflow. Per-glyph phase
+ * offset comes from an inline animation-delay. */
+.glyph-wave {
+  display: inline-block;
+  animation: glyph-wave 3.2s ease-in-out infinite both;
+}
+
+@keyframes glyph-wave {
+  0%,
+  100% {
+    font-weight: 460;
+  }
+  50% {
+    font-weight: 720;
+  }
+}
+
+/* Terminal-style blinking block cursor for boot and empty states. */
+.boot-cursor {
+  display: inline-block;
+  animation: cursor-blink 1.1s steps(1, end) infinite;
+}
+
+@keyframes cursor-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+/* One composited fade for the whole frame on mount. */
+#root > * {
+  animation: app-reveal 300ms var(--ease-swift) both;
+}
+
+@keyframes app-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Selection picks up the signal hue in the dark theme only; light keeps the
+ * platform default. */
+.dark ::selection {
+  background: color-mix(in oklab, var(--signal) 24%, transparent);
 }
