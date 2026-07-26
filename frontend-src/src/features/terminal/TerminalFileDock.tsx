@@ -48,6 +48,8 @@ type TerminalFileDockProps = {
   profileId?: string | null;
   dropTargetId?: string;
   sessionLabel: string;
+  /** Terminal session status; remote dock waits until connected to avoid blocking SFTP. */
+  sessionStatus?: "disconnected" | "connecting" | "connected" | "failed";
   followPath: string | null;
   height: number;
   dropActive?: boolean;
@@ -291,6 +293,7 @@ export function TerminalFileDock({
   profileId,
   dropTargetId,
   sessionLabel,
+  sessionStatus = "connected",
   followPath,
   height,
   dropActive = false,
@@ -356,6 +359,17 @@ export function TerminalFileDock({
     async (nextPath: string) => {
       const target = normalizeDockPath(side, nextPath);
       if (!target) return;
+      if (side === "remote" && sessionStatus !== "connected") {
+        setError(
+          sessionStatus === "connecting"
+            ? "会话连接中，连接成功后自动加载文件..."
+            : sessionStatus === "failed"
+              ? "会话连接失败，请先重连后再打开文件区"
+              : "会话未连接，请先连接后再打开文件区"
+        );
+        setLoading(false);
+        return;
+      }
       const seq = ++requestSeq.current;
       setLoading(true);
       setError("");
@@ -376,11 +390,39 @@ export function TerminalFileDock({
         if (requestSeq.current === seq) setLoading(false);
       }
     },
-    [hydrateTreeAroundPath, listDir, side]
+    [hydrateTreeAroundPath, listDir, sessionStatus, side]
   );
 
+  const remoteReady = side !== "remote" || sessionStatus === "connected";
+  const remoteStatusMessage =
+    side === "remote"
+      ? sessionStatus === "connecting"
+        ? "会话连接中，连接成功后自动加载文件..."
+        : sessionStatus === "failed"
+          ? "会话连接失败，请先重连后再打开文件区"
+          : sessionStatus === "disconnected"
+            ? "会话未连接，请先连接后再打开文件区"
+            : ""
+      : "";
+
   useEffect(() => {
+    if (!remoteReady) {
+      requestSeq.current += 1;
+      followedRef.current = null;
+      setLoading(false);
+      setEntries([]);
+      setSelected(null);
+      setSelectedPaths([]);
+      setPath("");
+      setPathDraft("");
+      setTree(null);
+      setError(remoteStatusMessage);
+      return;
+    }
+
     let cancelled = false;
+    setError("");
+    setLoading(true);
     void resolveHome()
       .then((home) => {
         if (cancelled) return;
@@ -390,21 +432,24 @@ export function TerminalFileDock({
         void navigate(normalizedHome);
       })
       .catch((err) => {
-        if (!cancelled) setError(String(err));
+        if (!cancelled) {
+          setLoading(false);
+          setError(String(err));
+        }
       });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [side, sessionLabel]);
+  }, [side, sessionLabel, remoteReady, remoteStatusMessage]);
 
   useEffect(() => {
-    if (!followPath) return;
+    if (!remoteReady || !followPath) return;
     const normalizedFollowPath = normalizeDockPath(side, followPath);
     if (!normalizedFollowPath || followedRef.current === normalizedFollowPath) return;
     followedRef.current = normalizedFollowPath;
     if (!sameDockPath(side, normalizedFollowPath, path)) void navigate(normalizedFollowPath);
-  }, [followPath, navigate, path, side]);
+  }, [followPath, navigate, path, remoteReady, side]);
 
   const sortedEntries = useMemo(() => sortFiles(entries, sort), [entries, sort]);
   const selectedPathSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
@@ -537,6 +582,7 @@ export function TerminalFileDock({
 
   const loadNodeChildren = useCallback(
     async (target: DockNode) => {
+      if (side === "remote" && sessionStatus !== "connected") return;
       setTree((current) => updateTreeNode(current, side, target.path, (node) => ({ ...node, loading: true })));
       try {
         const list = await listDir(target.path);
@@ -545,7 +591,7 @@ export function TerminalFileDock({
         setTree((current) => updateTreeNode(current, side, target.path, (node) => ({ ...node, loading: false })));
       }
     },
-    [listDir, side]
+    [listDir, sessionStatus, side]
   );
 
   const toggleNode = useCallback(
@@ -836,7 +882,15 @@ export function TerminalFileDock({
         </div>
         <div className="relative min-h-0 overflow-hidden">
           {error ? (
-            <div className="p-3 text-xs text-destructive">{error}</div>
+            <div
+              className={
+                side === "remote" && sessionStatus !== "connected" && sessionStatus !== "failed"
+                  ? "p-3 text-xs text-muted-foreground"
+                  : "p-3 text-xs text-destructive"
+              }
+            >
+              {error}
+            </div>
           ) : (
             <>
               <FileList

@@ -23,7 +23,7 @@ function alphaColor(rgb: [number, number, number], alpha: number) {
 }
 
 function xtermTheme(theme: AppSettings["theme"], backgroundAlpha = 100) {
-  // shadcn Neutral 对齐：亮=白底近黑字，暗（deep/graphite 收敛）=neutral-950 底近白字；
+  // shadcn Neutral 对齐：亮=白底近黑字，暗 deep = neutral-950 底近白字；
   // 光标/选区用中性灰阶，彩色只保留 ANSI 语义色（xterm 默认）。
   if (theme === "light") {
     return {

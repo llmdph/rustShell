@@ -756,6 +756,7 @@ export default function App() {
           profileId={profile?.id ?? null}
           dropTargetId={dropTargetId}
           sessionLabel={profile?.name ?? tab.title}
+          sessionStatus={tab.status}
           followPath={tab.currentDirectory ?? null}
           height={height}
           dropActive={dragOverDockTarget === dropTargetId}
@@ -3189,7 +3190,7 @@ export default function App() {
     onOpenFileManager: openSftpManager,
     onOpenSettings: () => setDialog("settings"),
     onCycleTheme: () => {
-      const nextTheme = settings.theme === "deep" ? "graphite" : settings.theme === "graphite" ? "light" : "deep";
+      const nextTheme = settings.theme === "deep" ? "light" : "deep";
       void persistSettings({ ...settings, theme: nextTheme });
     },
     onWindowAction: (action) => {

@@ -68,7 +68,6 @@ export default function SettingsDialog({ settings, onChange, onClose, onHostKeys
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="deep">Deep（暗色）</SelectItem>
-              <SelectItem value="graphite">Graphite（暗色）</SelectItem>
               <SelectItem value="light">Light（亮色）</SelectItem>
             </SelectContent>
           </Select>

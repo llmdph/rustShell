@@ -20,7 +20,7 @@ type BuildAppMenusOptions = {
 };
 
 function nextThemeHint(theme: AppSettings["theme"]) {
-  return theme === "deep" ? "Graphite" : theme === "graphite" ? "Light" : "Deep";
+  return theme === "deep" ? "Light" : "Deep";
 }
 
 export function buildAppMenus({

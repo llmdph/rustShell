@@ -98,7 +98,7 @@ export type FileEntry = {
 };
 
 export type AppSettings = {
-  theme: "deep" | "graphite" | "light";
+  theme: "deep" | "light";
   fontSize: number;
   copyOnSelect: boolean;
   scrollback: number;

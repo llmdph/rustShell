@@ -2104,50 +2104,53 @@ where
     F: FnMut(&mut sftp_service::SftpConnection) -> anyhow::Result<T>,
 {
     let effective_profile = profile_for_secret(profile.clone(), password);
-    let mut sessions = lock(&state.sftp_sessions)?;
-    prune_sftp_sessions(&mut sessions, Some(profile.id));
-    if !sessions.contains_key(&profile.id) {
-        let connection = sftp_service::SftpConnection::connect(&effective_profile, password)
-            .map_err(to_string)?;
-        sessions.insert(
-            profile.id,
-            CachedSftpConnection {
-                connection,
-                last_used: Instant::now(),
-            },
-        );
+
+    // Fast path: reuse an existing session under the lock only.
+    {
+        let mut sessions = lock(&state.sftp_sessions)?;
         prune_sftp_sessions(&mut sessions, Some(profile.id));
-    }
-
-    let first = {
-        let cached = sessions
-            .get_mut(&profile.id)
-            .ok_or_else(|| "SFTP 会话不存在".to_owned())?;
-        cached.last_used = Instant::now();
-        action(&mut cached.connection)
-    };
-
-    match first {
-        Ok(value) => Ok(value),
-        Err(_) => {
-            sessions.remove(&profile.id);
-            let connection = sftp_service::SftpConnection::connect(&effective_profile, password)
-                .map_err(to_string)?;
-            sessions.insert(
-                profile.id,
-                CachedSftpConnection {
-                    connection,
-                    last_used: Instant::now(),
-                },
-            );
-            prune_sftp_sessions(&mut sessions, Some(profile.id));
-            let cached = sessions
-                .get_mut(&profile.id)
-                .ok_or_else(|| "SFTP 会话不存在".to_owned())?;
+        if let Some(cached) = sessions.get_mut(&profile.id) {
             cached.last_used = Instant::now();
-            action(&mut cached.connection).map_err(to_string)
+            match action(&mut cached.connection) {
+                Ok(value) => return Ok(value),
+                Err(_) => {
+                    // Drop dead session; reconnect outside the lock below.
+                    sessions.remove(&profile.id);
+                }
+            }
         }
     }
+
+    // Connect outside the sessions mutex so concurrent terminal/SFTP work
+    // cannot freeze the whole app while SSH/SFTP handshakes are in progress.
+    let connection =
+        sftp_service::SftpConnection::connect(&effective_profile, password).map_err(to_string)?;
+
+    let mut sessions = lock(&state.sftp_sessions)?;
+    // Another caller may have inserted a fresh session while we connected.
+    if let Some(cached) = sessions.get_mut(&profile.id) {
+        cached.last_used = Instant::now();
+        match action(&mut cached.connection) {
+            Ok(value) => return Ok(value),
+            Err(_) => {
+                sessions.remove(&profile.id);
+            }
+        }
+    }
+
+    sessions.insert(
+        profile.id,
+        CachedSftpConnection {
+            connection,
+            last_used: Instant::now(),
+        },
+    );
+    prune_sftp_sessions(&mut sessions, Some(profile.id));
+    let cached = sessions
+        .get_mut(&profile.id)
+        .ok_or_else(|| "SFTP 会话不存在".to_owned())?;
+    cached.last_used = Instant::now();
+    action(&mut cached.connection).map_err(to_string)
 }
 
 fn prune_sftp_sessions(sessions: &mut HashMap<Uuid, CachedSftpConnection>, keep: Option<Uuid>) {

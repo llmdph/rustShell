@@ -28,7 +28,11 @@ impl Default for AppSettings {
 
 impl AppSettings {
     pub fn sanitized(mut self) -> Self {
-        if !matches!(self.theme.as_str(), "deep" | "graphite" | "light") {
+        // Legacy "graphite" was an alias of the same dark palette as "deep".
+        if self.theme == "graphite" {
+            self.theme = "deep".to_owned();
+        }
+        if !matches!(self.theme.as_str(), "deep" | "light") {
             self.theme = "deep".to_owned();
         }
         self.font_size = self.font_size.clamp(10, 28);

@@ -5,7 +5,7 @@ import { normalizeProfiles } from "../sessions/profileModel";
 
 export function useAppTheme(theme: AppSettings["theme"]) {
   useEffect(() => {
-    // shadcn/ui theme scope: deep/graphite -> dark, light -> light.
+    // shadcn/ui theme scope: deep -> dark, light -> light.
     document.documentElement.classList.toggle("dark", theme !== "light");
   }, [theme]);
 }
