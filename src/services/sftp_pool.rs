@@ -32,6 +32,29 @@ const MAX_SESSIONS: usize = 4;
 const SFTP_PROTOCOL_ERROR: i32 = -31;
 const FILE_ERROR: i32 = -16;
 
+/// Separates "could not reach or authenticate to the host" from "the host
+/// answered and refused". Only the former says anything about whether an
+/// OpenSSH fallback is worth remembering for this profile.
+#[derive(Debug)]
+pub enum SftpFailure {
+    Connect(String),
+    Operation(String),
+}
+
+impl SftpFailure {
+    pub fn is_connect(&self) -> bool {
+        matches!(self, Self::Connect(_))
+    }
+}
+
+impl std::fmt::Display for SftpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(message) | Self::Operation(message) => f.write_str(message),
+        }
+    }
+}
+
 struct SftpSlot {
     connection: Option<SftpConnection>,
     last_used: Instant,
@@ -63,8 +86,23 @@ impl SftpPool {
         &self,
         profile: &SessionProfile,
         password: Option<&str>,
-        mut action: F,
+        action: F,
     ) -> Result<T, String>
+    where
+        F: FnMut(&mut SftpConnection) -> Result<T>,
+    {
+        self.with_detail(profile, password, action)
+            .map_err(|failure| failure.to_string())
+    }
+
+    /// As [`SftpPool::with`], but reports whether the failure was in
+    /// establishing the session or in the operation itself.
+    pub fn with_detail<T, F>(
+        &self,
+        profile: &SessionProfile,
+        password: Option<&str>,
+        mut action: F,
+    ) -> Result<T, SftpFailure>
     where
         F: FnMut(&mut SftpConnection) -> Result<T>,
     {
@@ -85,14 +123,15 @@ impl SftpPool {
                 // the error as-is.
                 Err(error) if !is_transport_error(&error) => {
                     slot.connection = Some(connection);
-                    return Err(error.to_string());
+                    return Err(SftpFailure::Operation(error.to_string()));
                 }
                 // Transport failure: drop the dead session and reconnect below.
                 Err(_) => {}
             }
         }
 
-        let mut connection = SftpConnection::connect(profile, password).map_err(to_message)?;
+        let mut connection = SftpConnection::connect(profile, password)
+            .map_err(|error| SftpFailure::Connect(error.to_string()))?;
         let outcome = action(&mut connection);
         slot.last_used = Instant::now();
         match outcome {
@@ -104,7 +143,7 @@ impl SftpPool {
                 if !is_transport_error(&error) {
                     slot.connection = Some(connection);
                 }
-                Err(error.to_string())
+                Err(SftpFailure::Operation(error.to_string()))
             }
         }
     }
@@ -113,13 +152,13 @@ impl SftpPool {
     ///
     /// Reusing the session avoids the TCP connect, key exchange and auth that
     /// dominate the cost of a one-shot remote command.
-    pub fn exec(
+    pub fn exec_detail(
         &self,
         profile: &SessionProfile,
         password: Option<&str>,
         command: &str,
-    ) -> Result<String, String> {
-        self.with(profile, password, |connection| connection.exec(command))
+    ) -> Result<String, SftpFailure> {
+        self.with_detail(profile, password, |connection| connection.exec(command))
     }
 
     pub fn invalidate(&self, profile_id: Uuid) {
@@ -193,10 +232,6 @@ fn is_transport_error(error: &anyhow::Error) -> bool {
         ssh2::ErrorCode::Session(code) => code != SFTP_PROTOCOL_ERROR && code != FILE_ERROR,
         _ => false,
     }
-}
-
-fn to_message(error: anyhow::Error) -> String {
-    error.to_string()
 }
 
 fn lock_map<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
