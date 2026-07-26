@@ -165,10 +165,6 @@ impl SftpPool {
         lock_map(&self.slots).remove(&profile_id);
     }
 
-    pub fn clear(&self) {
-        lock_map(&self.slots).clear();
-    }
-
     pub fn retain_profiles(&self, keep: &[Uuid]) {
         lock_map(&self.slots).retain(|id, _| keep.contains(id));
     }
