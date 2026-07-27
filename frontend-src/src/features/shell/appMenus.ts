@@ -5,12 +5,17 @@ import type { WindowAction } from "@/components/app/WindowControls";
 type BuildAppMenusOptions = {
   theme: AppSettings["theme"];
   canReconnect: boolean;
+  canSearchTerminal: boolean;
+  broadcastOpen: boolean;
   onNewProfile: () => void;
   onImportSessions: () => void;
   onExportSessions: () => void;
   onQuickConnect: () => void;
   onReconnectActive: () => void;
   onOpenLocalShell: () => void;
+  onSearchTerminal: () => void;
+  onToggleBroadcast: () => void;
+  onManageSnippets: () => void;
   onOpenTransfers: () => void;
   onOpenFileManager: () => void;
   onOpenSettings: () => void;
@@ -26,12 +31,17 @@ function nextThemeHint(theme: AppSettings["theme"]) {
 export function buildAppMenus({
   theme,
   canReconnect,
+  canSearchTerminal,
+  broadcastOpen,
   onNewProfile,
   onImportSessions,
   onExportSessions,
   onQuickConnect,
   onReconnectActive,
   onOpenLocalShell,
+  onSearchTerminal,
+  onToggleBroadcast,
+  onManageSnippets,
   onOpenTransfers,
   onOpenFileManager,
   onOpenSettings,
@@ -61,6 +71,12 @@ export function buildAppMenus({
     {
       label: "工具(T)",
       items: [
+        { label: "查找终端输出", hint: "Ctrl+F", onClick: onSearchTerminal, disabled: !canSearchTerminal },
+        // The menu panel is a fixed 190px, so labels have to stay ~6 CJK glyphs
+        // or they truncate next to the hint.
+        { label: broadcastOpen ? "关闭广播栏" : "打开广播栏", hint: "Broadcast", onClick: onToggleBroadcast },
+        { label: "管理快捷命令", hint: "Snippets", onClick: onManageSnippets },
+        { type: "separator" },
         { label: "传输队列", hint: "Transfers", onClick: onOpenTransfers },
         {
           label: "文件管理器",

@@ -119,7 +119,9 @@ import { useWorkspacePanels } from "./features/shell/useWorkspacePanels";
 import { startWindowDrag } from "./features/shell/windowDrag";
 import { WorkspaceLayout } from "./features/shell/WorkspaceLayout";
 import { TerminalArea, type TerminalSplitDropTarget } from "./features/terminal/TerminalArea";
-import { terminalSnippets } from "./features/terminal/terminalSnippets";
+import { SnippetManagerDialog } from "./features/terminal/SnippetManagerDialog";
+import { requestTerminalSearch } from "./features/terminal/TerminalSearchOverlay";
+import { useSnippets } from "./features/terminal/terminalSnippets";
 import { buildTransferAuditActions } from "./features/transfers/transferAuditActions";
 import { buildTransferQueueProps } from "./features/transfers/transferQueueProps";
 import { useTransferState } from "./features/transfers/useTransferState";
@@ -220,6 +222,10 @@ export default function App() {
   } = useTransferState({ detailed: dialog === "transfers" });
   const [transferConflict, setTransferConflict] = useState<TransferConflictStrategy>("overwrite");
   const [terminalCommands, setTerminalCommands] = useState<Record<string, string>>({});
+  const snippets = useSnippets();
+  const [snippetManagerOpen, setSnippetManagerOpen] = useState(false);
+  const [broadcastOpen, setBroadcastOpen] = useState(false);
+  const [broadcastDraft, setBroadcastDraft] = useState("");
   const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
   const [serverStatusLoading, setServerStatusLoading] = useState(false);
   const [serverStatusError, setServerStatusError] = useState("");
@@ -1336,6 +1342,25 @@ export default function App() {
     } catch (error) {
       pushToast("error", `命令发送失败: ${String(error)}`);
     }
+  };
+
+  const broadcastTargets = useMemo(() => tabs.filter((tab) => tab.status === "connected"), [tabs]);
+
+  const broadcastToTerminals = async (command: string) => {
+    const value = command.trim();
+    if (!value) return;
+    if (broadcastTargets.length === 0) {
+      pushToast("info", "没有已连接的会话");
+      return;
+    }
+    const results = await Promise.allSettled(broadcastTargets.map((tab) => api.terminalSend(tab.id, `${value}\r`)));
+    const failed = results.filter((result) => result.status === "rejected").length;
+    const delivered = results.length - failed;
+    setBroadcastDraft("");
+    setStatus(`广播「${value}」到 ${delivered} 个会话`);
+    if (failed === 0) pushToast("success", `已广播到 ${delivered} 个会话`);
+    else if (delivered === 0) pushToast("error", "广播失败，没有会话接收到命令");
+    else pushToast("info", `已广播到 ${delivered} 个会话，${failed} 个失败`);
   };
 
   const closeTab = async (tabId: string) => {
@@ -3187,12 +3212,19 @@ export default function App() {
   const appMenus = buildAppMenus({
     theme: settings.theme,
     canReconnect: Boolean(activeProfile),
+    canSearchTerminal: Boolean(activeTab),
+    broadcastOpen,
     onNewProfile: () => openProfileEditor(),
     onImportSessions: importSessions,
     onExportSessions: exportSessions,
     onQuickConnect: () => setDialog("quick"),
     onReconnectActive: reconnectActive,
     onOpenLocalShell: openLocalShell,
+    onSearchTerminal: () => {
+      if (activeTab) requestTerminalSearch(activeTab.id);
+    },
+    onToggleBroadcast: () => setBroadcastOpen((open) => !open),
+    onManageSnippets: () => setSnippetManagerOpen(true),
     onOpenTransfers: () => setDialog("transfers"),
     onOpenFileManager: openSftpManager,
     onOpenSettings: () => setDialog("settings"),
@@ -3224,7 +3256,18 @@ export default function App() {
           <div className="absolute inset-0" style={{ background: "var(--background)", opacity: appBackground.dim / 100 }} />
         </div>
       )}
-      <CommandPalette open={commandOpen} menus={appMenus} onOpenChange={setCommandOpen} />
+      <CommandPalette
+        open={commandOpen}
+        menus={appMenus}
+        snippets={snippets}
+        canRunSnippet={activeTab?.status === "connected"}
+        onRunSnippet={(command) => {
+          if (activeTab) void sendTerminalCommand(activeTab, command);
+        }}
+        onManageSnippets={() => setSnippetManagerOpen(true)}
+        onOpenChange={setCommandOpen}
+      />
+      {snippetManagerOpen && <SnippetManagerDialog onClose={() => setSnippetManagerOpen(false)} />}
       {!isFileManagerWindow && (
         <AppTopbar
           menus={appMenus}
@@ -3297,7 +3340,18 @@ export default function App() {
             terminalBackgroundAlpha={appBackgroundActive ? Math.min(appBackground.surfaceAlpha, 58) : 100}
             settings={settings}
             commandForTab={commandForTab}
-            snippets={terminalSnippets}
+            broadcast={{
+              open: broadcastOpen,
+              command: broadcastDraft,
+              targets: broadcastTargets,
+              snippets,
+              onCommandChange: setBroadcastDraft,
+              onSend: (command) => {
+                void broadcastToTerminals(command);
+              },
+              onToggle: () => setBroadcastOpen((open) => !open)
+            }}
+            onManageSnippets={() => setSnippetManagerOpen(true)}
             activeProfileAvailable={Boolean(activeProfile)}
             canReconnectTab={canReconnectTab}
             onActivateTab={activateTerminalTab}

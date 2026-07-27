@@ -3,12 +3,26 @@ import { useEffect, useRef, useState, type CSSProperties, type DragEvent, type P
 import type { AppSettings, TerminalDrain, TerminalView } from "@/api";
 import { cn } from "@/lib/utils";
 
+import { BroadcastBar } from "./BroadcastBar";
 import { TerminalEmptyState } from "./TerminalEmptyState";
 import { TerminalTabs, TERMINAL_TAB_DRAG_MIME, type TerminalTabDragPoint } from "./TerminalTabs";
 import { TerminalTools } from "./TerminalTools";
 import { XtermView } from "./XtermView";
+import type { Snippet } from "./terminalSnippets";
 
 export type TerminalSplitDropTarget = "left" | "right" | "top" | "bottom";
+
+/** One command aimed at every connected session. Owned by the app shell so the
+ * bar spans both split panes instead of belonging to either one. */
+export type BroadcastControls = {
+  open: boolean;
+  command: string;
+  targets: TerminalView[];
+  snippets: Snippet[];
+  onCommandChange: (command: string) => void;
+  onSend: (command: string) => void;
+  onToggle: () => void;
+};
 type TerminalPaneId = "primary" | "split";
 type TabInsertTarget = {
   pane: TerminalPaneId;
@@ -40,7 +54,8 @@ type TerminalAreaProps = {
   terminalBackgroundAlpha: number;
   settings: AppSettings;
   commandForTab: (tabId: string) => string;
-  snippets: string[];
+  broadcast: BroadcastControls;
+  onManageSnippets: () => void;
   activeProfileAvailable: boolean;
   canReconnectTab: (tab: TerminalView) => boolean;
   onCommandChange: (tabId: string, command: string) => void;
@@ -91,7 +106,8 @@ export function TerminalArea({
   terminalBackgroundAlpha,
   settings,
   commandForTab,
-  snippets,
+  broadcast,
+  onManageSnippets,
   activeProfileAvailable,
   canReconnectTab,
   onCommandChange,
@@ -404,7 +420,7 @@ export function TerminalArea({
             activeTab={paneActiveTab}
             activeProfileAvailable={canReconnectTab(paneActiveTab)}
             command={commandForTab(paneActiveTab.id)}
-            snippets={snippets}
+            broadcastOpen={broadcast.open}
             onCommandChange={(next) => onCommandChange(paneActiveTab.id, next)}
             onSendCommand={(next) => onSendCommand(paneActiveTab, next)}
             onCopy={() => onCopyTab(paneActiveTab)}
@@ -412,6 +428,8 @@ export function TerminalArea({
             onClear={() => onClearTab(paneActiveTab)}
             onReconnect={() => onReconnectTab(paneActiveTab)}
             onCloseActive={() => onCloseTab(paneActiveTab.id)}
+            onToggleBroadcast={broadcast.onToggle}
+            onManageSnippets={onManageSnippets}
             fileDockOpen={dockOpen}
             onToggleFileDock={() => onToggleFileDock(paneActiveTab.id)}
           />
@@ -422,7 +440,25 @@ export function TerminalArea({
   };
 
   return (
-    <section data-terminal-area className="grid min-h-0 min-w-0 grid-rows-[minmax(0,1fr)] overflow-hidden bg-background">
+    <section
+      data-terminal-area
+      className={cn(
+        "grid min-h-0 min-w-0 overflow-hidden bg-background",
+        broadcast.open ? "grid-rows-[auto_minmax(0,1fr)]" : "grid-rows-[minmax(0,1fr)]"
+      )}
+    >
+      {broadcast.open && (
+        <BroadcastBar
+          command={broadcast.command}
+          targets={broadcast.targets}
+          totalTabs={tabs.length}
+          snippets={broadcast.snippets}
+          onCommandChange={broadcast.onCommandChange}
+          onSend={broadcast.onSend}
+          onManageSnippets={onManageSnippets}
+          onClose={broadcast.onToggle}
+        />
+      )}
       <div
         data-terminal-stack
         className="relative isolate min-h-0 min-w-0 overflow-hidden bg-background"
