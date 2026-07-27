@@ -149,7 +149,7 @@ export default function SettingsDialog({ settings, onChange, onClose, onHostKeys
                   key={gradient.id}
                   type="button"
                   className={cn(
-                    "h-10 rounded-md border transition-shadow",
+                    "h-10 rounded-md border transition-shadow duration-[var(--duration-fast)] ease-[var(--ease-swift)]",
                     background.gradient === gradient.id && "ring-2 ring-ring"
                   )}
                   style={{ backgroundImage: gradient.css }}

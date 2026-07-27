@@ -72,7 +72,7 @@ type PanelResizerProps = {
 function PanelResizer({ side, title, onStartResize, onResetWidth }: PanelResizerProps) {
   return (
     <div
-      className="panel-resizer relative min-h-0 min-w-2 cursor-col-resize [background:linear-gradient(90deg,transparent_0_3px,var(--border)_3px_5px,transparent_5px_100%)] after:absolute after:inset-x-0.5 after:inset-y-0 after:rounded after:content-[''] hover:after:bg-ring/30"
+      className="panel-resizer relative min-h-0 min-w-2 cursor-col-resize [background:linear-gradient(90deg,transparent_0_3px,var(--border)_3px_5px,transparent_5px_100%)] after:absolute after:inset-x-0.5 after:inset-y-0 after:rounded after:transition-colors after:duration-[var(--duration-fast)] after:ease-[var(--ease-swift)] after:content-[''] hover:after:bg-ring/30"
       role="separator"
       aria-orientation="vertical"
       title={title}

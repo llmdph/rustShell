@@ -97,9 +97,25 @@
    * --signal is a live link (phosphor green), --standby is negotiating (amber). */
   --signal: oklch(0.60 0.15 152);
   --standby: oklch(0.63 0.12 78);
-  /* Motion primitives shared across app chrome. */
+  /* Motion primitives shared across app chrome. Three durations only — every
+   * surface picks one of them, so the whole app moves at the same tempo:
+   *   fast  = state flips you should not notice (hover, press, toggles)
+   *   base  = anything that opens in place (menus, popovers, tooltips)
+   *   slow  = anything that arrives from off-surface (dialogs, overlays, toasts)
+   * --ease-swift decelerates into place, --ease-spring overshoots a hair and is
+   * reserved for entrances. Exits always use --ease-swift.
+   *
+   * Two deliberate exceptions, so nobody "fixes" them later:
+   *   1. Menu/list item highlights stay instantaneous. Cross-fading the active
+   *      row smears keyboard navigation through a long list.
+   *   2. tw-animate-css reads --tw-duration / --tw-ease, which is what Tailwind's
+   *      `duration-[…]` and `ease-[…]` utilities set. That is why animated Radix
+   *      surfaces carry those utilities instead of raw animation-* properties. */
   --ease-spring: cubic-bezier(0.2, 0.9, 0.25, 1.04);
   --ease-swift: cubic-bezier(0.33, 0, 0.2, 1);
+  --duration-fast: 120ms;
+  --duration-base: 160ms;
+  --duration-slow: 220ms;
 }
 
 /* Dark: phosphor-glass. Near-black surfaces with a subtle green-cold cast
@@ -457,6 +473,16 @@
       0 0 5px 2px color-mix(in oklab, var(--standby) 55%, transparent),
       0 0 12px 3px color-mix(in oklab, var(--standby) 20%, transparent);
   }
+}
+
+/* Armed-mode texture for the broadcast bar. A monochrome hatch marks "this
+ * input reaches every session" without spending one of the link-state colors. */
+.hatch-armed {
+  background-image: repeating-linear-gradient(
+    135deg,
+    color-mix(in oklab, var(--foreground) 5%, transparent) 0 1px,
+    transparent 1px 8px
+  );
 }
 
 /* Variable-weight shimmer for wordmark glyphs. Runs on the mono face, whose

@@ -8,7 +8,7 @@ const actionKeyClass =
   "group grid h-[88px] place-items-center gap-2 rounded-lg text-foreground/90 hover:border-ring/70 hover:bg-accent/60 disabled:opacity-50 dark:hover:border-ring/70 dark:hover:bg-accent/60";
 
 const actionIconClass =
-  "size-5 text-muted-foreground transition-transform duration-200 ease-[var(--ease-swift)] group-hover:-translate-y-px group-hover:text-foreground";
+  "size-5 text-muted-foreground transition-[transform,color] duration-[var(--duration-base)] ease-[var(--ease-swift)] group-hover:-translate-y-px group-hover:text-foreground";
 
 type TerminalEmptyStateProps = {
   canOpenSelected: boolean;

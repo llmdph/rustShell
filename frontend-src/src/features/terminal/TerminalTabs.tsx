@@ -209,9 +209,11 @@ export function TerminalTabs({
             tabIndex={0}
             data-terminal-tab-id={tab.id}
             className={cn(
-              "relative flex h-7 min-w-0 max-w-36 flex-1 cursor-grab select-none items-center justify-start gap-1.5 overflow-hidden rounded-none border-0 border-r border-border/70 bg-transparent px-1.5 py-0 text-xs text-muted-foreground shadow-none before:absolute before:bottom-0 before:left-0 before:h-0.5 before:w-full before:bg-transparent before:content-[''] hover:bg-accent/70 hover:text-foreground active:cursor-grabbing",
+              // The active marker wipes in from the left rather than blinking on,
+              // so switching tabs reads as the selection travelling to this one.
+              "relative flex h-7 min-w-0 max-w-36 flex-1 cursor-grab select-none items-center justify-start gap-1.5 overflow-hidden rounded-none border-0 border-r border-border/70 bg-transparent px-1.5 py-0 text-xs text-muted-foreground shadow-none transition-[color,background-color] duration-[var(--duration-fast)] ease-[var(--ease-swift)] before:absolute before:bottom-0 before:left-0 before:h-0.5 before:w-full before:origin-left before:scale-x-0 before:bg-primary before:transition-transform before:duration-[var(--duration-base)] before:ease-[var(--ease-spring)] before:content-[''] hover:bg-accent/70 hover:text-foreground active:cursor-grabbing",
               "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
-              tab.id === activeTabId && "bg-background text-foreground before:bg-primary dark:bg-card"
+              tab.id === activeTabId && "bg-background text-foreground before:scale-x-100 dark:bg-card"
             )}
             aria-selected={tab.id === activeTabId}
             title="拖到终端边缘分屏，拖回主标签栏取消分屏"
@@ -245,7 +247,7 @@ export function TerminalTabs({
             <button
               type="button"
               data-terminal-tab-action
-              className="ml-auto grid size-4 flex-none place-items-center rounded-sm text-muted-foreground hover:bg-border/70 hover:text-foreground"
+              className="ml-auto grid size-4 flex-none place-items-center rounded-sm text-muted-foreground transition-[color,background-color] duration-[var(--duration-fast)] ease-[var(--ease-swift)] hover:bg-border/70 hover:text-foreground"
               aria-label={`关闭 ${tab.title}`}
               onPointerDown={(event) => event.stopPropagation()}
               onClick={(event) => {

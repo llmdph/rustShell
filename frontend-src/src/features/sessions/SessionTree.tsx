@@ -222,7 +222,7 @@ const SessionFolderRow = memo(function SessionFolderRow({
         onClick={() => onToggle(path)}
         title={collapsed ? "展开目录" : "收起目录"}
       >
-        <ChevronRight className={cn("text-muted-foreground/90 transition-transform duration-150", !collapsed && "rotate-90")} size={11} />
+        <ChevronRight className={cn("text-muted-foreground/90 transition-transform duration-[var(--duration-fast)] ease-[var(--ease-swift)]", !collapsed && "rotate-90")} size={11} />
         <Folder className="text-muted-foreground/90" size={12} />
         <span className="min-w-0 truncate">{name}</span>
       </button>
