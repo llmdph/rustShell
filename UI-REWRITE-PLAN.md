@@ -340,11 +340,51 @@ frontend-src/src/
 
 ### Phase 8 · 功能增强（用户新需求批次 · 2026-07-05）✅ 全部交付（待用户真机复测）
 - [x] **8.1 关闭确认修复**：确认逻辑统一收口到 Tauri `onCloseRequested`（自绘 X / Alt+F4 / 系统关闭全覆盖），`confirmOnExit` 开启时弹确认（危险样式），确认后 `destroy()`；文件管理器窗口关闭不拦截 (2026-07-05)
-- [x] **8.2 自定义快捷命令**：快捷区新增 ＋ 按钮 → 管理对话框（显示名可选 + 命令 Textarea + 已有清单删除），localStorage 持久化（上限 100 条），chips 超宽截断 + 区域 flex-wrap 自动换行；自治于 TerminalTools 不动 App (2026-07-05)
+- [x] **8.2 自定义快捷命令**：快捷区新增 ＋ 按钮 → 管理对话框（显示名可选 + 命令 Textarea + 已有清单删除），localStorage 持久化（上限 100 条），chips 超宽截断 + 区域 flex-wrap 自动换行；自治于 TerminalTools 不动 App (2026-07-05) —— **已被 9.2 取代**：每个 TerminalTools 各持一份副本，分屏两侧看不到彼此的改动
 - [x] **8.3 全局背景**：设置 → 全局背景（无 / 4 渐变预设 / 自定义图片 ≤4MB data URL）+ 背景融合(0-85%) + 面板不透明(55-100%)滑杆，即时生效；实现为根节点 fixed 背景层 + `[data-app-bg] .app-surface` 半透明毛玻璃（topbar/侧栏/文件面板挂 app-surface，终端区保持不透明保证可读性）；localStorage + storage 事件跨窗口同步 (2026-07-05)
 - [x] **8.4 终端分屏**：标签右键 → 与当前标签左右/上下分屏、取消分屏；实现为同容器双窗格矩形布局（XtermView 新增 visible/paneStyle/onActivate，全程不卸载 xterm 实例零丢缓冲），分隔条可拖拽(20%-80%)，点击副屏聚焦不塌屏（主屏记忆 ref），关闭任一侧自动解除分屏；可见窗格均走快速 drain (2026-07-05)
 - [x] **8.5 终端下方文件区（FinalShell 式）**：新组件 `TerminalFileDock`（左懒加载目录树 200px + 右文件列表，顶部路径可编辑/上级/刷新/在文件管理器打开/关闭，顶边拖拽调高 160-520px）；跟随活动终端所属会话（本地 shell→本地盘，SSH→SFTP），**路径跟随终端 cwd**（drain.currentDirectory）；打开入口=工具条按钮+标签右键；设置勾选"连接后自动打开"（localStorage）；双击文件进现有文本编辑器；与右侧面板/独立窗口互不干扰 (2026-07-05)
 - 说明：新增偏好均走 localStorage（不改 Rust 后端契约）；构建 1994 modules / tsc 0 错误；全部文件 cmp 校验交付 + NUL 扫描干净。
+
+---
+
+### Phase 9 · 信号台批次（视觉身份 + 终端能力 · 2026-07-26）
+
+前五项已在本批次前段提交（见 `026af32` / `0d7a4d2` / `141c311` / `3bba83e`）：启动不再闪白、
+主题重着色为「信号台」（颜色只属于链路状态）、状态点统一到 `.signal-dot`、空态重做为签名式
+文字版式、图标全量 Lucide 化。以下为本轮交付：
+
+- [x] **9.1 终端查找浮层**：`XtermView` 挂载 `@xterm/addon-search`，新增 `TerminalSearchOverlay`
+  （查找输入 + `03/128` 定宽读数 + 上/下一个 + 区分大小写/全词/正则三个开关 + 位置轨）。
+  入口：终端聚焦时 Ctrl+F、工具条放大镜按钮、工具菜单「查找终端输出」；F3 / Shift+F3 步进，
+  Enter / Shift+Enter 同义，Esc 仅在浮层内生效（终端里的 Esc 仍归 vim/less）。
+  **关键点**：xterm 的匹配高亮走 `registerDecoration`（proposed API），`new Terminal()` 必须带
+  `allowProposedApi: true`，否则每次 `findNext` 抛错、浮层恒显 0 匹配。工具条按钮与浮层不在同
+  一棵树，用 `TERMINAL_SEARCH_EVENT` 窗口事件跨越（沿用终端布局既有的窗口事件约定）。
+  Ctrl+F 必须在 xterm 之前截获——React 合成捕获阶段在 root 容器上跑，晚于 xterm 自己的
+  textarea 监听，因此用宿主元素上的**原生捕获**监听。
+- [x] **9.2 快捷命令端到端**（**取代 8.2 的实现**）：`terminalSnippets.ts` 改为
+  `useSyncExternalStore` 单一数据源（含 v1→v2 迁移、`storage` 事件跨窗口同步、上限 100 条）。
+  8.2 里每个 `TerminalTools` 各持一份 localStorage 副本，分屏两侧互不可见；现在改为共享 store。
+  新增 `SnippetManagerDialog`：增 / 改 / 删 / 上下移 / 恢复默认（两步确认，4s 自动解除）。
+  默认六条改为**播种进 store 的普通条目**，因此可编辑可删除可排序。
+- [x] **9.3 广播命令栏 + 快捷命令接入外壳**：新增 `BroadcastBar`，横跨终端区顶部（分屏两侧共用
+  一条），Enter 或「发送 ×N」把命令发往**全部已连接会话**，逐条 `allSettled` 后按成功/失败数
+  出 toast。武装态用单色斜纹 `.hatch-armed` 表达，唯一着色元素是目标计数（已连接 = `--signal`），
+  与「颜色只属于链路状态」的规则一致。快捷命令同时接入：广播栏下拉、命令面板「快捷命令」分组、
+  工具菜单「管理快捷命令」。
+- [x] **9.4 动效与微交互统一**：`globals.css` 新增 `--duration-fast/base/slow` 三档节奏 token，
+  与既有 `--ease-swift` / `--ease-spring` 组成完整契约（fast=状态翻转，base=原地展开，
+  slow=从画面外抵达；进场可用 spring，退场一律 swift）。Radix 浮层从
+  `[animation-duration:140ms]` 一类裸属性改写为 `duration-[…]` / `ease-[…]` 工具类——
+  tw-animate-css 的 `--animate-in` 读的正是 `--tw-duration` / `--tw-ease`。
+  Button 基类加 `active:translate-y-px` 按压反馈；input/textarea/checkbox/switch/tabs/badge/
+  table/progress/scroll-area 及面板 resizer、终端标签（活跃下划线改为从左侧 scaleX 擦入）全部
+  接入 token。**两处刻意的例外已写进 CSS 注释**：菜单/列表行高亮保持瞬时（过渡会把键盘穿行糊掉）。
+- 说明：`scripts/screenshot-window.ps1` 为本轮加的窗口截图小工具（DWM 可见边界 + 前台化），
+  用于对着真实窗口核对 UI；不参与构建，可随时删除。
+  验证：`tsc --noEmit` 0 错误、`vite build` 通过（xterm chunk 340→376 kB，为 search addon），
+  `cargo build` 通过；亮/暗双主题下查找浮层、广播栏、快捷命令弹窗、命令面板均已在真实窗口走查。
 
 ---
 
