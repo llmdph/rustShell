@@ -1,10 +1,18 @@
 import { listen as listenTauriEvent } from "@tauri-apps/api/event";
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
 import { Terminal } from "@xterm/xterm";
-import { useCallback, useEffect, useRef, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 
 import { clampNumber } from "@/lib/math";
 import { api, terminalOutputEvent, type AppSettings, type TerminalDrain, type TerminalView } from "../../api";
+import {
+  TERMINAL_SEARCH_EVENT,
+  TerminalSearchOverlay,
+  emptyTerminalSearchResult,
+  type TerminalSearchOptions,
+  type TerminalSearchResult
+} from "./TerminalSearchOverlay";
 
 type XtermViewProps = {
   terminal: TerminalView;
@@ -44,6 +52,33 @@ function xtermTheme(theme: AppSettings["theme"], backgroundAlpha = 100) {
   };
 }
 
+/// Search highlights are the one place inside the terminal viewport where the
+/// signal hue is allowed on content rather than chrome: bulk matches stay a
+/// desaturated wash so the scrollback still reads, and only the active match
+/// lights up. xterm needs literal #RRGGBB here — CSS vars never reach it.
+function xtermSearchDecorations(theme: AppSettings["theme"]) {
+  if (theme === "light") {
+    return {
+      matchBackground: "#dbe7e0",
+      matchBorder: "#a4bbaf",
+      matchOverviewRuler: "#a4bbaf",
+      activeMatchBackground: "#a7e2c3",
+      activeMatchBorder: "#177a4a",
+      activeMatchColorOverviewRuler: "#177a4a"
+    };
+  }
+  return {
+    matchBackground: "#2f3b35",
+    matchBorder: "#4c5f55",
+    matchOverviewRuler: "#4c5f55",
+    activeMatchBackground: "#1d7a4c",
+    activeMatchBorder: "#7ef3b4",
+    activeMatchColorOverviewRuler: "#7ef3b4"
+  };
+}
+
+const defaultSearchOptions: TerminalSearchOptions = { caseSensitive: false, wholeWord: false, regex: false };
+
 /// Output arrives as a push event from the backend pump. This poll only exists
 /// as a safety net for output that lands between mount and subscription, so it
 /// runs rarely and skips entirely while events are flowing.
@@ -60,6 +95,12 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
   const terminalScrollbarHideRef = useRef<number | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const searchRef = useRef<SearchAddon | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchOptions, setSearchOptions] = useState<TerminalSearchOptions>(defaultSearchOptions);
+  const [searchResult, setSearchResult] = useState<TerminalSearchResult>(emptyTerminalSearchResult);
   const sendBufferRef = useRef("");
   const sendScheduledRef = useRef(false);
   const drainOutputRef = useRef("");
@@ -105,6 +146,114 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       terminalScrollbarHideRef.current = null;
     }, 760);
   }, []);
+
+  const runSearch = useCallback(
+    (query: string, options: TerminalSearchOptions, { reverse = false, incremental = false } = {}) => {
+      const search = searchRef.current;
+      if (!search) return;
+      if (!query) {
+        search.clearDecorations();
+        setSearchResult(emptyTerminalSearchResult);
+        return;
+      }
+      const params: ISearchOptions = {
+        ...options,
+        // findPrevious ignores `incremental`; only forward typing should grow
+        // the current selection instead of jumping to the next match.
+        incremental: incremental && !reverse,
+        decorations: xtermSearchDecorations(settings.theme)
+      };
+      try {
+        if (reverse) search.findPrevious(query, params);
+        else search.findNext(query, params);
+      } catch {
+        // An unfinished regex is a normal intermediate state while typing.
+        setSearchResult(emptyTerminalSearchResult);
+      }
+    },
+    [settings.theme]
+  );
+
+  const stepSearch = useCallback(
+    (reverse: boolean) => runSearch(searchQuery, searchOptions, { reverse }),
+    [runSearch, searchOptions, searchQuery]
+  );
+
+  const openSearch = useCallback(() => {
+    const selection = termRef.current?.getSelection() ?? "";
+    const seed = selection.includes("\n") ? "" : selection.trim();
+    setSearchOpen(true);
+    if (seed) setSearchQuery(seed);
+    window.requestAnimationFrame(() => {
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    });
+  }, []);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchResult(emptyTerminalSearchResult);
+    searchRef.current?.clearDecorations();
+    termRef.current?.focus();
+  }, []);
+
+  // Typing re-runs the search on a short trailing delay so a long scrollback is
+  // not re-scanned on every keystroke. Enter / the step buttons bypass this.
+  useEffect(() => {
+    if (!searchOpen) return;
+    const timer = window.setTimeout(() => runSearch(searchQuery, searchOptions, { incremental: true }), 90);
+    return () => window.clearTimeout(timer);
+  }, [runSearch, searchOpen, searchOptions, searchQuery]);
+
+  // Ctrl+F has to be claimed before xterm forwards it to the shell. React's
+  // synthetic capture phase runs at the root container — after xterm's own
+  // listener on its textarea — so this has to be a native capture listener.
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      const modifier = (event.ctrlKey || event.metaKey) && !event.altKey;
+      if (modifier && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        event.stopPropagation();
+        openSearch();
+        return;
+      }
+      if (!searchOpen) return;
+      if (event.key === "Escape") {
+        // Only the overlay's own controls may swallow Escape — inside the
+        // viewport it still belongs to whatever is running (vim, less, …).
+        const target = event.target;
+        if (!(target instanceof HTMLElement) || !target.closest("[data-terminal-search]")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        closeSearch();
+        return;
+      }
+      if (event.key === "F3") {
+        event.preventDefault();
+        event.stopPropagation();
+        stepSearch(event.shiftKey);
+      }
+    };
+    host.addEventListener("keydown", handleKeyDown, true);
+    return () => host.removeEventListener("keydown", handleKeyDown, true);
+  }, [closeSearch, openSearch, searchOpen, stepSearch]);
+
+  useEffect(() => {
+    const handleRequest = (event: Event) => {
+      const detail = (event as CustomEvent<{ terminalId?: string }>).detail;
+      if (detail?.terminalId === terminal.id) openSearch();
+    };
+    window.addEventListener(TERMINAL_SEARCH_EVENT, handleRequest);
+    return () => window.removeEventListener(TERMINAL_SEARCH_EVENT, handleRequest);
+  }, [openSearch, terminal.id]);
+
+  const handleSearchInputKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    stepSearch(event.shiftKey);
+  };
 
   const flushDrainOutput = useCallback(() => {
     drainWriteFrameRef.current = null;
@@ -161,6 +310,10 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     let disposed = false;
     const term = new Terminal({
       allowTransparency: true,
+      // SearchAddon paints its match highlights through registerDecoration,
+      // which xterm still gates behind the proposed-API flag. Without this the
+      // addon throws on every findNext and the overlay reports zero matches.
+      allowProposedApi: true,
       cursorBlink: true,
       convertEol: true,
       fontFamily: '"Geist Mono Variable", "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace',
@@ -171,6 +324,11 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
+    const search = new SearchAddon();
+    term.loadAddon(search);
+    const searchResults = search.onDidChangeResults(({ resultIndex, resultCount }) => {
+      setSearchResult({ index: resultIndex, count: resultCount });
+    });
     term.open(terminalMountRef.current);
     const initialReplay = terminal.text;
     if (initialReplay) {
@@ -202,6 +360,7 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     });
     termRef.current = term;
     fitRef.current = fit;
+    searchRef.current = search;
     lastHostSizeRef.current = { width: 0, height: 0 };
     lastTermSizeRef.current = { cols: 0, rows: 0 };
 
@@ -261,6 +420,7 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       window.removeEventListener("rustshell:terminal-layout-resize-end", flushDeferredResize);
       viewport?.removeEventListener("scroll", handleViewportScroll);
       scrollDisposable.dispose();
+      searchResults.dispose();
       observer.disconnect();
       if (terminalScrollbarHideRef.current !== null) {
         window.clearTimeout(terminalScrollbarHideRef.current);
@@ -283,6 +443,7 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
+      searchRef.current = null;
     };
   }, [terminal.id, onReplayConsumed, updateTerminalScrollbar]);
 
@@ -409,9 +570,23 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       ref={hostRef}
     >
       <div className="h-full min-h-0 overflow-hidden" ref={terminalMountRef} />
+      {searchOpen && (
+        <TerminalSearchOverlay
+          query={searchQuery}
+          options={searchOptions}
+          result={searchResult}
+          inputRef={searchInputRef}
+          onQueryChange={setSearchQuery}
+          onToggleOption={(option) => setSearchOptions((current) => ({ ...current, [option]: !current[option] }))}
+          onStep={stepSearch}
+          onClose={closeSearch}
+          onInputBlur={() => searchRef.current?.clearActiveDecoration()}
+          onInputKeyDown={handleSearchInputKeyDown}
+        />
+      )}
       <div
         data-xterm-scrollbar
-        className="pointer-events-none absolute bottom-2 right-[7px] top-3 z-[3] w-[7px] rounded-full p-px opacity-0 transition-opacity duration-100"
+        className="pointer-events-none absolute bottom-2 right-[7px] top-3 z-[3] w-[7px] rounded-full p-px opacity-0 transition-opacity duration-[var(--duration-fast)] ease-[var(--ease-swift)]"
         ref={terminalScrollbarRef}
         onPointerDown={handleTerminalScrollbarPointerDown}
       >
