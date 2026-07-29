@@ -228,6 +228,15 @@
       transition-duration: 0.01ms !important;
       scroll-behavior: auto !important;
     }
+
+    /* xterm paints the block cursor via a blink keyframe that alternates the
+     * cell to `background-color: inherit`. Collapsing that animation to a
+     * single 0.01ms pass can leave the caret on the transparent frame, so the
+     * terminal looks caret-less under reduced motion. Drop the animation and
+     * keep the solid block style instead. */
+    [data-xterm-host] .xterm-cursor-blink {
+      animation: none !important;
+    }
   }
 }
 

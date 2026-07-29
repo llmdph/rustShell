@@ -315,6 +315,10 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       // addon throws on every findNext and the overlay reports zero matches.
       allowProposedApi: true,
       cursorBlink: true,
+      cursorStyle: "block",
+      // Outline is easy to miss on the dark phosphor cell; keep a solid block
+      // when the pane is visible but the textarea does not own focus.
+      cursorInactiveStyle: "block",
       convertEol: true,
       fontFamily: '"Geist Mono Variable", "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace',
       fontSize: settings.fontSize,
@@ -560,12 +564,16 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
   return (
     <div
       data-xterm-host
-      className={`absolute inset-0 h-full min-h-0 overflow-hidden bg-background px-3 pb-1.5 pt-2.5 [contain:layout_paint] ${
+      className={`absolute inset-0 h-full min-h-0 overflow-hidden bg-background px-3 pb-1.5 pt-2.5 [contain:layout] ${
         shown ? "visible opacity-100" : "pointer-events-none invisible opacity-0"
       }`}
       style={{ ...paneStyle, "--xterm-background": terminalBackground } as CSSProperties}
       onMouseDown={() => {
         if (!active) onActivate?.();
+        // Always reclaim focus on press. The host padding sits outside xterm's
+        // own hit target, and a already-active tab that lost focus (tools bar,
+        // dialog, …) would otherwise stay caret-less until the active id flips.
+        if (shown) termRef.current?.focus();
       }}
       ref={hostRef}
     >
