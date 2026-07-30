@@ -229,13 +229,12 @@
       scroll-behavior: auto !important;
     }
 
-    /* xterm paints the block cursor via a blink keyframe that alternates the
-     * cell to `background-color: inherit`. Collapsing that animation to a
-     * single 0.01ms pass can leave the caret on the transparent frame, so the
-     * terminal looks caret-less under reduced motion. Drop the animation and
-     * keep the solid block style instead. */
-    [data-xterm-host] .xterm-cursor-blink {
+    /* xterm / empty-state carets rely on blink keyframes; keep them solid. */
+    [data-xterm-host] .xterm-cursor,
+    [data-xterm-host] .xterm-cursor-blink,
+    .boot-cursor {
       animation: none !important;
+      opacity: 1 !important;
     }
   }
 }
@@ -349,6 +348,37 @@
   height: 100%;
   max-height: 100%;
   overflow: hidden;
+}
+
+/* Pin the caret solid. xterm's DomRenderer injects blink keyframes that set
+ * `background-color: inherit` on the off frame; any global animation collapse
+ * (prefers-reduced-motion, WebView quirks) can freeze the caret there. Our
+ * options also set cursorBlink:false, but pin colors here so a theme/style
+ * race can never leave an invisible cell. */
+[data-xterm-host] .xterm-cursor {
+  animation: none !important;
+}
+
+[data-xterm-host] .xterm-cursor.xterm-cursor-block {
+  background-color: var(--xterm-cursor-color, #fafafa) !important;
+  color: var(--xterm-cursor-accent, #0a0a0a) !important;
+}
+
+[data-xterm-host] .xterm-cursor.xterm-cursor-outline {
+  outline: 1px solid var(--xterm-cursor-color, #fafafa) !important;
+  outline-offset: -1px;
+  background-color: transparent !important;
+}
+
+[data-xterm-host] .xterm-cursor.xterm-cursor-bar {
+  box-shadow: 2px 0 0 var(--xterm-cursor-color, #fafafa) inset !important;
+  background-color: transparent !important;
+}
+
+[data-xterm-host] .xterm-cursor.xterm-cursor-underline {
+  border-bottom: 2px solid var(--xterm-cursor-color, #fafafa) !important;
+  background-color: transparent !important;
+  height: calc(100% - 2px);
 }
 
 [data-xterm-host].terminal-scrollbar-active:not(.terminal-scrollbar-disabled) [data-xterm-scrollbar] {

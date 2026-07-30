@@ -26,14 +26,26 @@ type XtermViewProps = {
   onReplayConsumed: (terminalId: string) => void;
 };
 
+function hexByte(value: number) {
+  return clampNumber(Math.round(value), 0, 255).toString(16).padStart(2, "0");
+}
+
+/// xterm's ThemeService parses colors most reliably as #rrggbb[aa]. Modern
+/// space-separated `rgb(10 10 10)` fails its comma regex and only works via a
+/// canvas fallback; keep the wire format boring so cursor/bg never drop out.
 function alphaColor(rgb: [number, number, number], alpha: number) {
   const opacity = clampNumber(alpha, 55, 100) / 100;
-  return opacity >= 1 ? `rgb(${rgb.join(" ")})` : `rgba(${rgb.join(", ")}, ${opacity.toFixed(2)})`;
+  const [r, g, b] = rgb;
+  const base = `#${hexByte(r)}${hexByte(g)}${hexByte(b)}`;
+  if (opacity >= 1) return base;
+  return `${base}${hexByte(opacity * 255)}`;
 }
 
 function xtermTheme(theme: AppSettings["theme"], backgroundAlpha = 100) {
   // shadcn Neutral 对齐：亮=白底近黑字，暗 deep = neutral-950 底近白字；
   // 光标/选区用中性灰阶，彩色只保留 ANSI 语义色（xterm 默认）。
+  // Cursor colors stay fully opaque — blending a transparent bg onto the caret
+  // is what made it disappear against the phosphor cell in some WebView builds.
   if (theme === "light") {
     return {
       background: alphaColor([255, 255, 255], backgroundAlpha),
@@ -87,7 +99,10 @@ const DRAIN_EVENT_STALE_AFTER = 1500;
 
 export function XtermView({ terminal, settings, active, visible, paneStyle, terminalBackgroundAlpha, onActivate, onDrain, onReplayConsumed }: XtermViewProps) {
   const shown = visible ?? active;
-  const terminalBackground = xtermTheme(settings.theme, terminalBackgroundAlpha).background;
+  const terminalTheme = xtermTheme(settings.theme, terminalBackgroundAlpha);
+  const terminalBackground = terminalTheme.background;
+  const terminalCursor = terminalTheme.cursor;
+  const terminalCursorAccent = terminalTheme.cursorAccent;
   const hostRef = useRef<HTMLDivElement | null>(null);
   const terminalMountRef = useRef<HTMLDivElement | null>(null);
   const terminalScrollbarRef = useRef<HTMLDivElement | null>(null);
@@ -308,13 +323,18 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
   useEffect(() => {
     if (!hostRef.current || !terminalMountRef.current) return;
     let disposed = false;
+    const theme = xtermTheme(settings.theme, terminalBackgroundAlpha);
     const term = new Terminal({
       allowTransparency: true,
       // SearchAddon paints its match highlights through registerDecoration,
       // which xterm still gates behind the proposed-API flag. Without this the
       // addon throws on every findNext and the overlay reports zero matches.
       allowProposedApi: true,
-      cursorBlink: true,
+      // Blink is painted as a CSS keyframe that alternates the cell to
+      // `background-color: inherit`. Global prefers-reduced-motion (and some
+      // WebView2 builds) freeze that on the transparent frame so the caret
+      // vanishes. Keep a solid block instead; CSS below also pins the colors.
+      cursorBlink: false,
       cursorStyle: "block",
       // Outline is easy to miss on the dark phosphor cell; keep a solid block
       // when the pane is visible but the textarea does not own focus.
@@ -324,7 +344,7 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       fontSize: settings.fontSize,
       lineHeight: 1.18,
       scrollback: settings.scrollback,
-      theme: xtermTheme(settings.theme, terminalBackgroundAlpha)
+      theme
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -334,12 +354,36 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       setSearchResult({ index: resultIndex, count: resultCount });
     });
     term.open(terminalMountRef.current);
+    termRef.current = term;
+    fitRef.current = fit;
+    searchRef.current = search;
     const initialReplay = terminal.text;
     if (initialReplay) {
       term.write(initialReplay);
       onReplayConsumed(terminal.id);
     }
-    if (active) term.focus();
+    // DomRenderer only attaches .xterm-cursor after isCursorInitialized, which
+    // xterm sets on first focus/key. Touch focus once so a connected session is
+    // not caret-less; release it again for background tabs so the active pane
+    // keeps the real focus.
+    term.focus();
+    if (!active) term.blur();
+    // Variable fonts can finish loading after open; remeasure so the caret
+    // cell does not stay at a zero/stale width from the fallback face.
+    const refreshAfterFonts = () => {
+      if (disposed || termRef.current !== term) return;
+      try {
+        fit.fit();
+        term.refresh(0, Math.max(term.rows - 1, 0));
+      } catch {
+        // fit can throw if the host is display:none mid-unmount
+      }
+      updateTerminalScrollbar();
+    };
+    if (document.fonts?.ready) {
+      void document.fonts.ready.then(refreshAfterFonts);
+    }
+    window.requestAnimationFrame(refreshAfterFonts);
 
     const viewport = hostRef.current.querySelector<HTMLElement>(".xterm-viewport");
     const handleViewportScroll = () => updateTerminalScrollbar(true);
@@ -362,9 +406,6 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
         queueMicrotask(flushInput);
       }
     });
-    termRef.current = term;
-    fitRef.current = fit;
-    searchRef.current = search;
     lastHostSizeRef.current = { width: 0, height: 0 };
     lastTermSizeRef.current = { cols: 0, rows: 0 };
 
@@ -567,7 +608,14 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       className={`absolute inset-0 h-full min-h-0 overflow-hidden bg-background px-3 pb-1.5 pt-2.5 [contain:layout] ${
         shown ? "visible opacity-100" : "pointer-events-none invisible opacity-0"
       }`}
-      style={{ ...paneStyle, "--xterm-background": terminalBackground } as CSSProperties}
+      style={
+        {
+          ...paneStyle,
+          "--xterm-background": terminalBackground,
+          "--xterm-cursor-color": terminalCursor,
+          "--xterm-cursor-accent": terminalCursorAccent
+        } as CSSProperties
+      }
       onMouseDown={() => {
         if (!active) onActivate?.();
         // Always reclaim focus on press. The host padding sits outside xterm's
