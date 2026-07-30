@@ -47,15 +47,20 @@ $nodeVer = (node -v)
 $cargoVer = (cargo --version)
 Write-Host "==> node $nodeVer | $cargoVer" -ForegroundColor DarkGray
 
-# Prefer cargo tauri if installed; otherwise npx @tauri-apps/cli
-$tauriCmd = $null
-if (Get-Command cargo-tauri -ErrorAction SilentlyContinue) {
-  $tauriCmd = { param($args) & cargo tauri @args }
-} elseif (Get-Command tauri -ErrorAction SilentlyContinue) {
-  $tauriCmd = { param($args) & tauri @args }
-} else {
-  Write-Host "==> Installing @tauri-apps/cli locally (npx will use it)..." -ForegroundColor Yellow
-  $tauriCmd = { param($args) & npx --yes @tauri-apps/cli@2 @args }
+# Prefer local node_modules CLI, then cargo-tauri / global tauri, else npx.
+$localTauri = Join-Path $RepoRoot "node_modules\.bin\tauri.cmd"
+function Invoke-Tauri {
+  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$TauriArgs)
+  if (Test-Path $localTauri) {
+    & $localTauri @TauriArgs
+  } elseif (Get-Command cargo-tauri -ErrorAction SilentlyContinue) {
+    & cargo tauri @TauriArgs
+  } elseif (Get-Command tauri -ErrorAction SilentlyContinue) {
+    & tauri @TauriArgs
+  } else {
+    Write-Host "==> Using npx @tauri-apps/cli@2" -ForegroundColor Yellow
+    & npx --yes "@tauri-apps/cli@2" @TauriArgs
+  }
 }
 
 if (-not $SkipNpmInstall) {
@@ -68,15 +73,16 @@ Write-Host "==> Frontend build (vite)" -ForegroundColor Cyan
 npm run build
 if ($LASTEXITCODE -ne 0) { throw "npm run build failed" }
 
-$bundleTarget = switch ($Targets) {
-  "nsis" { "nsis" }
-  "msi"  { "msi" }
-  "all"  { "all" }
+# Tauri 2 CLI accepts msi/nsis only — expand "all" to both.
+$bundleArgs = switch ($Targets) {
+  "nsis" { @("nsis") }
+  "msi"  { @("msi") }
+  "all"  { @("nsis", "msi") }
 }
 
-Write-Host "==> Tauri release build (targets=$bundleTarget)" -ForegroundColor Cyan
+Write-Host ("==> Tauri release build (targets={0})" -f ($bundleArgs -join ",")) -ForegroundColor Cyan
 # beforeBuildCommand in tauri.conf already runs npm.cmd run build; dist already exists so that is fine
-& $tauriCmd @("build", "--bundles", $bundleTarget)
+Invoke-Tauri build --bundles @bundleArgs
 if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
 
 Write-Host ""
