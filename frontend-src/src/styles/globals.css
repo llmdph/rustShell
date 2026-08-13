@@ -92,7 +92,7 @@
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
   --font-sans: "Geist Variable", ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei UI", sans-serif;
-  --font-mono: "Geist Mono Variable", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --font-mono: "Geist Mono Variable", ui-monospace, "Cascadia Mono", Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace;
   /* Link-state semantics: the only chrome tokens allowed to carry color.
    * --signal is a live link (phosphor green), --standby is negotiating (amber). */
   --signal: oklch(0.60 0.15 152);
@@ -340,12 +340,17 @@
 }
 
 /* ---------- xterm host integration ---------- */
-/* Lock terminal metrics so DomRenderer letter-spacing cannot drift. */
+/* Lock terminal metrics so DomRenderer letter-spacing cannot drift.
+ * font-family is !important because xterm injects its own stack, and
+ * OffscreenCanvas measurement often fails to resolve the @font-face name
+ * "Geist Mono Variable" then silently paints Consolas. Chips/forms use
+ * --font-mono; the terminal must match that face, not the fallback. */
 [data-xterm-host] .xterm,
 [data-xterm-host] .xterm-rows,
 [data-xterm-host] .xterm-rows span,
 [data-xterm-host] .xterm-char-measure-element,
 [data-xterm-host] .xterm-width-cache-measure-container {
+  font-family: var(--font-mono) !important;
   font-kerning: none !important;
   font-variant-ligatures: none !important;
   font-feature-settings: "liga" 0, "calt" 0 !important;

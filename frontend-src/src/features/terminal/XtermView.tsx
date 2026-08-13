@@ -14,6 +14,22 @@ import {
   type TerminalSearchResult
 } from "./TerminalSearchOverlay";
 
+/// Same stack as `--font-mono` (bottom snippet chips). Keep the quoted
+/// family first — xterm writes this into both CSS and OffscreenCanvas.
+const TERMINAL_FONT_FAMILY =
+  '"Geist Mono Variable", ui-monospace, "Cascadia Mono", Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace';
+
+function loadTerminalFont(fontSize: number) {
+  if (!document.fonts?.load) return Promise.resolve();
+  return Promise.all([
+    document.fonts.load(`${fontSize}px "Geist Mono Variable"`),
+    document.fonts.load(`700 ${fontSize}px "Geist Mono Variable"`)
+  ]).then(
+    () => undefined,
+    () => undefined
+  );
+}
+
 type XtermViewProps = {
   terminal: TerminalView;
   settings: AppSettings;
@@ -493,9 +509,9 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       // the tools bar or another tab steals focus.
       cursorInactiveStyle: "block",
       convertEol: true,
-      // DOM renderer + system ClearType. Consolas is fuller than Cascadia Mono
-      // regular and has real bold; avoid WebGL atlas (no subpixel AA → jaggies).
-      fontFamily: 'Consolas, "Cascadia Mono", "Microsoft YaHei UI", "Microsoft YaHei", monospace',
+      // DOM renderer + ClearType. Avoid WebGL atlas (no subpixel AA → jaggies).
+      // Face is locked again in CSS; this string is what CharSizeService measures.
+      fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: settings.fontSize,
       fontWeight: "400",
       fontWeightBold: "700",
@@ -539,11 +555,15 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     }
     if (active) term.focus();
     // Variable fonts can finish loading after open; remeasure so the caret
-    // cell does not stay at a zero/stale width from the fallback face.
+    // cell does not stay at a zero/stale width from the Consolas fallback face.
     const refreshAfterFonts = () => {
       if (disposed || termRef.current !== term) return;
       try {
+        // Touch fontFamily so CharSizeService remeasures after @font-face is in.
+        term.options.fontFamily = TERMINAL_FONT_FAMILY;
+        term.options.fontSize = settings.fontSize;
         fit.fit();
+        term.refresh(0, Math.max(0, term.rows - 1));
         term.scrollToBottom();
         primeCursor(term);
         if (active) term.focus();
@@ -552,6 +572,7 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       }
       updateTerminalScrollbar();
     };
+    void loadTerminalFont(settings.fontSize).then(refreshAfterFonts);
     if (document.fonts?.ready) {
       void document.fonts.ready.then(refreshAfterFonts);
     }
@@ -680,6 +701,7 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
+    term.options.fontFamily = TERMINAL_FONT_FAMILY;
     term.options.fontSize = settings.fontSize;
     term.options.fontWeight = "400";
     term.options.fontWeightBold = "700";

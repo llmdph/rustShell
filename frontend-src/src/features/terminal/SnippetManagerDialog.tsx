@@ -68,6 +68,7 @@ export function SnippetManagerDialog({ onClose }: SnippetManagerDialogProps) {
             <Label htmlFor="snippet-name">显示名（留空则显示命令本身）</Label>
             <Input
               id="snippet-name"
+              className="font-mono"
               value={draftName}
               onChange={(event) => setDraftName(event.target.value)}
               placeholder="例如：查看磁盘"
@@ -130,7 +131,7 @@ export function SnippetManagerDialog({ onClose }: SnippetManagerDialogProps) {
                     {editing ? (
                       <div className="grid gap-1.5">
                         <Input
-                          className="h-7 text-xs"
+                          className="h-7 font-mono text-xs"
                           value={editName}
                           onChange={(event) => setEditName(event.target.value)}
                           placeholder="显示名"
@@ -155,7 +156,7 @@ export function SnippetManagerDialog({ onClose }: SnippetManagerDialogProps) {
                     ) : (
                       <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
                         <div className="min-w-0">
-                          <div className="truncate text-[13px] font-medium">{snippet.name}</div>
+                          <div className="truncate font-mono text-[13px] font-medium">{snippet.name}</div>
                           <div className="truncate font-mono text-[11px] text-muted-foreground" title={snippet.command}>
                             {snippet.command}
                           </div>
