@@ -466,6 +466,7 @@ export default function App() {
     }
   }, [pushToast]);
 
+  const serverStatusInflightRef = useRef(false);
   const refreshServerStatus = useCallback(async (force = false) => {
     if (!hasTauriRuntime() || !activeProfile) {
       serverStatusProfileIdRef.current = null;
@@ -473,17 +474,20 @@ export default function App() {
       setServerStatusError("");
       return;
     }
+    if (serverStatusInflightRef.current && !force) return;
     const profile = activeProfile;
     const profileId = profile.id;
     serverStatusProfileIdRef.current = profileId;
     if (isRemoteProtocol(profile.protocol) && !activeRemoteConnected && !remoteBrowserReady && !force) {
       setServerStatus(null);
       setServerStatusError("");
+      setServerStatusLoading(false);
       return;
     }
+    serverStatusInflightRef.current = true;
     setServerStatusLoading(true);
     try {
-      const next = await api.serverStatus(profile.id, passwordForActive);
+      const next = await api.serverStatus(profile.id, passwordForActive, force);
       if (serverStatusProfileIdRef.current !== profileId) return;
       setServerStatus(next);
       setServerStatusError("");
@@ -496,6 +500,7 @@ export default function App() {
       setServerStatus(null);
       setServerStatusError(message);
     } finally {
+      serverStatusInflightRef.current = false;
       if (serverStatusProfileIdRef.current === profileId) {
         setServerStatusLoading(false);
       }
@@ -1005,25 +1010,43 @@ export default function App() {
   }, [refreshRemoteFiles, remoteBrowserReady, remoteHomeReady]);
 
   useEffect(() => {
-    if (isFileManagerWindow) {
+    if (isFileManagerWindow || !activeProfile) {
       serverStatusProfileIdRef.current = null;
       setServerStatus(null);
       setServerStatusError("");
       setServerStatusLoading(false);
       return;
     }
-    if (!activeProfile) {
-      serverStatusProfileIdRef.current = null;
+    if (leftPanelCollapsed) return;
+
+    const profileId = activeProfile.id;
+    if (serverStatusProfileIdRef.current !== profileId) {
+      serverStatusProfileIdRef.current = profileId;
       setServerStatus(null);
       setServerStatusError("");
-      setServerStatusLoading(false);
-      return;
     }
-    serverStatusProfileIdRef.current = activeProfile.id;
-    setServerStatus(null);
-    setServerStatusError("");
-    setServerStatusLoading(false);
-  }, [activeProfile?.id, isFileManagerWindow]);
+
+    let cancelled = false;
+    const tick = (force = false) => {
+      if (cancelled || document.visibilityState === "hidden") return;
+      void refreshServerStatus(force);
+    };
+
+    tick(false);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") tick(false);
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    // 15s: one extra exec on the existing SSH session. Hidden / collapsed panes
+    // do not poll. Backend TTL is 10s so a burst of ticks still collapses.
+    const timer = window.setInterval(() => tick(false), 15_000);
+
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.clearInterval(timer);
+    };
+  }, [activeProfile?.id, activeRemoteConnected, isFileManagerWindow, leftPanelCollapsed, refreshServerStatus]);
 
   useEffect(() => {
     const previous = transferStatusRef.current;

@@ -238,8 +238,8 @@ export const api = {
     invoke<FileEntry[]>("list_remote_dir", { request: { profileId, path, password: password || null } }),
   remoteHome: (profileId: string, password?: string | null) =>
     invoke<string>("remote_home", { request: { profileId, password: password || null } }),
-  serverStatus: (profileId: string, password?: string | null) =>
-    invoke<ServerStatus>("server_status", { request: { profileId, password: password || null } }),
+  serverStatus: (profileId: string, password?: string | null, force = false) =>
+    invoke<ServerStatus>("server_status", { request: { profileId, password: password || null, force } }),
   disconnectSftpSession: (profileId: string) =>
     invoke<void>("disconnect_sftp_session", { request: { profileId } }),
   searchRemote: (profileId: string, root: string, query: string, maxResults = 200, password?: string | null) =>

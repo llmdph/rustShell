@@ -2,7 +2,8 @@ import { RefreshCcw } from "lucide-react";
 
 import type { Profile, ServerStatus } from "@/api";
 import { IconButton } from "@/components/app/IconButton";
-import { normalizeProtocolLabel } from "@/features/sessions/profileProtocol";
+import { isLocalProtocol, normalizeProtocolLabel } from "@/features/sessions/profileProtocol";
+import { cn } from "@/lib/utils";
 
 type ConnectionOverviewProps = {
   profile: Profile | null;
@@ -28,62 +29,140 @@ export function ConnectionOverview({
   linkStatus,
   onRefreshServerStatus
 }: ConnectionOverviewProps) {
+  const connected = linkStatus === "connected";
+  const canRefresh = Boolean(profile) && (connected || isLocalProtocol(profile?.protocol));
+
   return (
-    <section className="mt-0 border-t border-border/70 pt-2">
-      <div className="mb-1.5 flex min-w-0 items-center justify-between gap-2">
+    <section className="border-t border-border/70 pb-0.5 pt-2">
+      <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
           <h3 className="m-0 text-[13px] font-semibold">连接概览</h3>
           {linkStatus != null && (
             <>
               <span className={"signal-dot signal-dot--" + linkStatus} />
-              <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">{linkStatusLabel[linkStatus]}</span>
+              <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+                {linkStatusLabel[linkStatus]}
+              </span>
             </>
           )}
         </div>
         <IconButton
           className="h-6 min-w-6 p-0"
           title="刷新服务器状态"
-          icon={<RefreshCcw size={14} />}
+          icon={<RefreshCcw size={13} className={serverStatusLoading ? "animate-spin" : undefined} />}
           onClick={onRefreshServerStatus}
-          disabled={!profile || serverStatusLoading}
+          disabled={!canRefresh || serverStatusLoading}
         />
       </div>
-      <div className="grid grid-cols-1 gap-x-2.5 gap-y-px @[235px]:grid-cols-2">
-        <CompactInfoRow label="名称" value={profile?.name ?? "-"} />
-        <CompactInfoRow label="主机" value={profile?.host ?? "-"} />
-        <CompactInfoRow label="协议" value={normalizeProtocolLabel(profile?.protocol)} />
-        <CompactInfoRow label="用户" value={profile?.username ?? "-"} />
-        <CompactInfoRow label="端口" value={String(profile?.port ?? "-")} />
-        {serverStatus && (
-          <>
-            <CompactInfoRow label="节点" value={serverStatus.hostname} />
-            <CompactInfoRow label="系统" value={compactServerOs(serverStatus.os)} title={serverStatus.os} />
-            <CompactInfoRow label="运行" value={compactUptime(serverStatus.uptime)} title={serverStatus.uptime} />
-            <CompactInfoRow label="负载" value={serverStatus.loadAverage} />
-            <CompactInfoRow label="CPU" value={serverStatus.cpu} />
-            <CompactInfoRow label="内存" value={serverStatus.memory} />
-            <CompactInfoRow label="磁盘" value={serverStatus.disk} />
-          </>
-        )}
-      </div>
-      {!serverStatus && (
-        <div className="pt-1 text-[11px] leading-tight text-muted-foreground">
-          {serverStatusLoading ? "正在读取服务器状态..." : serverStatusError ? `状态读取失败: ${serverStatusError}` : "暂无状态数据"}
+
+      {profile ? (
+        <div className="min-w-0">
+          <div className="truncate text-[13px] font-medium leading-tight">{profile.name}</div>
+          <div className="mt-0.5 truncate font-mono text-[10.5px] text-muted-foreground" title={identityLine(profile)}>
+            {identityLine(profile)}
+          </div>
         </div>
+      ) : (
+        <p className="m-0 text-[11px] text-muted-foreground">选择一个会话查看状态</p>
+      )}
+
+      <div className="mt-2.5 grid gap-1.5">
+        <StatusMeter label="CPU" value={serverStatus?.cpu} loading={serverStatusLoading && !serverStatus} />
+        <StatusMeter label="内存" value={serverStatus?.memory} loading={serverStatusLoading && !serverStatus} />
+        <StatusMeter label="磁盘" value={serverStatus?.disk} loading={serverStatusLoading && !serverStatus} />
+      </div>
+
+      {serverStatus ? (
+        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[10.5px] leading-tight text-muted-foreground">
+          <MetaChip label="运行" value={compactUptime(serverStatus.uptime)} title={serverStatus.uptime} />
+          <MetaChip label="负载" value={compactLoad(serverStatus.loadAverage)} title={serverStatus.loadAverage} />
+          <MetaChip label="节点" value={serverStatus.hostname} />
+          <MetaChip label="系统" value={compactServerOs(serverStatus.os)} title={serverStatus.os} />
+        </div>
+      ) : (
+        <p className="mt-2 mb-0 text-[11px] leading-tight text-muted-foreground">
+          {serverStatusLoading
+            ? "正在读取服务器状态…"
+            : serverStatusError
+              ? `状态读取失败：${serverStatusError}`
+              : connected || isLocalProtocol(profile?.protocol)
+                ? "暂无状态数据"
+                : "连接后显示 CPU / 内存 / 磁盘"}
+        </p>
       )}
     </section>
   );
 }
 
-function CompactInfoRow({ label, value, title }: { label: string; value: string; title?: string }) {
+function identityLine(profile: Profile) {
+  const protocol = normalizeProtocolLabel(profile.protocol);
+  const host = profile.host?.trim() || "-";
+  const port = Number(profile.port || 0);
+  const endpoint = port > 0 ? `${host}:${port}` : host;
+  const user = profile.username?.trim();
+  return [endpoint, protocol, user].filter(Boolean).join(" · ");
+}
+
+function StatusMeter({ label, value, loading }: { label: string; value?: string; loading?: boolean }) {
+  const text = (value ?? "").trim();
+  const empty = !text || text === "-";
+  const percent = empty ? null : parsePercent(text);
+  const display = empty ? (loading ? "…" : "—") : compactMetric(text);
+
   return (
-    <div className="grid min-h-[17px] grid-cols-[36px_minmax(0,1fr)] gap-1.5 text-[11px] leading-tight text-muted-foreground/90">
-      <span>{label}</span>
-      <strong className="truncate font-medium text-foreground/85" title={title ?? value}>
-        {value}
-      </strong>
+    <div className="grid min-w-0 grid-cols-[28px_minmax(0,1fr)] items-center gap-2">
+      <span className="text-[10.5px] text-muted-foreground">{label}</span>
+      <div className="min-w-0">
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="truncate font-mono text-[10.5px] text-foreground/85" title={empty ? undefined : text}>
+            {display}
+          </span>
+          {percent != null && <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">{Math.round(percent)}%</span>}
+        </div>
+        <div className="mt-0.5 h-1 overflow-hidden rounded-full bg-muted">
+          <div
+            className={cn(
+              "h-full rounded-full bg-foreground/45 transition-[width] duration-[var(--duration-base)] ease-[var(--ease-swift)]",
+              loading && empty && "w-1/3 animate-pulse",
+              percent != null && percent >= 90 && "bg-foreground/70"
+            )}
+            style={percent == null ? undefined : { width: `${Math.max(2, Math.min(100, percent))}%` }}
+          />
+        </div>
+      </div>
     </div>
   );
+}
+
+function MetaChip({ label, value, title }: { label: string; value: string; title?: string }) {
+  if (!value || value === "-") return null;
+  return (
+    <span className="inline-flex min-w-0 max-w-full items-baseline gap-1" title={title ?? value}>
+      <span>{label}</span>
+      <strong className="truncate font-medium text-foreground/80">{value}</strong>
+    </span>
+  );
+}
+
+function parsePercent(value: string) {
+  const match = value.match(/(\d+(?:\.\d+)?)\s*%/);
+  if (!match) return null;
+  const next = Number(match[1]);
+  return Number.isFinite(next) ? Math.max(0, Math.min(100, next)) : null;
+}
+
+function compactMetric(value: string) {
+  return value.replace(/\s+used$/i, "").trim();
+}
+
+function compactLoad(value: string) {
+  const text = value.trim();
+  if (!text || text === "-") return "-";
+  const parts = text.split(/\s+/).filter(Boolean);
+  if (parts.length >= 3 && parts.every((part) => /^[\d.]+$/.test(part))) {
+    return parts.slice(0, 3).join(" / ");
+  }
+  return text.length > 22 ? `${text.slice(0, 19)}…` : text;
 }
 
 function compactServerOs(value: string) {
@@ -95,12 +174,13 @@ function compactServerOs(value: string) {
     const arch = text.match(/\b(x86_64|aarch64|arm64|amd64|i386|i686)\b/i)?.[1];
     return ["Linux", version, arch].filter(Boolean).join(" ");
   }
-  return text.length > 34 ? `${text.slice(0, 31)}...` : text;
+  return text.length > 28 ? `${text.slice(0, 25)}…` : text;
 }
 
 function compactUptime(value: string) {
   const text = value.trim().replace(/^up\s+/i, "");
   if (!text || text === "-") return "-";
+  if (/[天时分]/.test(text)) return text;
   const units: Array<[RegExp, string]> = [
     [/(\d+)\s+years?/i, "年"],
     [/(\d+)\s+weeks?/i, "周"],
@@ -123,5 +203,5 @@ function compactUptime(value: string) {
     const minute = `${Number(clock[3])}分`;
     return [day, hour, minute].filter(Boolean).slice(0, 2).join(" ");
   }
-  return text.length > 18 ? `${text.slice(0, 15)}...` : text;
+  return text.length > 18 ? `${text.slice(0, 15)}…` : text;
 }

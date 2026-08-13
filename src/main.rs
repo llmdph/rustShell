@@ -73,10 +73,10 @@ struct AppRuntime {
 
 const TRANSFER_HISTORY_LIMIT: usize = 200;
 const FINISHED_TRANSFER_QUEUE_LIMIT: usize = 50;
-/// Long enough to collapse the burst of duplicate status requests that a
-/// profile switch or dock open triggers, short enough that a manual refresh
-/// still feels live.
-const SERVER_STATUS_TTL: Duration = Duration::from_secs(2);
+/// Collapses the burst of duplicate status requests a profile switch fires.
+/// Manual refresh passes `force` and skips this. Polling is 15s, so 10s still
+/// feels live without exec-ing on every dock paint.
+const SERVER_STATUS_TTL: Duration = Duration::from_secs(10);
 const APP_ICON_RGBA: &[u8] = include_bytes!("../icons/rustshell-app-icon-64.rgba");
 const APP_ICON_SIZE: u32 = 64;
 const WEBVIEW2_BROWSER_ARGS: &str =
@@ -314,6 +314,14 @@ struct RemoteHomeRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ServerStatusRequest {
+    profile_id: String,
+    password: Option<String>,
+    force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RemoteSearchRequest {
     profile_id: String,
     root: String,
@@ -533,6 +541,29 @@ struct ServerStatusView {
     cpu: String,
     memory: String,
     disk: String,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+#[allow(non_snake_case)]
+struct FILETIME {
+  dwLowDateTime: u32,
+  dwHighDateTime: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+#[allow(non_snake_case)]
+struct MEMORYSTATUSEX {
+    dwLength: u32,
+    dwMemoryLoad: u32,
+    ullTotalPhys: u64,
+    ullAvailPhys: u64,
+    ullTotalPageFile: u64,
+    ullAvailPageFile: u64,
+    ullTotalVirtual: u64,
+    ullAvailVirtual: u64,
+    ullAvailExtendedVirtual: u64,
 }
 
 #[derive(Debug)]
@@ -1259,19 +1290,21 @@ async fn remote_home(
 
 #[tauri::command]
 async fn server_status(
-    request: RemoteHomeRequest,
+    request: ServerStatusRequest,
     state: State<'_, AppRuntime>,
 ) -> Result<ServerStatusView, String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     if matches!(context.profile.protocol, SessionProtocol::LocalShell) {
-        return Ok(local_server_status());
+        return blocking(|| Ok(local_server_status())).await;
     }
 
-    // Opening the overview panel and switching profiles both fire this, often
-    // within the same tick; serve those from cache rather than re-running the
-    // remote command.
+    // Opening the overview and switching profiles both fire this, often in the
+    // same tick; serve those from cache rather than re-running the remote
+    // command. Manual refresh sets force and skips the TTL.
     let profile_id = context.profile.id;
-    let cached_view = {
+    let cached_view = if request.force.unwrap_or(false) {
+        None
+    } else {
         let cache = lock(&state.server_status_cache)?;
         cache
             .get(&profile_id)
@@ -2171,8 +2204,26 @@ const SERVER_STATUS_COMMAND: &str = r#"printf 'hostname=%s\n' "$(hostname 2>/dev
 printf 'os=%s\n' "$(uname -srvmo 2>/dev/null || uname -a 2>/dev/null)"
 printf 'uptime=%s\n' "$(uptime -p 2>/dev/null || uptime 2>/dev/null)"
 printf 'load=%s\n' "$(awk '{print $1" "$2" "$3}' /proc/loadavg 2>/dev/null || uptime 2>/dev/null)"
-printf 'cpu=%s cores\n' "$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo '-')"
-printf 'memory=%s\n' "$(free -h 2>/dev/null | awk '/^Mem:/ {print $3 " / " $2 " used"}')"
+cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo '-')
+cpu_pct=
+if [ -r /proc/stat ]; then
+  read -r _ u1 n1 s1 i1 _ < /proc/stat
+  t1=$((u1+n1+s1+i1))
+  sleep 0.1
+  read -r _ u2 n2 s2 i2 _ < /proc/stat
+  t2=$((u2+n2+s2+i2))
+  dt=$((t2-t1))
+  di=$((i2-i1))
+  if [ "$dt" -gt 0 ]; then
+    cpu_pct=$(( (dt-di)*100/dt ))
+  fi
+fi
+if [ -n "$cpu_pct" ]; then
+  printf 'cpu=%s%% (%s cores)\n' "$cpu_pct" "$cores"
+else
+  printf 'cpu=%s cores\n' "$cores"
+fi
+printf 'memory=%s\n' "$(free 2>/dev/null | awk '/^Mem:/ {if($2>0) printf "%.1fG / %.1fG (%.0f%%)", $3/1048576, $2/1048576, $3*100/$2}')"
 printf 'disk=%s\n' "$(df -h / 2>/dev/null | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')"
 "#;
 
@@ -2319,20 +2370,180 @@ fn parse_server_status(output: &str) -> ServerStatusView {
     }
 }
 
-fn local_server_status() -> ServerStatusView {
-    ServerStatusView {
-        hostname: std::env::var("COMPUTERNAME")
-            .or_else(|_| std::env::var("HOSTNAME"))
-            .unwrap_or_else(|_| "localhost".to_owned()),
-        os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
-        uptime: "-".to_owned(),
-        load_average: "-".to_owned(),
-        cpu: std::thread::available_parallelism()
-            .map(|count| format!("{} cores", count.get()))
-            .unwrap_or_else(|_| "-".to_owned()),
-        memory: "-".to_owned(),
-        disk: "-".to_owned(),
+fn format_bytes_short(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
     }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else if value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_uptime_secs(secs: u64) -> String {
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    if days > 0 {
+        format!("{days}天 {hours}时")
+    } else if hours > 0 {
+        format!("{hours}时 {mins}分")
+    } else {
+        format!("{mins}分")
+    }
+}
+
+fn local_server_status() -> ServerStatusView {
+    let hostname = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "localhost".to_owned());
+    let os = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+
+    let mut cpu = std::thread::available_parallelism()
+        .map(|count| format!("{} cores", count.get()))
+        .unwrap_or_else(|_| "-".to_owned());
+    let mut uptime = "-".to_owned();
+    let mut memory = "-".to_owned();
+    let mut disk = "-".to_owned();
+
+    #[cfg(windows)]
+    {
+        if let Some(pct) = windows_cpu_percent() {
+            cpu = format!("{pct:.0}%");
+        }
+        let ticks = unsafe { GetTickCount64() };
+        uptime = format_uptime_secs(ticks / 1000);
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..MEMORYSTATUSEX::default()
+        };
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ullTotalPhys > 0 {
+            let used = status.ullTotalPhys.saturating_sub(status.ullAvailPhys);
+            memory = format!(
+                "{} / {} ({}%)",
+                format_bytes_short(used),
+                format_bytes_short(status.ullTotalPhys),
+                status.dwMemoryLoad
+            );
+        }
+        let root: Vec<u16> = "C:\\\0".encode_utf16().collect();
+        let mut free = 0u64;
+        let mut total = 0u64;
+        let mut total_free = 0u64;
+        if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut free, &mut total, &mut total_free) } != 0
+            && total > 0
+        {
+            let used = total.saturating_sub(free);
+            let pct = (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0);
+            disk = format!(
+                "{} / {} ({pct:.0}%)",
+                format_bytes_short(used),
+                format_bytes_short(total)
+            );
+        }
+    }
+
+    ServerStatusView {
+        hostname,
+        os,
+        uptime,
+        load_average: "-".to_owned(),
+        cpu,
+        memory,
+        disk,
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetSystemTimes(
+        lpIdleTime: *mut FILETIME,
+        lpKernelTime: *mut FILETIME,
+        lpUserTime: *mut FILETIME,
+    ) -> i32;
+    fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
+    fn GetDiskFreeSpaceExW(
+        lpDirectoryName: *const u16,
+        lpFreeBytesAvailableToCaller: *mut u64,
+        lpTotalNumberOfBytes: *mut u64,
+        lpTotalNumberOfFreeBytes: *mut u64,
+    ) -> i32;
+    fn GetTickCount64() -> u64;
+}
+
+fn win_get_current_cpu() -> Result<(FILETIME, FILETIME, FILETIME), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    {
+        let mut idle = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+        if ok == 0 {
+            return Err("GetSystemTimes failed".into());
+        }
+        return Ok((idle, kernel, user));
+    }
+    #[cfg(not(windows))]
+    {
+        Err("not windows".into())
+    }
+}
+
+#[cfg(windows)]
+fn windows_cpu_percent() -> Option<f32> {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+    let sample = || -> Option<(u64, u64)> {
+        let (idle_ft, kernel_ft, user_ft) = win_get_current_cpu().ok()?;
+        let idle = (u64::from(idle_ft.dwHighDateTime) << 32) | u64::from(idle_ft.dwLowDateTime);
+        let kernel = (u64::from(kernel_ft.dwHighDateTime) << 32) | u64::from(kernel_ft.dwLowDateTime);
+        let user = (u64::from(user_ft.dwHighDateTime) << 32) | u64::from(user_ft.dwLowDateTime);
+        // Kernel time includes idle on Windows.
+        let busy = kernel.saturating_sub(idle).saturating_add(user);
+        Some((idle, busy))
+    };
+
+    let (idle, busy) = sample()?;
+    let mut last = LAST.lock().ok()?;
+    let pct = if let Some((prev_idle, prev_busy)) = *last {
+        let di = idle.saturating_sub(prev_idle);
+        let db = busy.saturating_sub(prev_busy);
+        let tot = di + db;
+        if tot > 0 {
+            Some((db as f32 / tot as f32 * 100.0).clamp(0.0, 100.0))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    *last = Some((idle, busy));
+    if pct.is_some() {
+        return pct;
+    }
+    drop(last);
+    // First paint: one 80ms sample so we don't show since-boot average.
+    std::thread::sleep(Duration::from_millis(80));
+    let (idle, busy) = sample()?;
+    let mut last = LAST.lock().ok()?;
+    let prev = last.unwrap_or((idle, busy));
+    *last = Some((idle, busy));
+    let di = idle.saturating_sub(prev.0);
+    let db = busy.saturating_sub(prev.1);
+    let tot = di + db;
+    if tot == 0 {
+        return None;
+    }
+    Some((db as f32 / tot as f32 * 100.0).clamp(0.0, 100.0))
 }
 
 fn launch_terminal(
