@@ -97,6 +97,151 @@ const defaultSearchOptions: TerminalSearchOptions = { caseSensitive: false, whol
 const DRAIN_SAFETY_POLL_DELAY = 2000;
 const DRAIN_EVENT_STALE_AFTER = 1500;
 
+type XtermCoreHandle = {
+  _core?: {
+    coreService?: { isCursorInitialized?: boolean; isCursorHidden?: boolean };
+    _coreService?: { isCursorInitialized?: boolean; isCursorHidden?: boolean };
+    _showCursor?: () => void;
+    _renderService?: {
+      dimensions?: {
+        css?: { cell?: { width?: number; height?: number } };
+      };
+    };
+  };
+  core?: {
+    coreService?: { isCursorInitialized?: boolean; isCursorHidden?: boolean };
+    _coreService?: { isCursorInitialized?: boolean; isCursorHidden?: boolean };
+    _showCursor?: () => void;
+    _renderService?: {
+      dimensions?: {
+        css?: { cell?: { width?: number; height?: number } };
+      };
+    };
+  };
+};
+
+function readCellSize(term: Terminal, screen: HTMLElement, cols: number, rows: number) {
+  const handle = term as unknown as XtermCoreHandle;
+  const core = handle._core ?? handle.core;
+  const cell = core?._renderService?.dimensions?.css?.cell;
+  if (cell?.width && cell.height && cell.width >= 1 && cell.height >= 1) {
+    return { cellW: cell.width, cellH: cell.height };
+  }
+  // Rows are sized to the glyph grid. The screen element is often wider than
+  // that grid (leftover gutter), so clientWidth/cols drifts the overlay right.
+  const row = screen.querySelector(".xterm-rows > div");
+  if (row instanceof HTMLElement) {
+    const rowW = parseFloat(row.style.width);
+    const rowH = row.getBoundingClientRect().height;
+    if (Number.isFinite(rowW) && rowW > 0 && rowH >= 1) {
+      return { cellW: rowW / cols, cellH: rowH };
+    }
+  }
+  return { cellW: screen.clientWidth / cols, cellH: screen.clientHeight / rows };
+}
+
+/// Paint a caret we own. xterm's DOM cell is gated by isCursorInitialized,
+/// isCursorHidden (ConPTY often emits CSI ?25l because the hidden console
+/// window is "unfocused"), and letter-spacing that can collapse the span to
+/// 0px. An overlay with explicit cell metrics is independent of all three.
+function syncTermCaret(term: Terminal) {
+  const screen = term.element?.querySelector(".xterm-screen");
+  if (!(screen instanceof HTMLElement)) return;
+  let caret = screen.querySelector(":scope > [data-xterm-caret]");
+  if (!(caret instanceof HTMLDivElement)) {
+    caret = document.createElement("div");
+    caret.dataset.xtermCaret = "";
+    caret.setAttribute("aria-hidden", "true");
+    screen.appendChild(caret);
+  }
+  const cols = Math.max(term.cols, 1);
+  const rows = Math.max(term.rows, 1);
+  const { cellW, cellH } = readCellSize(term, screen, cols, rows);
+  if (!Number.isFinite(cellW) || !Number.isFinite(cellH) || cellW < 1 || cellH < 1) {
+    caret.style.visibility = "hidden";
+    return;
+  }
+
+  // If xterm did emit a cursor cell, snap to its box so we cannot drift from
+  // the glyph grid. A collapsed (0-width) span still has a correct origin.
+  const native = screen.querySelector(".xterm-cursor");
+  if (native instanceof HTMLElement) {
+    const screenRect = screen.getBoundingClientRect();
+    const cellRect = native.getBoundingClientRect();
+    if (cellRect.height >= 1) {
+      caret.style.visibility = "visible";
+      caret.style.width = `${cellRect.width >= 1 ? cellRect.width : cellW}px`;
+      caret.style.height = `${cellRect.height}px`;
+      caret.style.transform = `translate(${cellRect.left - screenRect.left}px, ${cellRect.top - screenRect.top}px)`;
+      return;
+    }
+  }
+
+  const buf = term.buffer.active;
+  const x = Math.max(0, Math.min(buf.cursorX, cols - 1));
+  const y = Math.max(0, Math.min(buf.cursorY, rows - 1));
+  caret.style.visibility = "visible";
+  caret.style.width = `${cellW}px`;
+  caret.style.height = `${cellH}px`;
+  caret.style.transform = `translate(${x * cellW}px, ${y * cellH}px)`;
+}
+
+/// xterm's DomRenderer only emits a .xterm-cursor cell after
+/// CoreService.isCursorInitialized is true. That latch normally flips inside
+/// Terminal#_showCursor (textarea focus / keydown). A plain write() of the
+/// shell prompt never flips it, and our window boots hidden then reveals after
+/// paint — mount-time focus() can set activeElement without a focus event, so
+/// the latch stays false and the pane stays caret-less until a real click.
+/// Reach the service through a few known shapes and force a refresh so the
+/// block caret exists from the first painted frame.
+function primeCursor(term: Terminal) {
+  try {
+    const handle = term as unknown as XtermCoreHandle;
+    const core = handle._core ?? handle.core;
+    const coreService = core?.coreService ?? core?._coreService;
+    if (coreService) {
+      coreService.isCursorInitialized = true;
+      // ConPTY hides the Win32 cursor when the pseudo console is not the
+      // foreground window, and that arrives as CSI ?25l. Keep xterm's own
+      // cell unhidden; the overlay caret is the visible one either way.
+      coreService.isCursorHidden = false;
+    }
+    if (typeof core?._showCursor === "function") {
+      core._showCursor();
+    }
+  } catch {
+    // Internal shape moved under an xterm upgrade — still try a plain refresh.
+  }
+  try {
+    // Force DomRenderer to repaint the cursor cell at the real buffer position.
+    const y = term.buffer.active.cursorY;
+    term.refresh(Math.max(0, y), Math.max(term.rows - 1, y));
+  } catch {
+    try {
+      term.refresh(0, Math.max(term.rows - 1, 0));
+    } catch {
+      // refresh() can throw if the host was torn down between open and prime.
+    }
+  }
+  try {
+    syncTermCaret(term);
+  } catch {
+    // Host torn down between open and prime.
+  }
+}
+
+
+
+function schedulePrimeCursor(term: Terminal, frames = 2) {
+  let left = frames;
+  const tick = () => {
+    primeCursor(term);
+    left -= 1;
+    if (left > 0) window.requestAnimationFrame(tick);
+  };
+  window.requestAnimationFrame(tick);
+}
+
 export function XtermView({ terminal, settings, active, visible, paneStyle, terminalBackgroundAlpha, onActivate, onDrain, onReplayConsumed }: XtermViewProps) {
   const shown = visible ?? active;
   const terminalTheme = xtermTheme(settings.theme, terminalBackgroundAlpha);
@@ -275,7 +420,17 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     const output = drainOutputRef.current;
     drainOutputRef.current = "";
     if (!output) return;
-    termRef.current?.write(output, () => updateTerminalScrollbar());
+    termRef.current?.write(output, () => {
+      if (termRef.current) {
+        try {
+          termRef.current.scrollToBottom();
+        } catch {
+          // ignore
+        }
+        primeCursor(termRef.current);
+      }
+      updateTerminalScrollbar();
+    });
   }, [updateTerminalScrollbar]);
 
   const scheduleDrainWrite = useCallback(
@@ -330,19 +485,22 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       // which xterm still gates behind the proposed-API flag. Without this the
       // addon throws on every findNext and the overlay reports zero matches.
       allowProposedApi: true,
-      // Blink is painted as a CSS keyframe that alternates the cell to
-      // `background-color: inherit`. Global prefers-reduced-motion (and some
-      // WebView2 builds) freeze that on the transparent frame so the caret
-      // vanishes. Keep a solid block instead; CSS below also pins the colors.
+      // Solid block. Blink keyframes use `background-color: inherit` on the off
+      // frame; WebView2 / reduced-motion can freeze there and the caret vanishes.
       cursorBlink: false,
       cursorStyle: "block",
-      // Outline is easy to miss on the dark phosphor cell; keep a solid block
-      // when the pane is visible but the textarea does not own focus.
+      // Unfocused panes keep a solid block so the caret never disappears when
+      // the tools bar or another tab steals focus.
       cursorInactiveStyle: "block",
       convertEol: true,
-      fontFamily: '"Geist Mono Variable", "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace',
+      // DOM renderer + system ClearType. Consolas is fuller than Cascadia Mono
+      // regular and has real bold; avoid WebGL atlas (no subpixel AA → jaggies).
+      fontFamily: 'Consolas, "Cascadia Mono", "Microsoft YaHei UI", "Microsoft YaHei", monospace',
       fontSize: settings.fontSize,
-      lineHeight: 1.18,
+      fontWeight: "400",
+      fontWeightBold: "700",
+      letterSpacing: 0,
+      lineHeight: 1,
       scrollback: settings.scrollback,
       theme
     });
@@ -357,24 +515,38 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     termRef.current = term;
     fitRef.current = fit;
     searchRef.current = search;
+    if (hostRef.current) hostRef.current.dataset.xtermRenderer = "dom";
     const initialReplay = terminal.text;
     if (initialReplay) {
-      term.write(initialReplay);
+      term.write(initialReplay, () => {
+        if (!disposed) primeCursor(term);
+      });
       onReplayConsumed(terminal.id);
     }
-    // DomRenderer only attaches .xterm-cursor after isCursorInitialized, which
-    // xterm sets on first focus/key. Touch focus once so a connected session is
-    // not caret-less; release it again for background tabs so the active pane
-    // keeps the real focus.
-    term.focus();
-    if (!active) term.blur();
+    // xterm gates the cursor cell behind CoreService.isCursorInitialized, which
+    // it flips only inside the textarea focus/keydown handlers. At mount the
+    // window is often not yet OS-focused (hidden-until-painted boot, background
+    // WebView2 tabs), so focus() sets activeElement without firing a focus event
+    // and the caret would stay absent until a real click. Prime the latch here
+    // so the block caret is present immediately; focus() below is now purely
+    // about routing the keyboard to the active pane.
+    primeCursor(term);
+    schedulePrimeCursor(term, 8);
+    try {
+      term.scrollToBottom();
+    } catch {
+      // ignore
+    }
+    if (active) term.focus();
     // Variable fonts can finish loading after open; remeasure so the caret
     // cell does not stay at a zero/stale width from the fallback face.
     const refreshAfterFonts = () => {
       if (disposed || termRef.current !== term) return;
       try {
         fit.fit();
-        term.refresh(0, Math.max(term.rows - 1, 0));
+        term.scrollToBottom();
+        primeCursor(term);
+        if (active) term.focus();
       } catch {
         // fit can throw if the host is display:none mid-unmount
       }
@@ -388,7 +560,12 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     const viewport = hostRef.current.querySelector<HTMLElement>(".xterm-viewport");
     const handleViewportScroll = () => updateTerminalScrollbar(true);
     viewport?.addEventListener("scroll", handleViewportScroll, { passive: true });
-    const scrollDisposable = term.onScroll(() => updateTerminalScrollbar(true));
+    const scrollDisposable = term.onScroll(() => {
+      updateTerminalScrollbar(true);
+      syncTermCaret(term);
+    });
+    const renderDisposable = term.onRender(() => syncTermCaret(term));
+    const cursorDisposable = term.onCursorMove(() => syncTermCaret(term));
 
     const flushInput = () => {
       sendScheduledRef.current = false;
@@ -429,6 +606,12 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
         lastTermSizeRef.current = { cols: term.cols, rows: term.rows };
         api.terminalResize(terminal.id, term.cols, term.rows).catch(() => undefined);
       }
+      try {
+        term.scrollToBottom();
+        primeCursor(term);
+      } catch {
+        // ignore
+      }
       updateTerminalScrollbar();
     };
 
@@ -465,6 +648,8 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       window.removeEventListener("rustshell:terminal-layout-resize-end", flushDeferredResize);
       viewport?.removeEventListener("scroll", handleViewportScroll);
       scrollDisposable.dispose();
+      renderDisposable.dispose();
+      cursorDisposable.dispose();
       searchResults.dispose();
       observer.disconnect();
       if (terminalScrollbarHideRef.current !== null) {
@@ -496,6 +681,8 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     const term = termRef.current;
     if (!term) return;
     term.options.fontSize = settings.fontSize;
+    term.options.fontWeight = "400";
+    term.options.fontWeightBold = "700";
     term.options.scrollback = settings.scrollback;
     term.options.theme = xtermTheme(settings.theme, terminalBackgroundAlpha);
     const frame = window.requestAnimationFrame(() => {
@@ -505,6 +692,7 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
         lastTermSizeRef.current = { cols: termRef.current.cols, rows: termRef.current.rows };
         api.terminalResize(terminal.id, termRef.current.cols, termRef.current.rows).catch(() => undefined);
       }
+      primeCursor(termRef.current);
       updateTerminalScrollbar();
     });
     return () => window.cancelAnimationFrame(frame);
@@ -519,6 +707,7 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       if (rect.width <= 0 || rect.height <= 0) return;
       fitRef.current.fit();
       updateTerminalScrollbar();
+      primeCursor(termRef.current);
       termRef.current.focus();
       api.terminalResize(terminal.id, termRef.current.cols, termRef.current.rows).catch(() => undefined);
       if (drainOutputRef.current) {
@@ -527,6 +716,25 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     });
     return () => window.cancelAnimationFrame(frame);
   }, [active, scheduleDrainWrite, terminal.id, updateTerminalScrollbar]);
+
+  // Hidden-until-painted boot and OS focus changes can leave the caret latch
+  // false even after mount. Re-prime when the document becomes visible/focused.
+  useEffect(() => {
+    const reprime = () => {
+      if (!shown || !termRef.current) return;
+      primeCursor(termRef.current);
+      if (active) termRef.current.focus();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") reprime();
+    };
+    window.addEventListener("focus", reprime);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", reprime);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [active, shown]);
 
   useEffect(() => {
     let stopped = false;
@@ -621,7 +829,10 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
         // Always reclaim focus on press. The host padding sits outside xterm's
         // own hit target, and a already-active tab that lost focus (tools bar,
         // dialog, …) would otherwise stay caret-less until the active id flips.
-        if (shown) termRef.current?.focus();
+        if (shown && termRef.current) {
+          primeCursor(termRef.current);
+          termRef.current.focus();
+        }
       }}
       ref={hostRef}
     >

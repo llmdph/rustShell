@@ -38,6 +38,19 @@ $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $RepoRoot
 Write-Host "==> Repo: $RepoRoot" -ForegroundColor Cyan
 
+# Vite 8 needs modern Node. Prefer nvm-windows Node 22 when PATH still points at v14.
+$preferredNodeDirs = @(
+  "C:\Users\admin\AppData\Local\nvm\v22.12.0",
+  "C:\Users\admin\AppData\Local\nvm\v22.14.0",
+  "C:\Users\admin\AppData\Local\nvm\v26.0.0"
+)
+foreach ($dir in $preferredNodeDirs) {
+  if (Test-Path (Join-Path $dir "node.exe")) {
+    $env:Path = "$dir;" + $env:Path
+    break
+  }
+}
+
 Assert-Command node
 Assert-Command npm
 Assert-Command cargo
@@ -46,6 +59,10 @@ Assert-Command rustc
 $nodeVer = (node -v)
 $cargoVer = (cargo --version)
 Write-Host "==> node $nodeVer | $cargoVer" -ForegroundColor DarkGray
+$nodeMajor = [int](($nodeVer.TrimStart("v") -split "\.")[0])
+if ($nodeMajor -lt 20) {
+  throw "Node $nodeVer is too old for this project (need >= 20). package.ps1 tried nvm v22 but PATH is still old."
+}
 
 # Prefer local node_modules CLI, then cargo-tauri / global tauri, else npx.
 $localTauri = Join-Path $RepoRoot "node_modules\.bin\tauri.cmd"
@@ -73,16 +90,43 @@ Write-Host "==> Frontend build (vite)" -ForegroundColor Cyan
 npm run build
 if ($LASTEXITCODE -ne 0) { throw "npm run build failed" }
 
+# Hard gate: refuse to package a stale/empty frontend.
+# Windows -Filter App-*.js is case-insensitive and also matches app-entry-*.js.
+$appJs = Get-ChildItem -Path (Join-Path $RepoRoot "dist\assets") -File |
+  Where-Object { $_.Name -cmatch '^App-[A-Za-z0-9_-]+\.js$' } |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+if (-not $appJs) { throw "dist/assets/App-*.js missing after vite build" }
+$appText = Get-Content -LiteralPath $appJs.FullName -Raw
+# Overlay caret + solid cursorBlink:false. Do not accept a build that still
+# only styles xterm's own .xterm-cursor cell.
+if ($appText -notmatch "cursorBlink") { throw "dist frontend missing cursorBlink option ($($appJs.Name))" }
+if ($appText -notmatch "xtermCaret|data-xterm-caret") { throw "dist frontend missing overlay caret ($($appJs.Name))" }
+if ($appText -notmatch "dataset\.xtermRenderer|xtermRenderer|Consolas") { throw "dist frontend missing terminal font/renderer path ($($appJs.Name))" }
+if ($appText -notmatch "exitMainWindow") { throw "dist frontend missing exitMainWindow ($($appJs.Name))" }
+if ($appText -match "request-exit-confirm") { throw "dist frontend still contains request-exit-confirm ($($appJs.Name))" }
+$cssFile = Get-ChildItem -Path (Join-Path $RepoRoot "dist\assets") -Filter "app-entry-*.css" -File |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+if (-not $cssFile) { throw "dist/assets/app-entry-*.css missing after vite build" }
+$cssText = Get-Content -LiteralPath $cssFile.FullName -Raw
+if ($cssText -notmatch "xterm-caret") { throw "dist css missing overlay caret ($($cssFile.Name))" }
+Write-Host ("==> Frontend gate OK: {0} / {1}" -f $appJs.Name, $cssFile.Name) -ForegroundColor DarkGray
+
 # Tauri 2 CLI accepts msi/nsis only — expand "all" to both.
-$bundleArgs = switch ($Targets) {
-  "nsis" { @("nsis") }
-  "msi"  { @("msi") }
-  "all"  { @("nsis", "msi") }
-}
+# Force array: bare switch returns unwrap a 1-element @() to string; @string then
+# character-splats ("n","s","i","s") and tauri sees --bundles n.
+$bundleArgs = @(switch ($Targets) {
+  "nsis" { "nsis" }
+  "msi"  { "msi" }
+  "all"  { "nsis"; "msi" }
+})
 
 Write-Host ("==> Tauri release build (targets={0})" -f ($bundleArgs -join ",")) -ForegroundColor Cyan
 # beforeBuildCommand in tauri.conf already runs npm.cmd run build; dist already exists so that is fine
-Invoke-Tauri build --bundles @bundleArgs
+# Pass as one arg list so remaining-args + splat never char-splits a bare string.
+$tauriBuildArgs = @("build", "--bundles") + $bundleArgs
+Invoke-Tauri @tauriBuildArgs
 if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
 
 Write-Host ""
