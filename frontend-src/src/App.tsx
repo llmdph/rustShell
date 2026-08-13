@@ -941,47 +941,8 @@ export default function App() {
     [activeProfile, confirmAction, copyWithFallback, dragOverDockTarget, fileDockHeightByTabId, localPath, profileSecrets, profiles, pushToast, remotePath, transferConflict, transferHistory.length, transfers]
   );
 
-  const confirmActionRef = useRef(confirmAction);
-  useEffect(() => {
-    confirmActionRef.current = confirmAction;
-  }, [confirmAction]);
-  const exitConfirmOpenRef = useRef(false);
-
-  useEffect(() => {
-    if (!hasTauriRuntime() || isFileManagerWindow) return;
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-    void listenTauriEvent("rustshell://request-exit-confirm", async () => {
-      if (exitConfirmOpenRef.current) return;
-      exitConfirmOpenRef.current = true;
-      try {
-        const confirmed = await confirmActionRef.current("退出确认", {
-          message: "确定要关闭 RustShell 吗？未断开的会话将被关闭。",
-          confirmLabel: "退出",
-          cancelLabel: "取消",
-          danger: true
-        });
-        if (confirmed) {
-          await api.exitMainWindow().catch((error) => {
-            const message = `退出失败: ${String(error)}`;
-            setStatus(message);
-            pushToast("error", message);
-          });
-        }
-      } finally {
-        exitConfirmOpenRef.current = false;
-      }
-    })
-      .then((fn) => {
-        if (disposed) fn();
-        else unlisten = fn;
-      })
-      .catch(() => undefined);
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [isFileManagerWindow, pushToast]);
+  // App exit never prompts. settings.confirmOnExit only gates closing a
+  // terminal session tab (see closeTabWithConfirm).
   useCommandPaletteShortcut(setCommandOpen);
 
   useEffect(() => {
@@ -1388,15 +1349,7 @@ export default function App() {
   const closeTabWithConfirm = async (tabId: string) => {
     const tab = tabs.find((item) => item.id === tabId);
     if (!tab) return;
-    if (settings.confirmOnExit) {
-      const confirmed = await confirmAction("关闭会话确认", {
-        message: `确定要关闭会话「${tab.title}」吗？\n未保存的终端输出不会继续保留在当前窗口。`,
-        confirmLabel: "关闭会话",
-        cancelLabel: "取消",
-        danger: true
-      });
-      if (!confirmed) return;
-    }
+    // Window exit must never go through this path. Session tab close only.
     await closeTab(tabId);
   };
 
@@ -2059,13 +2012,91 @@ export default function App() {
     }
   };
 
+  const hardExitApp = useCallback(async () => {
+    // Nuke any visible dialog nodes that look like exit confirms.
+    try {
+      resolveAppModal(false);
+      document.querySelectorAll("[role='dialog'], [data-slot='dialog-content']").forEach((node) => {
+        const text = (node.textContent || "").replace(/\s+/g, "");
+        if (text.includes("确认退出") || text.includes("退出确认") || text.includes("未断开") || text.includes("断开所有连接")) {
+          node.parentElement?.remove();
+        }
+      });
+    } catch {
+      // ignore
+    }
+    if (!hasTauriRuntime()) {
+      window.close();
+      return;
+    }
+    // Fire-and-forget hard exit; do not await UI work after this.
+    void api.exitMainWindow().catch(async () => {
+      try {
+        await getCurrentWindow().destroy();
+      } catch {
+        // ignore
+      }
+    });
+  }, [resolveAppModal]);
+
+  useEffect(() => {
+    window.__rustshellHardExit = () => {
+      void hardExitApp();
+    };
+    return () => {
+      delete window.__rustshellHardExit;
+    };
+  }, [hardExitApp]);
+
+  // If any exit-confirm dialog is injected by unexpected code, remove it and exit.
+  useEffect(() => {
+    const scrub = () => {
+      const nodes = Array.from(document.querySelectorAll("body *"));
+      for (const node of nodes) {
+        const text = (node.textContent || "").replace(/\s+/g, "");
+        if (!text) continue;
+        if (
+          (text.includes("确认退出") && text.includes("RustShell")) ||
+          text.includes("当前还有未断开") ||
+          text.includes("关闭窗口将断开所有连接")
+        ) {
+          (node as HTMLElement).style.display = "none";
+          void hardExitApp();
+          return;
+        }
+      }
+    };
+    const observer = new MutationObserver(() => scrub());
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    scrub();
+    return () => observer.disconnect();
+  }, [hardExitApp]);
+
+  // Belt-and-suspenders: native closeRequested always hard-exits.
+  useEffect(() => {
+    if (!hasTauriRuntime()) return;
+    let unlisten: (() => void) | null = null;
+    void getCurrentWindow()
+      .onCloseRequested(async (event) => {
+        event.preventDefault();
+        await hardExitApp();
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => undefined);
+    return () => {
+      unlisten?.();
+    };
+  }, [hardExitApp]);
+
   const runWindowAction = async (action: WindowAction) => {
     if (!hasTauriRuntime()) return;
     try {
       const appWindow = getCurrentWindow();
       if (action === "minimize") await appWindow.minimize();
       if (action === "maximize") await appWindow.toggleMaximize();
-      if (action === "close") await appWindow.close();
+      if (action === "close") await hardExitApp();
     } catch (error) {
       const message = `窗口操作失败: ${String(error)}`;
       setStatus(message);

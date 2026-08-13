@@ -33,8 +33,31 @@ type AppModalDialogProps = {
   onResolve: (value: string | boolean | null) => void;
 };
 
+function isAppExitConfirm(title: string, message?: string) {
+  const text = `${title}\n${message ?? ""}`;
+  return (
+    text.includes("确认退出") ||
+    text.includes("退出确认") ||
+    text.includes("退出 RustShell") ||
+    text.includes("关闭 RustShell") ||
+    text.includes("未断开") ||
+    text.includes("断开所有连接") ||
+    (text.includes("RustShell") && text.includes("退出"))
+  );
+}
+
 export default function AppModalDialog({ modal, onResolve }: AppModalDialogProps) {
   const [value, setValue] = useState(modal.kind === "prompt" ? modal.value : "");
+
+  useEffect(() => {
+    if (modal.kind === "confirm" && isAppExitConfirm(modal.title, modal.message)) {
+      onResolve(true);
+      if (typeof window !== "undefined" && typeof window.__rustshellHardExit === "function") {
+        void window.__rustshellHardExit();
+      }
+    }
+  }, [modal, onResolve]);
+
 
   useEffect(() => {
     setValue(modal.kind === "prompt" ? modal.value : "");
@@ -51,6 +74,7 @@ export default function AppModalDialog({ modal, onResolve }: AppModalDialogProps
   }, [modal.kind, onResolve]);
 
   if (modal.kind === "confirm") {
+    if (isAppExitConfirm(modal.title, modal.message)) return null;
     return (
       <Modal title={modal.title} onClose={() => onResolve(false)}>
         <div className="mb-3 mt-0.5 whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/85">{modal.message}</div>

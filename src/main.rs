@@ -1923,16 +1923,15 @@ async fn clear_transfer_history() -> Result<Vec<TransferView>, String> {
 
 #[tauri::command]
 fn exit_main_window(app: AppHandle, state: State<'_, AppRuntime>) -> Result<(), String> {
+    // Always hard-exit. Never prompt from Rust.
     state.allow_main_close.store(true, Ordering::SeqCst);
     if let Some(window) = app.get_webview_window("main") {
-        if let Err(error) = window.destroy() {
-            state.allow_main_close.store(false, Ordering::SeqCst);
-            return Err(to_string(error));
-        }
-    } else {
-        app.exit(0);
+        let _ = window.hide();
+        let _ = window.destroy();
     }
-    Ok(())
+    app.exit(0);
+    // If the event loop is wedged, terminate the process.
+    std::process::exit(0);
 }
 
 #[tauri::command]
@@ -2064,18 +2063,14 @@ fn main() {
                 if state.allow_main_close.load(Ordering::SeqCst) {
                     return;
                 }
+                // No confirm dialog on app close. Always hard-exit.
                 api.prevent_close();
-                let should_confirm = lock(&state.settings)
-                    .map(|settings| settings.confirm_on_exit)
-                    .unwrap_or(true);
-                if should_confirm {
-                    let _ = window.unminimize();
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                    let _ = window.emit("rustshell://request-exit-confirm", ());
-                } else {
-                    let _ = window.hide();
-                }
+                state.allow_main_close.store(true, Ordering::SeqCst);
+                let app = window.app_handle().clone();
+                let _ = window.hide();
+                let _ = window.destroy();
+                app.exit(0);
+                std::process::exit(0);
             }
         })
         .manage(runtime)
