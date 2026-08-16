@@ -4,7 +4,7 @@ use crate::core::{
 };
 use crate::services::ssh::{self, ConnectFailure};
 use anyhow::{Context, Result};
-use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use portable_pty::{CommandBuilder, PtySize};
 use ssh2::ErrorCode;
 use std::{
@@ -12,8 +12,6 @@ use std::{
     thread,
     time::Duration,
 };
-
-const TERMINAL_EVENT_CHANNEL_CAP: usize = 64;
 
 pub struct TerminalLauncher;
 
@@ -25,7 +23,10 @@ impl TerminalLauncher {
         local_shell: Option<String>,
     ) -> RunningTerminal {
         let (command_tx, command_rx) = unbounded();
-        let (event_tx, event_rx) = bounded(TERMINAL_EVENT_CHANNEL_CAP);
+        // Unbounded: a 64-slot bound blocked the PTY/SSH reader on key-repeat
+        // echo, the socket window froze, and the next write marked the session
+        // failed. The pump drains up to 1024 events per tick.
+        let (event_tx, event_rx) = unbounded();
 
         let worker_event_tx = event_tx.clone();
         if let Err(error) = thread::Builder::new()
@@ -176,11 +177,21 @@ fn run_local_shell(
         .context("failed to spawn PTY reader")?;
 
     let master = pair.master;
-    while let Ok(command) = command_rx.recv() {
+    let mut pending = None;
+    'local_cmd: loop {
+        let command = match pending.take() {
+            Some(command) => command,
+            None => match command_rx.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
         match command {
             TerminalCommand::Write(bytes) => {
-                writer.write_all(&bytes).context("failed to write PTY")?;
+                let (outgoing, leftover) = coalesce_writes(bytes, &command_rx);
+                writer.write_all(&outgoing).context("failed to write PTY")?;
                 writer.flush().ok();
+                pending = leftover;
             }
             TerminalCommand::Resize(next_size) => {
                 master
@@ -192,7 +203,7 @@ fn run_local_shell(
                     })
                     .context("failed to resize PTY")?;
             }
-            TerminalCommand::Shutdown => break,
+            TerminalCommand::Shutdown => break 'local_cmd,
         }
     }
 
@@ -292,13 +303,23 @@ fn run_system_ssh_shell(
         .context("failed to spawn SSH PTY reader")?;
 
     let master = pair.master;
-    while let Ok(command) = command_rx.recv() {
+    let mut pending = None;
+    'ssh_pty_cmd: loop {
+        let command = match pending.take() {
+            Some(command) => command,
+            None => match command_rx.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
         match command {
             TerminalCommand::Write(bytes) => {
+                let (outgoing, leftover) = coalesce_writes(bytes, &command_rx);
                 writer
-                    .write_all(&bytes)
+                    .write_all(&outgoing)
                     .context("failed to write SSH PTY")?;
                 writer.flush().ok();
+                pending = leftover;
             }
             TerminalCommand::Resize(next_size) => {
                 master
@@ -310,7 +331,7 @@ fn run_system_ssh_shell(
                     })
                     .context("failed to resize SSH PTY")?;
             }
-            TerminalCommand::Shutdown => break,
+            TerminalCommand::Shutdown => break 'ssh_pty_cmd,
         }
     }
 
@@ -365,11 +386,17 @@ fn run_ssh_shell(
 
     let mut buffer = [0_u8; 16 * 1024];
     let mut idle_rounds: u32 = 0;
+    let mut outgoing = Vec::new();
     loop {
         while let Ok(command) = command_rx.try_recv() {
-            if apply_ssh_command(&mut channel, command)? {
+            if apply_ssh_command(&mut channel, command, &mut outgoing, &event_tx)? {
                 return Ok(());
             }
+            idle_rounds = 0;
+        }
+        if !outgoing.is_empty() {
+            write_ssh_all(&mut channel, &outgoing, &event_tx)?;
+            outgoing.clear();
             idle_rounds = 0;
         }
 
@@ -394,7 +421,7 @@ fn run_ssh_shell(
             idle_rounds = idle_rounds.saturating_add(1);
             match command_rx.recv_timeout(ssh_poll_interval(idle_rounds)) {
                 Ok(command) => {
-                    if apply_ssh_command(&mut channel, command)? {
+                    if apply_ssh_command(&mut channel, command, &mut outgoing, &event_tx)? {
                         return Ok(());
                     }
                     idle_rounds = 0;
@@ -415,15 +442,25 @@ fn run_ssh_shell(
     Ok(())
 }
 
-/// Applies one command to the channel. Returns `true` when the terminal should
+/// Applies one command to the channel. Writes are staged into `outgoing` so a
+/// key-repeat burst becomes one flush. Returns `true` when the terminal should
 /// shut down.
-fn apply_ssh_command(channel: &mut ssh2::Channel, command: TerminalCommand) -> Result<bool> {
+fn apply_ssh_command(
+    channel: &mut ssh2::Channel,
+    command: TerminalCommand,
+    outgoing: &mut Vec<u8>,
+    event_tx: &Sender<TerminalEvent>,
+) -> Result<bool> {
     match command {
         TerminalCommand::Write(bytes) => {
-            write_ssh_all(channel, &bytes)?;
+            outgoing.extend(bytes);
             Ok(false)
         }
         TerminalCommand::Resize(size) => {
+            if !outgoing.is_empty() {
+                write_ssh_all(channel, outgoing, event_tx)?;
+                outgoing.clear();
+            }
             channel
                 .request_pty_size(size.cols as u32, size.rows as u32, None, None)
                 .context("failed to resize SSH PTY")?;
@@ -432,6 +469,20 @@ fn apply_ssh_command(channel: &mut ssh2::Channel, command: TerminalCommand) -> R
         TerminalCommand::Shutdown => {
             channel.close().ok();
             Ok(true)
+        }
+    }
+}
+
+fn coalesce_writes(
+    first: Vec<u8>,
+    command_rx: &Receiver<TerminalCommand>,
+) -> (Vec<u8>, Option<TerminalCommand>) {
+    let mut outgoing = first;
+    loop {
+        match command_rx.try_recv() {
+            Ok(TerminalCommand::Write(bytes)) => outgoing.extend(bytes),
+            Ok(other) => return (outgoing, Some(other)),
+            Err(_) => return (outgoing, None),
         }
     }
 }
@@ -449,8 +500,26 @@ fn ssh_poll_interval(idle_rounds: u32) -> Duration {
     Duration::from_millis(millis)
 }
 
-fn write_ssh_all(channel: &mut ssh2::Channel, mut bytes: &[u8]) -> Result<()> {
+fn write_ssh_all(
+    channel: &mut ssh2::Channel,
+    mut bytes: &[u8],
+    event_tx: &Sender<TerminalEvent>,
+) -> Result<()> {
+    let mut incoming = [0_u8; 16 * 1024];
     while !bytes.is_empty() {
+        // libssh2 only applies inbound window updates when we read. A
+        // write-only burst (key repeat) otherwise dies with WINDOW_EXCEEDED.
+        match channel.read(&mut incoming) {
+            Ok(0) => {}
+            Ok(n) => {
+                event_tx
+                    .send(TerminalEvent::Output(incoming[..n].to_vec()))
+                    .ok();
+            }
+            Err(error) if is_would_block(&error) => {}
+            Err(error) => return Err(error).context("failed to read SSH channel"),
+        }
+
         match channel.write(bytes) {
             Ok(0) => thread::sleep(Duration::from_millis(1)),
             Ok(n) => bytes = &bytes[n..],
@@ -464,11 +533,20 @@ fn write_ssh_all(channel: &mut ssh2::Channel, mut bytes: &[u8]) -> Result<()> {
 }
 
 fn is_would_block(error: &std::io::Error) -> bool {
-    error.kind() == ErrorKind::WouldBlock
-        || error
-            .get_ref()
-            .and_then(|inner| inner.downcast_ref::<ssh2::Error>())
-            .is_some_and(|error| matches!(error.code(), ErrorCode::Session(-37)))
+    matches!(
+        error.kind(),
+        ErrorKind::WouldBlock | ErrorKind::Interrupted | ErrorKind::TimedOut
+    ) || error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ssh2::Error>())
+        .is_some_and(|error| {
+            matches!(
+                error.code(),
+                ErrorCode::Session(-37) // EAGAIN
+                    | ErrorCode::Session(-19) // CHANNEL_WINDOW_EXCEEDED
+                    | ErrorCode::Session(-14) // TIMEOUT
+            )
+        })
 }
 
 fn default_shell() -> String {

@@ -279,6 +279,7 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
   const [searchResult, setSearchResult] = useState<TerminalSearchResult>(emptyTerminalSearchResult);
   const sendBufferRef = useRef("");
   const sendScheduledRef = useRef(false);
+  const sendFrameRef = useRef<number | null>(null);
   const drainOutputRef = useRef("");
   const drainWriteFrameRef = useRef<number | null>(null);
   const resizeFrameRef = useRef<number | null>(null);
@@ -393,6 +394,30 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
         event.preventDefault();
         event.stopPropagation();
         openSearch();
+        return;
+      }
+      // Space is not emitted from xterm's keydown path (keyCode 32 < 48); it
+      // waits for the 0×0 helper textarea's input/keypress. WebView2 then
+      // treats Space as page-down on the overflow:scroll viewport — at the
+      // bottom that is a silent no-op, so letters work and spaces do not.
+      if (
+        event.key === " " &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.metaKey &&
+        !event.isComposing &&
+        event.keyCode !== 229
+      ) {
+        const target = event.target;
+        if (
+          target instanceof HTMLElement &&
+          target.closest("[data-terminal-search], input, textarea:not(.xterm-helper-textarea)")
+        ) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        termRef.current?.input(" ");
         return;
       }
       if (!searchOpen) return;
@@ -589,6 +614,7 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     const cursorDisposable = term.onCursorMove(() => syncTermCaret(term));
 
     const flushInput = () => {
+      sendFrameRef.current = null;
       sendScheduledRef.current = false;
       if (!sendBufferRef.current) return;
       const payload = sendBufferRef.current;
@@ -599,10 +625,9 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
 
     term.onData((data) => {
       sendBufferRef.current += data;
-      if (!sendScheduledRef.current) {
-        sendScheduledRef.current = true;
-        queueMicrotask(flushInput);
-      }
+      if (sendScheduledRef.current) return;
+      sendScheduledRef.current = true;
+      sendFrameRef.current = window.requestAnimationFrame(flushInput);
     });
     lastHostSizeRef.current = { width: 0, height: 0 };
     lastTermSizeRef.current = { cols: 0, rows: 0 };
@@ -684,6 +709,10 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       if (drainWriteFrameRef.current !== null) {
         window.cancelAnimationFrame(drainWriteFrameRef.current);
         drainWriteFrameRef.current = null;
+      }
+      if (sendFrameRef.current !== null) {
+        window.cancelAnimationFrame(sendFrameRef.current);
+        sendFrameRef.current = null;
       }
       drainOutputRef.current = "";
       if (sendBufferRef.current) {

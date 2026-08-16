@@ -31,23 +31,34 @@ export function ConnectionOverview({
 }: ConnectionOverviewProps) {
   const connected = linkStatus === "connected";
   const canRefresh = Boolean(profile) && (connected || isLocalProtocol(profile?.protocol));
+  const showSkeleton = !serverStatus && (serverStatusLoading || linkStatus === "connecting");
+  const showMeters = Boolean(serverStatus) || showSkeleton;
 
   return (
     <section className="border-t border-border/70 pb-0.5 pt-2">
-      <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <h3 className="m-0 text-[13px] font-semibold">连接概览</h3>
-          {linkStatus != null && (
-            <>
-              <span className={"signal-dot signal-dot--" + linkStatus} />
-              <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-                {linkStatusLabel[linkStatus]}
-              </span>
-            </>
-          )}
-        </div>
+      <div className="flex min-w-0 items-start justify-between gap-2">
+        {profile ? (
+          <div className="min-w-0">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <div className="truncate text-[13px] font-medium leading-tight">{profile.name}</div>
+              {linkStatus != null && (
+                <>
+                  <span className={"signal-dot signal-dot--" + linkStatus} />
+                  <span className="shrink-0 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+                    {linkStatusLabel[linkStatus]}
+                  </span>
+                </>
+              )}
+            </div>
+            <div className="mt-0.5 truncate font-mono text-[10.5px] text-muted-foreground" title={identityLine(profile)}>
+              {identityLine(profile)}
+            </div>
+          </div>
+        ) : (
+          <p className="m-0 text-[11px] text-muted-foreground">选择一个会话查看状态</p>
+        )}
         <IconButton
-          className="h-6 min-w-6 p-0"
+          className="h-6 min-w-6 shrink-0 p-0"
           title="刷新服务器状态"
           icon={<RefreshCcw size={13} className={serverStatusLoading ? "animate-spin" : undefined} />}
           onClick={onRefreshServerStatus}
@@ -55,22 +66,13 @@ export function ConnectionOverview({
         />
       </div>
 
-      {profile ? (
-        <div className="min-w-0">
-          <div className="truncate text-[13px] font-medium leading-tight">{profile.name}</div>
-          <div className="mt-0.5 truncate font-mono text-[10.5px] text-muted-foreground" title={identityLine(profile)}>
-            {identityLine(profile)}
-          </div>
+      {showMeters && (
+        <div className="mt-2.5 grid gap-1.5">
+          <StatusMeter label="CPU" value={serverStatus?.cpu} loading={showSkeleton} />
+          <StatusMeter label="内存" value={serverStatus?.memory} loading={showSkeleton} />
+          <StatusMeter label="磁盘" value={serverStatus?.disk} loading={showSkeleton} />
         </div>
-      ) : (
-        <p className="m-0 text-[11px] text-muted-foreground">选择一个会话查看状态</p>
       )}
-
-      <div className="mt-2.5 grid gap-1.5">
-        <StatusMeter label="CPU" value={serverStatus?.cpu} loading={serverStatusLoading && !serverStatus} />
-        <StatusMeter label="内存" value={serverStatus?.memory} loading={serverStatusLoading && !serverStatus} />
-        <StatusMeter label="磁盘" value={serverStatus?.disk} loading={serverStatusLoading && !serverStatus} />
-      </div>
 
       {serverStatus ? (
         <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[10.5px] leading-tight text-muted-foreground">
@@ -79,17 +81,11 @@ export function ConnectionOverview({
           <MetaChip label="节点" value={serverStatus.hostname} />
           <MetaChip label="系统" value={compactServerOs(serverStatus.os)} title={serverStatus.os} />
         </div>
-      ) : (
+      ) : serverStatusError ? (
         <p className="mt-2 mb-0 text-[11px] leading-tight text-muted-foreground">
-          {serverStatusLoading
-            ? "正在读取服务器状态…"
-            : serverStatusError
-              ? `状态读取失败：${serverStatusError}`
-              : connected || isLocalProtocol(profile?.protocol)
-                ? "暂无状态数据"
-                : "连接后显示 CPU / 内存 / 磁盘"}
+          状态读取失败：{serverStatusError}
         </p>
-      )}
+      ) : null}
     </section>
   );
 }
@@ -107,28 +103,35 @@ function StatusMeter({ label, value, loading }: { label: string; value?: string;
   const text = (value ?? "").trim();
   const empty = !text || text === "-";
   const percent = empty ? null : parsePercent(text);
-  const display = empty ? (loading ? "…" : "—") : compactMetric(text);
 
   return (
     <div className="grid min-w-0 grid-cols-[28px_minmax(0,1fr)] items-center gap-2">
       <span className="text-[10.5px] text-muted-foreground">{label}</span>
       <div className="min-w-0">
-        <div className="flex items-baseline justify-between gap-2">
-          <span className="truncate font-mono text-[10.5px] text-foreground/85" title={empty ? undefined : text}>
-            {display}
-          </span>
-          {percent != null && <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">{Math.round(percent)}%</span>}
-        </div>
-        <div className="mt-0.5 h-1 overflow-hidden rounded-full bg-muted">
-          <div
-            className={cn(
-              "h-full rounded-full bg-foreground/45 transition-[width] duration-[var(--duration-base)] ease-[var(--ease-swift)]",
-              loading && empty && "w-1/3 animate-pulse",
-              percent != null && percent >= 90 && "bg-foreground/70"
-            )}
-            style={percent == null ? undefined : { width: `${Math.max(2, Math.min(100, percent))}%` }}
-          />
-        </div>
+        {loading && empty ? (
+          <>
+            <div className="h-[13px] w-14 animate-pulse rounded-sm bg-muted" />
+            <div className="mt-0.5 h-1 animate-pulse rounded-full bg-muted" />
+          </>
+        ) : (
+          <>
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="truncate font-mono text-[10.5px] text-foreground/85" title={empty ? undefined : text}>
+                {empty ? "—" : compactMetric(text)}
+              </span>
+              {percent != null && <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">{Math.round(percent)}%</span>}
+            </div>
+            <div className="mt-0.5 h-1 overflow-hidden rounded-full bg-muted">
+              <div
+                className={cn(
+                  "h-full rounded-full bg-foreground/45 transition-[width] duration-[var(--duration-base)] ease-[var(--ease-swift)]",
+                  percent != null && percent >= 90 && "bg-foreground/70"
+                )}
+                style={percent == null ? undefined : { width: `${Math.max(2, Math.min(100, percent))}%` }}
+              />
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

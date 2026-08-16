@@ -361,6 +361,14 @@
   -moz-osx-font-smoothing: auto;
 }
 
+/* Keep SP visible. xterm spans are inline-block; if white-space falls back
+ * to normal, a space-only cell collapses to 0px and looks like the key died. */
+[data-xterm-host] .xterm-rows,
+[data-xterm-host] .xterm-rows span,
+[data-xterm-host] .xterm-width-cache-measure-container {
+  white-space: pre !important;
+}
+
 [data-xterm-host],
 [data-xterm-host] .xterm {
   background-color: var(--xterm-background, var(--background)) !important;

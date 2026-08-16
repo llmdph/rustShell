@@ -8,7 +8,10 @@ use uuid::Uuid;
 const TERMINAL_REPLAY_CAP: usize = 1024 * 1024;
 const TERMINAL_PENDING_CAP: usize = 1024 * 1024;
 const TERMINAL_OSC_SCAN_CAP: usize = 8 * 1024;
-const MAX_EVENTS_PER_PUMP: usize = 64;
+/// Drain a full key-repeat / `cat` burst in one pump tick. The I/O thread
+/// used to block on a 64-slot event channel; holding a key filled it in ~2s
+/// and the next write was reported as a dead session.
+const MAX_EVENTS_PER_PUMP: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSize {
