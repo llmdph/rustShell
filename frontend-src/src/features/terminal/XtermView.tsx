@@ -57,9 +57,29 @@ function alphaColor(rgb: [number, number, number], alpha: number) {
   return `${base}${hexByte(opacity * 255)}`;
 }
 
+/// Classic xterm 16-color palette. Keep it explicit so a future theme reset
+/// cannot silently drop shell prompt / ls colors back to monochrome.
+const XTERM_ANSI = {
+  black: "#2e3436",
+  red: "#cc0000",
+  green: "#4e9a06",
+  yellow: "#c4a000",
+  blue: "#3465a4",
+  magenta: "#75507b",
+  cyan: "#06989a",
+  white: "#d3d7cf",
+  brightBlack: "#555753",
+  brightRed: "#ef2929",
+  brightGreen: "#8ae234",
+  brightYellow: "#fce94f",
+  brightBlue: "#729fcf",
+  brightMagenta: "#ad7fa8",
+  brightCyan: "#34e2e2",
+  brightWhite: "#eeeeec"
+} as const;
+
 function xtermTheme(theme: AppSettings["theme"], backgroundAlpha = 100) {
-  // shadcn Neutral 对齐：亮=白底近黑字，暗 deep = neutral-950 底近白字；
-  // 光标/选区用中性灰阶，彩色只保留 ANSI 语义色（xterm 默认）。
+  // Chrome stays neutral; ANSI semantic colors stay vivid for prompts / ls / git.
   // Cursor colors stay fully opaque — blending a transparent bg onto the caret
   // is what made it disappear against the phosphor cell in some WebView builds.
   if (theme === "light") {
@@ -68,7 +88,8 @@ function xtermTheme(theme: AppSettings["theme"], backgroundAlpha = 100) {
       foreground: "#171717",
       cursor: "#171717",
       cursorAccent: "#ffffff",
-      selectionBackground: "#d4d4d4"
+      selectionBackground: "#d4d4d4",
+      ...XTERM_ANSI
     };
   }
   return {
@@ -76,7 +97,8 @@ function xtermTheme(theme: AppSettings["theme"], backgroundAlpha = 100) {
     foreground: "#e5e5e5",
     cursor: "#fafafa",
     cursorAccent: "#0a0a0a",
-    selectionBackground: "#404040"
+    selectionBackground: "#404040",
+    ...XTERM_ANSI
   };
 }
 

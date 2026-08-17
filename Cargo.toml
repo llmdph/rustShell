@@ -8,7 +8,10 @@ license = "PROPRIETARY"
 build = "build.rs"
 
 [features]
-default = []
+# Windows libssh2 defaults to WinCNG, which cannot open many modern OpenSSH
+# private keys (ed25519 / openssh-key-v1). Build against OpenSSL instead so
+# key-file auth stays fully in-process.
+default = ["vendored-ssh-openssl"]
 vendored-ssh-openssl = ["ssh2/openssl-on-win32", "ssh2/vendored-openssl"]
 
 [dependencies]

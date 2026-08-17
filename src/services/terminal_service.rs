@@ -41,17 +41,16 @@ impl TerminalLauncher {
                         worker_event_tx.clone(),
                     ),
                     SessionProtocol::Ssh => {
-                        if matches!(profile.auth, AuthProfile::KeyFile { .. }) {
-                            run_system_ssh_shell(profile, size, command_rx, worker_event_tx.clone())
-                        } else {
-                            run_ssh_shell(
-                                profile,
-                                password,
-                                size,
-                                command_rx,
-                                worker_event_tx.clone(),
-                            )
-                        }
+                        // Prefer the in-process SSH stack for every auth mode so
+                        // key-file sessions stay inside the app instead of
+                        // popping OpenSSH/OpenSSL passphrase consoles.
+                        run_ssh_shell(
+                            profile,
+                            password,
+                            size,
+                            command_rx,
+                            worker_event_tx.clone(),
+                        )
                     }
                     SessionProtocol::SftpOnly | SessionProtocol::Serial => {
                         run_placeholder(profile, command_rx, worker_event_tx.clone())
@@ -215,134 +214,8 @@ fn run_local_shell(
     Ok(())
 }
 
-fn run_system_ssh_shell(
-    profile: SessionProfile,
-    size: TerminalSize,
-    command_rx: Receiver<TerminalCommand>,
-    event_tx: Sender<TerminalEvent>,
-) -> Result<()> {
-    let AuthProfile::KeyFile { path } = &profile.auth else {
-        return run_ssh_shell(profile, None, size, command_rx, event_tx);
-    };
-    let key_path = path.trim();
-    if key_path.is_empty() {
-        event_tx
-            .send(TerminalEvent::AuthFailed("密钥文件路径为空".to_owned()))
-            .ok();
-        return Ok(());
-    }
-
-    let pty_system = portable_pty::native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: size.rows,
-            cols: size.cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .context("failed to open SSH PTY")?;
-
-    let mut command = CommandBuilder::new("ssh");
-    command.arg("-tt");
-    command.arg("-i");
-    command.arg(key_path);
-    command.arg("-p");
-    command.arg(profile.port.to_string());
-    command.arg("-o");
-    command.arg("IdentitiesOnly=yes");
-    command.arg("-o");
-    command.arg("StrictHostKeyChecking=accept-new");
-    command.arg("-o");
-    command.arg("ServerAliveInterval=30");
-    command.arg("-o");
-    command.arg("ConnectTimeout=8");
-    command.arg(format!("{}@{}", profile.username, profile.host));
-    command.env("TERM", "xterm-256color");
-    command.env("COLORTERM", "truecolor");
-
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .context("failed to spawn system ssh")?;
-    drop(pair.slave);
-
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .context("failed to clone SSH PTY reader")?;
-    let mut writer = pair
-        .master
-        .take_writer()
-        .context("failed to open SSH PTY writer")?;
-
-    event_tx.send(TerminalEvent::Connected).ok();
-
-    let reader_tx = event_tx.clone();
-    thread::Builder::new()
-        .name("system-ssh-reader".to_owned())
-        .spawn(move || {
-            let mut buffer = [0_u8; 16 * 1024];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if reader_tx
-                            .send(TerminalEvent::Output(buffer[..n].to_vec()))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        reader_tx.send(TerminalEvent::Error(error.to_string())).ok();
-                        break;
-                    }
-                }
-            }
-        })
-        .context("failed to spawn SSH PTY reader")?;
-
-    let master = pair.master;
-    let mut pending = None;
-    'ssh_pty_cmd: loop {
-        let command = match pending.take() {
-            Some(command) => command,
-            None => match command_rx.recv() {
-                Ok(command) => command,
-                Err(_) => break,
-            },
-        };
-        match command {
-            TerminalCommand::Write(bytes) => {
-                let (outgoing, leftover) = coalesce_writes(bytes, &command_rx);
-                writer
-                    .write_all(&outgoing)
-                    .context("failed to write SSH PTY")?;
-                writer.flush().ok();
-                pending = leftover;
-            }
-            TerminalCommand::Resize(next_size) => {
-                master
-                    .resize(PtySize {
-                        rows: next_size.rows,
-                        cols: next_size.cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                    .context("failed to resize SSH PTY")?;
-            }
-            TerminalCommand::Shutdown => break 'ssh_pty_cmd,
-        }
-    }
-
-    let _ = child.kill();
-    let exit_code = child.wait().ok().map(|status| status.exit_code() as i32);
-    event_tx
-        .send(TerminalEvent::Disconnected { exit_code })
-        .ok();
-    Ok(())
-}
-
+/// All SSH terminals use the in-process libssh2 stack. System OpenSSH is not
+/// used here, so encrypted keys never open an external passphrase console.
 fn run_ssh_shell(
     profile: SessionProfile,
     password: Option<String>,
@@ -350,25 +223,47 @@ fn run_ssh_shell(
     command_rx: Receiver<TerminalCommand>,
     event_tx: Sender<TerminalEvent>,
 ) -> Result<()> {
-    let session = match ssh::establish(&profile, password.as_deref()) {
-        Ok(session) => session,
+    match establish_ssh_session(&profile, password.as_deref(), &event_tx)? {
+        Some(session) => run_ssh_channel(session, size, command_rx, event_tx),
+        None => Ok(()),
+    }
+}
+
+fn establish_ssh_session(
+    profile: &SessionProfile,
+    password: Option<&str>,
+    event_tx: &Sender<TerminalEvent>,
+) -> Result<Option<ssh2::Session>> {
+    match ssh::establish(profile, password) {
+        Ok(session) => Ok(Some(session)),
         Err(ConnectFailure::HostKey(issue)) => {
             event_tx.send(TerminalEvent::HostKey(issue)).ok();
-            return Ok(());
+            Ok(None)
         }
         Err(ConnectFailure::PasswordRequired) => {
-            event_tx
-                .send(TerminalEvent::AuthFailed("需要输入密码".to_owned()))
-                .ok();
-            return Ok(());
+            let message = if matches!(profile.auth, AuthProfile::KeyFile { .. }) {
+                "需要输入密钥口令".to_owned()
+            } else {
+                "需要输入密码".to_owned()
+            };
+            event_tx.send(TerminalEvent::AuthFailed(message)).ok();
+            Ok(None)
         }
         Err(ConnectFailure::AuthRejected(message)) => {
             event_tx.send(TerminalEvent::AuthFailed(message)).ok();
-            return Ok(());
+            Ok(None)
         }
-        Err(ConnectFailure::Other(error)) => return Err(error),
-    };
+        Err(ConnectFailure::Other(error)) => Err(error),
+    }
+}
 
+
+fn run_ssh_channel(
+    session: ssh2::Session,
+    size: TerminalSize,
+    command_rx: Receiver<TerminalCommand>,
+    event_tx: Sender<TerminalEvent>,
+) -> Result<()> {
     let mut channel = session
         .channel_session()
         .context("failed to create SSH channel")?;
@@ -379,6 +274,9 @@ fn run_ssh_shell(
             Some((size.cols as u32, size.rows as u32, 0, 0)),
         )
         .context("failed to request SSH PTY")?;
+    // Best-effort remote color env for prompts/ls.
+    let _ = channel.setenv("COLORTERM", "truecolor");
+    let _ = channel.setenv("TERM", "xterm-256color");
     channel.shell().context("failed to start remote shell")?;
     session.set_blocking(false);
 
@@ -531,6 +429,7 @@ fn write_ssh_all(
     channel.flush().ok();
     Ok(())
 }
+
 
 fn is_would_block(error: &std::io::Error) -> bool {
     matches!(

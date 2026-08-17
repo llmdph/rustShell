@@ -33,8 +33,7 @@ const SFTP_PROTOCOL_ERROR: i32 = -31;
 const FILE_ERROR: i32 = -16;
 
 /// Separates "could not reach or authenticate to the host" from "the host
-/// answered and refused". Only the former says anything about whether an
-/// OpenSSH fallback is worth remembering for this profile.
+/// answered and refused". Only the former is a transport/auth problem.
 #[derive(Debug)]
 pub enum SftpFailure {
     Connect(String),

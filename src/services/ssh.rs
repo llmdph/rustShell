@@ -40,7 +40,7 @@ impl std::fmt::Display for ConnectFailure {
                 write!(f, "主机密钥已变更,连接被阻止: {}", issue.fingerprint)
             }
             Self::HostKey(issue) => write!(f, "主机密钥未信任: {}", issue.fingerprint),
-            Self::PasswordRequired => write!(f, "需要输入密码"),
+            Self::PasswordRequired => write!(f, "需要输入密钥口令或密码"),
             Self::AuthRejected(message) => write!(f, "认证失败: {}", message),
             Self::Other(error) => write!(f, "{:#}", error),
         }
@@ -254,6 +254,9 @@ fn authenticate(
             if !key_path.exists() {
                 return Err(ConnectFailure::Other(anyhow!("密钥文件不存在: {}", path)));
             }
+            if password.is_none() && private_key_appears_encrypted(key_path) {
+                return Err(ConnectFailure::PasswordRequired);
+            }
             let public_key_path = public_key_path_for(key_path);
             let result = session.userauth_pubkey_file(
                 &profile.username,
@@ -262,16 +265,23 @@ fn authenticate(
                 password,
             );
             if let Err(error) = result {
-                // Retrying with a passphrase is the common fix for encrypted keys.
-                if password.is_none() {
+                let detail = error.to_string();
+                if password.is_none() && looks_like_passphrase_required(&detail) {
+                    return Err(ConnectFailure::PasswordRequired);
+                }
+                if password.is_some() && looks_like_passphrase_required(&detail) {
                     return Err(ConnectFailure::AuthRejected(format!(
-                        "密钥认证失败，可能需要输入密钥口令，或服务器未配置对应公钥: {}",
-                        error
+                        "密钥口令不正确: {}",
+                        detail
                     )));
                 }
-                return Err(ConnectFailure::AuthRejected(error.to_string()));
+                return Err(ConnectFailure::AuthRejected(format!(
+                    "密钥认证失败，请确认密钥文件与服务器 authorized_keys: {}",
+                    detail
+                )));
             }
         }
+
         AuthProfile::Agent => {
             let agent_result = session.userauth_agent(&profile.username);
             if agent_result.is_err() || !session.authenticated() {
@@ -287,6 +297,40 @@ fn authenticate(
         return Err(ConnectFailure::AuthRejected("服务器拒绝认证".to_owned()));
     }
     Ok(())
+}
+
+
+fn private_key_appears_encrypted(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let lower = text.to_ascii_lowercase();
+    lower.contains("proc-type: 4,encrypted")
+        || lower.contains("bcrypt")
+        || lower.contains("aes256-ctr")
+        || lower.contains("aes256-cbc")
+        || lower.contains("aes128-ctr")
+        || lower.contains("aes192-ctr")
+        || (lower.contains("openssh private key") && lower.contains("encrypted"))
+}
+
+fn looks_like_passphrase_required(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "passphrase",
+        "password protected",
+        "bad decrypt",
+        "wrong passphrase",
+        "incorrect passphrase",
+        "key is encrypted",
+        "encrypted key",
+        "unable to decrypt",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn public_key_path_for(private_key_path: &Path) -> Option<std::path::PathBuf> {

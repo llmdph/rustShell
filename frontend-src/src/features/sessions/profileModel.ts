@@ -1,5 +1,5 @@
 import type { Profile, Protocol } from "@/api";
-import { normalizeAuthProfile } from "@/features/sessions/profileAuth";
+import { normalizeAuthProfile, profileAuthKind } from "@/features/sessions/profileAuth";
 import { isLocalProtocol, normalizeSavedProtocol } from "@/features/sessions/profileProtocol";
 
 export function createBlankProfile(): Profile {
@@ -55,6 +55,20 @@ export function normalizeQuickProtocol(protocol: Protocol): Protocol {
 export function shouldPromptForPassword(profile: Profile, message: string) {
   if (isLocalProtocol(profile.protocol)) return false;
   const normalized = message.toLowerCase();
+  const authKind = profileAuthKind(profile.auth);
+
+  // Key-file sessions only prompt when the backend explicitly needs a passphrase.
+  // Generic publickey rejects must not reopen the secret dialog.
+  if (authKind === "KeyFile") {
+    return (
+      message.includes("需要输入密钥口令") ||
+      message.includes("需要输入密码") ||
+      message.includes("密钥口令不正确") ||
+      normalized.includes("passphrase") ||
+      (normalized.includes("encrypted") && normalized.includes("key"))
+    );
+  }
+
   return (
     message.includes("需要输入密码") ||
     message.includes("认证失败") ||

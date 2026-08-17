@@ -62,7 +62,6 @@ struct AppRuntime {
     /// multi-gigabyte upload hold the per-profile lock and stall every
     /// directory listing for that host.
     transfer_sftp: Arc<sftp_pool::SftpPool>,
-    openssh_fallback: Arc<OpenSshFallback>,
     server_status_cache: Mutex<HashMap<Uuid, CachedServerStatus>>,
     password_cache: Mutex<HashMap<Uuid, String>>,
     settings: Mutex<AppSettings>,
@@ -597,82 +596,20 @@ struct CachedServerStatus {
     fetched_at: Instant,
 }
 
-/// Remembers key-file profiles whose authentication libssh2 cannot complete
-/// (common on Windows with newer OpenSSH-format keys).
-///
-/// Without this, every remote operation on such a profile pays a doomed
-/// libssh2 handshake *and then* spawns `ssh.exe` — two connections per
-/// directory listing. The TTL means a fixed key or agent setup recovers on its
-/// own instead of being written off for the rest of the session.
-#[derive(Default)]
-struct OpenSshFallback {
-    profiles: Mutex<HashMap<Uuid, Instant>>,
-}
-
-const OPENSSH_FALLBACK_TTL: Duration = Duration::from_secs(5 * 60);
-
-impl OpenSshFallback {
-    fn is_active(&self, profile_id: Uuid) -> bool {
-        let mut profiles = lock_poison_ok(&self.profiles);
-        match profiles.get(&profile_id) {
-            Some(marked) if marked.elapsed() < OPENSSH_FALLBACK_TTL => true,
-            Some(_) => {
-                profiles.remove(&profile_id);
-                false
-            }
-            None => false,
-        }
-    }
-
-    fn mark(&self, profile_id: Uuid) {
-        lock_poison_ok(&self.profiles).insert(profile_id, Instant::now());
-    }
-
-    fn forget(&self, profile_id: Uuid) {
-        lock_poison_ok(&self.profiles).remove(&profile_id);
-    }
-}
-
 /// Everything a blocking SFTP task needs, extracted from `State` up front so the
 /// task itself owns `'static` data.
 struct SftpContext {
     profile: SessionProfile,
     password: Option<String>,
     pool: Arc<sftp_pool::SftpPool>,
-    openssh_fallback: Arc<OpenSshFallback>,
 }
 
 impl SftpContext {
-    fn uses_key_file(&self) -> bool {
-        matches!(self.profile.auth, AuthProfile::KeyFile { .. })
-    }
-
-    /// Try the pooled libssh2 path, falling back to spawning OpenSSH for
-    /// key-file profiles it cannot authenticate — and remembering that verdict
-    /// so the next call skips straight to the fallback.
-    fn run_or_fall_back<T>(
+    fn run_pooled<T>(
         &self,
         pooled: impl FnOnce(&sftp_pool::SftpPool) -> Result<T, sftp_pool::SftpFailure>,
-        fallback: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        let key_file = self.uses_key_file();
-        if key_file && self.openssh_fallback.is_active(self.profile.id) {
-            return fallback();
-        }
-
-        match pooled(&self.pool) {
-            Ok(value) => Ok(value),
-            Err(failure) if key_file => {
-                // Only a connect/auth failure means libssh2 is unusable here; a
-                // refused operation says the session works fine.
-                if failure.is_connect() {
-                    self.openssh_fallback.mark(self.profile.id);
-                }
-                fallback()
-                    .map_err(|error| format!("{}；OpenSSH fallback 失败: {}", failure, error))
-            }
-            Err(failure) => Err(failure.to_string()),
-        }
+        pooled(&self.pool).map_err(|failure| failure.to_string())
     }
 }
 
@@ -689,7 +626,6 @@ fn sftp_context(
         profile: profile_for_secret(profile, password.as_deref()),
         password,
         pool: state.sftp.clone(),
-        openssh_fallback: state.openssh_fallback.clone(),
     })
 }
 
@@ -757,7 +693,6 @@ async fn save_profile(
         if invalidate_sftp {
             state.sftp.invalidate(profile_id);
             state.transfer_sftp.invalidate(profile_id);
-            state.openssh_fallback.forget(profile_id);
             lock(&state.server_status_cache)?.remove(&profile_id);
         }
 
@@ -872,7 +807,6 @@ async fn delete_profile(
         lock(&state.password_cache)?.remove(&id);
         state.sftp.invalidate(id);
         state.transfer_sftp.invalidate(id);
-        state.openssh_fallback.forget(id);
         lock(&state.server_status_cache)?.remove(&id);
         Ok(removed.1)
     })
@@ -1257,14 +1191,11 @@ async fn list_remote_dir(
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     let path = request.path;
     blocking(move || {
-        context.run_or_fall_back(
-            |pool| {
-                pool.with_detail(&context.profile, context.password.as_deref(), |connection| {
-                    connection.list_dir(&path)
-                })
-            },
-            || system_ssh_list_dir(&context.profile, &path),
-        )
+        context.run_pooled(|pool| {
+            pool.with_detail(&context.profile, context.password.as_deref(), |connection| {
+                connection.list_dir(&path)
+            })
+        })
     })
     .await
 }
@@ -1276,14 +1207,11 @@ async fn remote_home(
 ) -> Result<String, String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context.run_or_fall_back(
-            |pool| {
-                pool.with_detail(&context.profile, context.password.as_deref(), |connection| {
-                    connection.home_dir()
-                })
-            },
-            || system_ssh_remote_home(&context.profile),
-        )
+        context.run_pooled(|pool| {
+            pool.with_detail(&context.profile, context.password.as_deref(), |connection| {
+                connection.home_dir()
+            })
+        })
     })
     .await
 }
@@ -1318,16 +1246,13 @@ async fn server_status(
     let view = blocking(move || {
         // The pooled session is already authenticated, so this is one extra
         // channel rather than a fresh TCP connect, key exchange and auth.
-        let output = context.run_or_fall_back(
-            |pool| {
-                pool.exec_detail(
-                    &context.profile,
-                    context.password.as_deref(),
-                    SERVER_STATUS_COMMAND,
-                )
-            },
-            || system_ssh_output(&context.profile, SERVER_STATUS_COMMAND),
-        )?;
+        let output = context.run_pooled(|pool| {
+            pool.exec_detail(
+                &context.profile,
+                context.password.as_deref(),
+                SERVER_STATUS_COMMAND,
+            )
+        })?;
         Ok(parse_server_status(&output))
     })
     .await?;
@@ -1350,7 +1275,6 @@ fn disconnect_sftp_session(
     let id = parse_uuid(&request.profile_id)?;
     state.sftp.invalidate(id);
     state.transfer_sftp.invalidate(id);
-    state.openssh_fallback.forget(id);
     lock(&state.server_status_cache)?.remove(&id);
     Ok(())
 }
@@ -2028,7 +1952,6 @@ fn main() {
         terminals: Mutex::new(HashMap::new()),
         sftp: Arc::new(sftp_pool::SftpPool::new()),
         transfer_sftp: Arc::new(sftp_pool::SftpPool::new()),
-        openssh_fallback: Arc::new(OpenSshFallback::default()),
         server_status_cache: Mutex::new(HashMap::new()),
         password_cache: Mutex::new(HashMap::new()),
         settings: Mutex::new(settings),
@@ -2226,129 +2149,6 @@ fi
 printf 'memory=%s\n' "$(free 2>/dev/null | awk '/^Mem:/ {if($2>0) printf "%.1fG / %.1fG (%.0f%%)", $3/1048576, $2/1048576, $3*100/$2}')"
 printf 'disk=%s\n' "$(df -h / 2>/dev/null | awk 'NR==2 {print $3 " / " $2 " (" $5 ")"}')"
 "#;
-
-fn system_ssh_remote_home(profile: &SessionProfile) -> Result<String, String> {
-    let output = system_ssh_output(profile, r#"printf '%s\n' "$HOME""#)?;
-    Ok(output.trim().to_owned())
-}
-
-fn system_ssh_list_dir(profile: &SessionProfile, path: &str) -> Result<Vec<FileEntry>, String> {
-    let command = format!(
-        r#"
-dir={}
-if [ ! -d "$dir" ]; then
-  exit 2
-fi
-find "$dir" -mindepth 1 -maxdepth 1 -exec sh -c '
-for path do
-  name=${{path##*/}}
-  target=
-  if [ -L "$path" ]; then
-    kind=symlink
-    target=$(readlink "$path" 2>/dev/null || true)
-  elif [ -d "$path" ]; then
-    kind=directory
-  else
-    kind=file
-  fi
-  size=$(stat -c %s "$path" 2>/dev/null || echo 0)
-  mtime=$(stat -c %Y "$path" 2>/dev/null || echo 0)
-  perm=$(stat -c %a "$path" 2>/dev/null || echo 0)
-  uid=$(stat -c %u "$path" 2>/dev/null || echo 0)
-  gid=$(stat -c %g "$path" 2>/dev/null || echo 0)
-  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$name" "$path" "$kind" "$size" "$mtime" "$perm" "$uid" "$gid" "$target"
-done
-' sh {{}} +
-"#,
-        shell_quote(path)
-    );
-    let output = system_ssh_output(profile, &command)?;
-    let mut entries = output
-        .lines()
-        .filter_map(parse_system_ssh_entry)
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
-    Ok(entries)
-}
-
-fn system_ssh_output(profile: &SessionProfile, remote_command: &str) -> Result<String, String> {
-    let AuthProfile::KeyFile { path } = &profile.auth else {
-        return Err("OpenSSH fallback 仅支持密钥文件会话".to_owned());
-    };
-    let key_path = path.trim();
-    if key_path.is_empty() {
-        return Err("密钥文件路径为空".to_owned());
-    }
-    if !Path::new(key_path).exists() {
-        return Err(format!("密钥文件不存在: {}", key_path));
-    }
-
-    let output = Command::new("ssh")
-        .arg("-i")
-        .arg(key_path)
-        .arg("-p")
-        .arg(profile.port.to_string())
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("IdentitiesOnly=yes")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
-        .arg("-o")
-        .arg("ConnectTimeout=8")
-        .arg(format!("{}@{}", profile.username, profile.host))
-        .arg(remote_command)
-        .output()
-        .map_err(|error| format!("启动 ssh.exe 失败: {}", error))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(if stderr.is_empty() {
-            format!("ssh.exe 退出码 {:?}", output.status.code())
-        } else {
-            stderr
-        });
-    }
-    String::from_utf8(output.stdout).map_err(|error| format!("SSH 输出不是 UTF-8: {}", error))
-}
-
-fn parse_system_ssh_entry(line: &str) -> Option<FileEntry> {
-    let fields = line.splitn(9, '\t').collect::<Vec<_>>();
-    if fields.len() < 8 {
-        return None;
-    }
-    let file_type = fields[2].to_owned();
-    let is_dir = file_type == "directory";
-    let size = fields[3].parse::<u64>().unwrap_or_default();
-    let mtime = fields[4].parse::<i64>().unwrap_or_default().max(0);
-    let modified_at = DateTime::<Utc>::from_timestamp(mtime, 0).unwrap_or_else(Utc::now);
-    let perm_text = fields[5].trim_start_matches('0');
-    let permissions =
-        u32::from_str_radix(if perm_text.is_empty() { "0" } else { perm_text }, 8).ok();
-    let uid = fields[6].parse::<u32>().ok();
-    let gid = fields[7].parse::<u32>().ok();
-    let link_target = fields
-        .get(8)
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-
-    Some(FileEntry {
-        name: fields[0].to_owned(),
-        path: fields[1].to_owned(),
-        size,
-        modified_at,
-        is_dir,
-        file_type,
-        link_target,
-        permissions,
-        uid,
-        gid,
-    })
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
 
 fn parse_server_status(output: &str) -> ServerStatusView {
     let get = |key: &str| {

@@ -122,6 +122,14 @@ $bundleArgs = @(switch ($Targets) {
   "all"  { "nsis"; "msi" }
 })
 
+# vendored OpenSSL/Perl cannot build under non-ASCII paths (this repo lives under
+# a Chinese folder). Keep the cargo target tree on a pure-ASCII drive path and
+# mirror the final artifacts back into the repo target\ folder for convenience.
+$CargoTargetDir = "E:\rs-build\rustshell"
+New-Item -ItemType Directory -Force -Path $CargoTargetDir | Out-Null
+$env:CARGO_TARGET_DIR = $CargoTargetDir
+Write-Host ("==> CARGO_TARGET_DIR={0}" -f $CargoTargetDir) -ForegroundColor DarkGray
+
 Write-Host ("==> Tauri release build (targets={0})" -f ($bundleArgs -join ",")) -ForegroundColor Cyan
 # beforeBuildCommand in tauri.conf already runs npm.cmd run build; dist already exists so that is fine
 # Pass as one arg list so remaining-args + splat never char-splits a bare string.
@@ -129,18 +137,41 @@ $tauriBuildArgs = @("build", "--bundles") + $bundleArgs
 Invoke-Tauri @tauriBuildArgs
 if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
 
+# Mirror release exe + installers into the in-repo target path expected by docs/UI.
+$repoRelease = Join-Path $RepoRoot "target\release"
+$remoteRelease = Join-Path $CargoTargetDir "release"
+New-Item -ItemType Directory -Force -Path $repoRelease | Out-Null
+$remoteExe = Join-Path $remoteRelease "rustshell.exe"
+if (Test-Path $remoteExe) {
+  Copy-Item -Force -LiteralPath $remoteExe -Destination (Join-Path $repoRelease "rustshell.exe")
+}
+$remoteBundle = Join-Path $remoteRelease "bundle"
+$repoBundle = Join-Path $repoRelease "bundle"
+if (Test-Path $remoteBundle) {
+  New-Item -ItemType Directory -Force -Path $repoBundle | Out-Null
+  Copy-Item -Force -Recurse -LiteralPath $remoteBundle -Destination $repoRelease
+}
+
 Write-Host ""
 Write-Host "==> Done. Artifacts:" -ForegroundColor Green
-$exe = Join-Path $RepoRoot "target\release\rustshell.exe"
-if (Test-Path $exe) {
+$exeCandidates = @(
+  (Join-Path $repoRelease "rustshell.exe"),
+  (Join-Path $remoteRelease "rustshell.exe")
+) | Where-Object { Test-Path $_ }
+foreach ($exe in $exeCandidates | Select-Object -Unique) {
   $item = Get-Item $exe
   Write-Host ("  EXE  {0:N1} MB  {1}" -f ($item.Length / 1MB), $item.FullName)
 }
 
-Get-ChildItem -Path (Join-Path $RepoRoot "target\release\bundle") -Recurse -Include *.exe,*.msi -ErrorAction SilentlyContinue |
-  ForEach-Object {
-    Write-Host ("  PKG  {0:N1} MB  {1}" -f ($_.Length / 1MB), $_.FullName)
-  }
+@(
+  (Join-Path $repoRelease "bundle"),
+  (Join-Path $remoteRelease "bundle")
+) | Where-Object { Test-Path $_ } | ForEach-Object {
+  Get-ChildItem -Path $_ -Recurse -Include *.exe,*.msi -ErrorAction SilentlyContinue |
+    ForEach-Object {
+      Write-Host ("  PKG  {0:N1} MB  {1}" -f ($_.Length / 1MB), $_.FullName)
+    }
+}
 
 Write-Host ""
 Write-Host "Tip: open target\release\bundle\nsis for the installer." -ForegroundColor DarkGray
