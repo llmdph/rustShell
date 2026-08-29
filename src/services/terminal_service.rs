@@ -6,7 +6,7 @@ use crate::services::ssh::{self, ConnectFailure};
 use anyhow::{Context, Result};
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use portable_pty::{CommandBuilder, PtySize};
-use ssh2::ErrorCode;
+use ssh2::{ErrorCode, PtyModeOpcode, PtyModes};
 use std::{
     io::{ErrorKind, Read, Write},
     thread,
@@ -257,6 +257,53 @@ fn establish_ssh_session(
     }
 }
 
+/// Interactive tty flags so remote bash/dircolors treat the session as a
+/// real xterm (color_prompt, ls --color=auto) instead of a dumb pipe.
+fn ssh_pty_modes() -> PtyModes {
+    let mut modes = PtyModes::new();
+    modes.set_boolean(PtyModeOpcode::ECHO, true);
+    modes.set_boolean(PtyModeOpcode::ECHOE, true);
+    modes.set_boolean(PtyModeOpcode::ECHOK, true);
+    modes.set_boolean(PtyModeOpcode::ECHOCTL, true);
+    modes.set_boolean(PtyModeOpcode::ECHOKE, true);
+    modes.set_boolean(PtyModeOpcode::ICANON, true);
+    modes.set_boolean(PtyModeOpcode::ISIG, true);
+    modes.set_boolean(PtyModeOpcode::IEXTEN, true);
+    modes.set_boolean(PtyModeOpcode::OPOST, true);
+    modes.set_boolean(PtyModeOpcode::ONLCR, true);
+    modes.set_boolean(PtyModeOpcode::ICRNL, true);
+    modes.set_boolean(PtyModeOpcode::IXON, true);
+    modes.set_boolean(PtyModeOpcode::IXANY, true);
+    modes.set_boolean(PtyModeOpcode::IMAXBEL, true);
+    modes.set_boolean(PtyModeOpcode::CS8, true);
+    modes.set_boolean(PtyModeOpcode::ISTRIP, false);
+    modes.set_boolean(PtyModeOpcode::INLCR, false);
+    modes.set_boolean(PtyModeOpcode::IGNCR, false);
+    modes.set_character(PtyModeOpcode::VINTR, Some('\u{0003}'));
+    modes.set_character(PtyModeOpcode::VQUIT, Some('\u{001c}'));
+    modes.set_character(PtyModeOpcode::VERASE, Some('\u{007f}'));
+    modes.set_character(PtyModeOpcode::VKILL, Some('\u{0015}'));
+    modes.set_character(PtyModeOpcode::VEOF, Some('\u{0004}'));
+    modes.set_character(PtyModeOpcode::VSTART, Some('\u{0011}'));
+    modes.set_character(PtyModeOpcode::VSTOP, Some('\u{0013}'));
+    modes.set_character(PtyModeOpcode::VSUSP, Some('\u{001a}'));
+    modes.set_u32(PtyModeOpcode::TTY_OP_ISPEED, 38_400);
+    modes.set_u32(PtyModeOpcode::TTY_OP_OSPEED, 38_400);
+    modes
+}
+
+/// Start a login shell with TERM already in the environment so Ubuntu
+/// `.bashrc` can turn on `color_prompt`. `ls --color` can work while the
+/// prompt stays monochrome: older skel only matches `xterm-color`, not
+/// `*-256color`. Exporting `force_color_prompt` hits the `tput` branch.
+/// Fall back to a plain `shell` request if the server rejects `exec`.
+fn start_remote_shell(channel: &mut ssh2::Channel) -> Result<()> {
+    const START: &str = "export TERM=xterm-256color COLORTERM=truecolor force_color_prompt=yes; exec \"${SHELL:-/bin/bash}\" -l";
+    if channel.exec(START).is_ok() {
+        return Ok(());
+    }
+    channel.shell().context("failed to start remote shell")
+}
 
 fn run_ssh_channel(
     session: ssh2::Session,
@@ -270,14 +317,17 @@ fn run_ssh_channel(
     channel
         .request_pty(
             "xterm-256color",
-            None,
+            Some(ssh_pty_modes()),
             Some((size.cols as u32, size.rows as u32, 0, 0)),
         )
         .context("failed to request SSH PTY")?;
-    // Best-effort remote color env for prompts/ls.
+    // Best-effort; OpenSSH AcceptEnv usually ignores these. TERM itself
+    // comes from the pty-req term type above.
     let _ = channel.setenv("COLORTERM", "truecolor");
     let _ = channel.setenv("TERM", "xterm-256color");
-    channel.shell().context("failed to start remote shell")?;
+    let _ = channel.setenv("FORCE_COLOR", "1");
+    let _ = channel.setenv("CLICOLOR_FORCE", "1");
+    start_remote_shell(&mut channel)?;
     session.set_blocking(false);
 
     event_tx.send(TerminalEvent::Connected).ok();

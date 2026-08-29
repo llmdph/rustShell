@@ -121,6 +121,7 @@ import { WorkspaceLayout } from "./features/shell/WorkspaceLayout";
 import { TerminalArea, type TerminalSplitDropTarget } from "./features/terminal/TerminalArea";
 import { SnippetManagerDialog } from "./features/terminal/SnippetManagerDialog";
 import { requestTerminalSearch } from "./features/terminal/TerminalSearchOverlay";
+import { copyTerminalSelection, pasteIntoTerminal } from "./features/terminal/terminalClipboard";
 import { useSnippets } from "./features/terminal/terminalSnippets";
 import { buildTransferAuditActions } from "./features/transfers/transferAuditActions";
 import { buildTransferQueueProps } from "./features/transfers/transferQueueProps";
@@ -1270,6 +1271,10 @@ export default function App() {
   };
 
   const copyTerminal = async (tab: TerminalView) => {
+    if (await copyTerminalSelection(tab.id)) {
+      pushToast("success", "已复制选中内容");
+      return;
+    }
     let text = tab.text || "";
     if (hasTauriRuntime()) {
       try {
@@ -1292,10 +1297,11 @@ export default function App() {
 
   const pasteToTerminal = async (tab: TerminalView) => {
     if (tab.status !== "connected") return;
+    if (await pasteIntoTerminal(tab.id)) return;
     try {
       const text = await navigator.clipboard.readText();
       if (!text) return;
-      await api.terminalSend(tab.id, text);
+      await api.terminalSend(tab.id, text.replace(/\r?\n/g, "\r"));
     } catch (error) {
       pushToast("error", `粘贴失败: ${String(error)}`);
     }
@@ -3365,6 +3371,9 @@ export default function App() {
             onCreateProfileInGroup={(group) => openProfileEditor(undefined, group)}
             onDeleteFolder={deleteSessionFolder}
             onRefreshServerStatus={() => refreshServerStatus(true)}
+            onReconnect={() => {
+              void reconnectActive();
+            }}
           />
         }
         terminalArea={

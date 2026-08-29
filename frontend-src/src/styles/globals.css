@@ -229,7 +229,6 @@
       scroll-behavior: auto !important;
     }
 
-    /* xterm / empty-state carets rely on blink keyframes; keep them solid. */
     [data-xterm-host] .xterm-cursor,
     [data-xterm-host] .xterm-cursor-blink,
     [data-xterm-host] [data-xterm-caret],
@@ -340,31 +339,63 @@
 }
 
 /* ---------- xterm host integration ---------- */
-/* Lock terminal metrics so DomRenderer letter-spacing cannot drift.
- * font-family is !important because xterm injects its own stack, and
- * OffscreenCanvas measurement often fails to resolve the @font-face name
- * "Geist Mono Variable" then silently paints Consolas. Chips/forms use
- * --font-mono; the terminal must match that face, not the fallback. */
+/* Lock face/size on the row container, not on each cell span. Forcing
+ * font-family !important on the span makes WebView2 drop xterm's SGR
+ * color classes, so ls/git/prompt go monochrome. */
 [data-xterm-host] .xterm,
 [data-xterm-host] .xterm-rows,
-[data-xterm-host] .xterm-rows span,
 [data-xterm-host] .xterm-char-measure-element,
 [data-xterm-host] .xterm-width-cache-measure-container {
   font-family: var(--font-mono) !important;
+  font-size: var(--terminal-font-size, 14px) !important;
   font-kerning: none !important;
   font-variant-ligatures: none !important;
   font-feature-settings: "liga" 0, "calt" 0 !important;
-  /* Prefer Windows ClearType subpixel AA. Forced grayscale antialiasing looks
-     thin and jagged on mono glyphs in WebView2. */
   text-rendering: auto !important;
   -webkit-font-smoothing: auto;
   -moz-osx-font-smoothing: auto;
 }
 
-/* Keep SP visible. xterm spans are inline-block; if white-space falls back
- * to normal, a space-only cell collapses to 0px and looks like the key died. */
+/* Do not put !important on generic cell spans. WebView2 then drops xterm's
+ * non-important SGR color (and even inline truecolor) on the same element. */
+
+/* SGR 16-color. Keep !important so host/body foreground cannot flatten
+ * prompt/ls/git back to monochrome. 256-color classes are injected by xterm. */
+[data-xterm-host] .xterm-fg-0 { color: #2e3436 !important; }
+[data-xterm-host] .xterm-fg-1 { color: #cc0000 !important; }
+[data-xterm-host] .xterm-fg-2 { color: #4e9a06 !important; }
+[data-xterm-host] .xterm-fg-3 { color: #c4a000 !important; }
+[data-xterm-host] .xterm-fg-4 { color: #3465a4 !important; }
+[data-xterm-host] .xterm-fg-5 { color: #75507b !important; }
+[data-xterm-host] .xterm-fg-6 { color: #06989a !important; }
+[data-xterm-host] .xterm-fg-7 { color: #d3d7cf !important; }
+[data-xterm-host] .xterm-fg-8 { color: #555753 !important; }
+[data-xterm-host] .xterm-fg-9 { color: #ef2929 !important; }
+[data-xterm-host] .xterm-fg-10 { color: #8ae234 !important; }
+[data-xterm-host] .xterm-fg-11 { color: #fce94f !important; }
+[data-xterm-host] .xterm-fg-12 { color: #729fcf !important; }
+[data-xterm-host] .xterm-fg-13 { color: #ad7fa8 !important; }
+[data-xterm-host] .xterm-fg-14 { color: #34e2e2 !important; }
+[data-xterm-host] .xterm-fg-15 { color: #eeeeec !important; }
+[data-xterm-host] .xterm-bg-0 { background-color: #2e3436 !important; }
+[data-xterm-host] .xterm-bg-1 { background-color: #cc0000 !important; }
+[data-xterm-host] .xterm-bg-2 { background-color: #4e9a06 !important; }
+[data-xterm-host] .xterm-bg-3 { background-color: #c4a000 !important; }
+[data-xterm-host] .xterm-bg-4 { background-color: #3465a4 !important; }
+[data-xterm-host] .xterm-bg-5 { background-color: #75507b !important; }
+[data-xterm-host] .xterm-bg-6 { background-color: #06989a !important; }
+[data-xterm-host] .xterm-bg-7 { background-color: #d3d7cf !important; }
+[data-xterm-host] .xterm-bg-8 { background-color: #555753 !important; }
+[data-xterm-host] .xterm-bg-9 { background-color: #ef2929 !important; }
+[data-xterm-host] .xterm-bg-10 { background-color: #8ae234 !important; }
+[data-xterm-host] .xterm-bg-11 { background-color: #fce94f !important; }
+[data-xterm-host] .xterm-bg-12 { background-color: #729fcf !important; }
+[data-xterm-host] .xterm-bg-13 { background-color: #ad7fa8 !important; }
+[data-xterm-host] .xterm-bg-14 { background-color: #34e2e2 !important; }
+[data-xterm-host] .xterm-bg-15 { background-color: #eeeeec !important; }
+
+/* Keep SP visible. white-space inherits; do not target cell spans. */
 [data-xterm-host] .xterm-rows,
-[data-xterm-host] .xterm-rows span,
 [data-xterm-host] .xterm-width-cache-measure-container {
   white-space: pre !important;
 }
@@ -381,9 +412,7 @@
 }
 
 /* Native xterm caret is gated by internals (isCursorHidden / latch / 0-width
- * letter-spacing). Hide it and paint [data-xterm-caret] instead — explicit
- * cell size, visible on both themes. Blink is ours: opacity only, never
- * `background-color: inherit` (that is what froze xterm's own caret). */
+ * letter-spacing). Hide it and paint a bar overlay. Idle blinks; typing does not. */
 [data-xterm-host] .xterm-cursor,
 [data-xterm-host] .xterm-cursor.xterm-cursor-block,
 [data-xterm-host] .xterm-cursor.xterm-cursor-outline,
@@ -404,11 +433,15 @@
   pointer-events: none;
   box-sizing: border-box;
   background-color: var(--xterm-cursor-color, #171717);
-  box-shadow: inset 0 0 0 1px var(--xterm-cursor-color, #171717);
 }
 
 [data-xterm-host] .xterm.focus [data-xterm-caret] {
   animation: xterm-caret-blink 1.06s steps(1, end) infinite;
+}
+
+[data-xterm-host] .xterm.focus [data-xterm-caret].is-typing {
+  animation: none;
+  opacity: 1;
 }
 
 @keyframes xterm-caret-blink {
@@ -425,7 +458,6 @@
 @supports (mix-blend-mode: difference) {
   [data-xterm-host] [data-xterm-caret] {
     background-color: #fff;
-    box-shadow: none;
     mix-blend-mode: difference;
   }
 }
@@ -450,6 +482,30 @@
 
 [data-xterm-host] .xterm .xterm-screen {
   background-color: var(--xterm-background, var(--background)) !important;
+}
+
+[data-xterm-host] .xterm-scrollable-element {
+  width: 100%;
+  height: 100%;
+}
+
+/* Native overlay uses CharSizeService metrics that drift from the DOM rows.
+ * Hide it; [data-xterm-selection] is painted from actual row boxes. */
+[data-xterm-host] .xterm-selection {
+  display: none !important;
+}
+
+[data-xterm-host] [data-xterm-selection] {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+[data-xterm-host] [data-xterm-selection] div {
+  position: absolute;
+  background-color: color-mix(in srgb, var(--foreground) 28%, transparent);
 }
 
 [data-xterm-host] .xterm .xterm-viewport::-webkit-scrollbar {

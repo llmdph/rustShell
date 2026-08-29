@@ -18,7 +18,7 @@ impl Default for AppSettings {
         Self {
             theme: "deep".to_owned(),
             font_size: 14,
-            copy_on_select: false,
+            copy_on_select: true,
             scrollback: 10_000,
             local_shell: String::new(),
             confirm_on_exit: true,

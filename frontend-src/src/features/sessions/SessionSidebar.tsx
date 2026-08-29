@@ -33,6 +33,7 @@ type SessionSidebarProps = {
   onCreateProfileInGroup: (group: string) => void;
   onDeleteFolder: (group: string) => Promise<boolean>;
   onRefreshServerStatus: () => void;
+  onReconnect: () => void;
 };
 
 export function SessionSidebar({
@@ -58,7 +59,8 @@ export function SessionSidebar({
   onPromptText,
   onCreateProfileInGroup,
   onDeleteFolder,
-  onRefreshServerStatus
+  onRefreshServerStatus,
+  onReconnect
 }: SessionSidebarProps) {
   return (
     <aside
@@ -122,6 +124,7 @@ export function SessionSidebar({
             serverStatusError={serverStatusError}
             linkStatus={linkStatus}
             onRefreshServerStatus={onRefreshServerStatus}
+            onReconnect={onReconnect}
           />
         </>
       )}

@@ -78,6 +78,9 @@ export default function SettingsDialog({ settings, onChange, onClose, onHostKeys
             <Input
               id="settings-font"
               type="number"
+              min={10}
+              max={28}
+              step={1}
               value={settings.fontSize}
               onChange={(event) => onChange({ ...settings, fontSize: Number(event.target.value) })}
             />
@@ -100,8 +103,11 @@ export default function SettingsDialog({ settings, onChange, onClose, onHostKeys
             onChange={(event) => onChange({ ...settings, localShell: event.target.value })}
           />
         </div>
-        <div className="flex items-center justify-between rounded-md border px-3 py-2.5">
-          <Label htmlFor="settings-copy" className="font-normal">选择即复制</Label>
+        <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
+          <div className="grid min-w-0 gap-0.5">
+            <Label htmlFor="settings-copy" className="font-normal">选择即复制</Label>
+            <p className="text-[11px] leading-tight text-muted-foreground">划选写入剪贴板，右键粘贴。关闭后右键在有选区时复制。</p>
+          </div>
           <Switch
             id="settings-copy"
             checked={settings.copyOnSelect}

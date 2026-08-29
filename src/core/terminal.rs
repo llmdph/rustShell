@@ -570,6 +570,14 @@ mod tests {
     }
 
     #[test]
+    fn stream_decoder_keeps_sgr_escape() {
+        let mut decoder = terminal_encoding("UTF-8").new_decoder();
+        let text = decode_terminal_stream(&mut decoder, b"\x1b[32mgreen\x1b[0m");
+        assert!(text.contains('\u{1b}'), "ANSI ESC must reach xterm: {text:?}");
+        assert_eq!(text, "\u{1b}[32mgreen\u{1b}[0m");
+    }
+
+    #[test]
     fn osc_scan_buffer_stays_empty_for_plain_colour_output() {
         let mut terminal = TerminalModel::new(SessionProfile::new_local(), TerminalSize::default());
 

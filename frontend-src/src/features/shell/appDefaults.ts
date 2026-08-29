@@ -3,7 +3,7 @@ import type { AppSettings, QuickConnectRequest } from "@/api";
 export const defaultSettings: AppSettings = {
   theme: "deep",
   fontSize: 14,
-  copyOnSelect: false,
+  copyOnSelect: true,
   scrollback: 10000,
   localShell: "",
   confirmOnExit: true

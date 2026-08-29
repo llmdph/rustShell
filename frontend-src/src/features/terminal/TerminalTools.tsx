@@ -53,8 +53,8 @@ export function TerminalTools({
   return (
     <section data-terminal-tools className="relative z-[2] flex min-w-0 flex-wrap items-center gap-[7px] border-t border-border/70 bg-card/80 px-[9px] py-[5px]">
       <div className="grid grid-cols-[repeat(8,30px)] gap-1.5">
-        <IconButton className={toolIconClass} title="复制终端内容" icon={<Copy size={14} />} onClick={onCopy} disabled={!activeTab} />
-        <IconButton className={toolIconClass} title="粘贴到终端" icon={<ClipboardPaste size={14} />} onClick={onPaste} disabled={!connected} />
+        <IconButton className={toolIconClass} title="复制选中内容，无选区时复制整屏（Ctrl+Shift+C）" icon={<Copy size={14} />} onClick={onCopy} disabled={!activeTab} />
+        <IconButton className={toolIconClass} title="粘贴到终端（Ctrl+Shift+V）" icon={<ClipboardPaste size={14} />} onClick={onPaste} disabled={!connected} />
         <IconButton
           className={toolIconClass}
           title="查找终端输出（Ctrl+F）"

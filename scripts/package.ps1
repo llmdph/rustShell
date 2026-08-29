@@ -111,6 +111,8 @@ $cssFile = Get-ChildItem -Path (Join-Path $RepoRoot "dist\assets") -Filter "app-
 if (-not $cssFile) { throw "dist/assets/app-entry-*.css missing after vite build" }
 $cssText = Get-Content -LiteralPath $cssFile.FullName -Raw
 if ($cssText -notmatch "xterm-caret") { throw "dist css missing overlay caret ($($cssFile.Name))" }
+if ($cssText -notmatch "xterm-fg-2") { throw "dist css missing ANSI color classes ($($cssFile.Name))" }
+if ($appText -notmatch "xterm-fg-") { throw "dist frontend missing ANSI color injection ($($appJs.Name))" }
 Write-Host ("==> Frontend gate OK: {0} / {1}" -f $appJs.Name, $cssFile.Name) -ForegroundColor DarkGray
 
 # Tauri 2 CLI accepts msi/nsis only — expand "all" to both.

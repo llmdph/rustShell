@@ -12,6 +12,7 @@ type ConnectionOverviewProps = {
   serverStatusError: string;
   linkStatus?: "disconnected" | "connecting" | "connected" | "failed" | null;
   onRefreshServerStatus: () => void;
+  onReconnect: () => void;
 };
 
 const linkStatusLabel: Record<NonNullable<ConnectionOverviewProps["linkStatus"]>, string> = {
@@ -27,42 +28,64 @@ export function ConnectionOverview({
   serverStatusLoading,
   serverStatusError,
   linkStatus,
-  onRefreshServerStatus
+  onRefreshServerStatus,
+  onReconnect
 }: ConnectionOverviewProps) {
   const connected = linkStatus === "connected";
+  const connecting = linkStatus === "connecting";
+  const canReconnect = Boolean(profile) && (linkStatus === "failed" || linkStatus === "disconnected");
   const canRefresh = Boolean(profile) && (connected || isLocalProtocol(profile?.protocol));
-  const showSkeleton = !serverStatus && (serverStatusLoading || linkStatus === "connecting");
+  const showSkeleton = !serverStatus && (serverStatusLoading || connecting);
   const showMeters = Boolean(serverStatus) || showSkeleton;
+  const iconBusy = connecting || (!canReconnect && serverStatusLoading);
+
+  const identity = profile ? (
+    <>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <div className="truncate text-[13px] font-medium leading-tight">{profile.name}</div>
+        {linkStatus != null && (
+          <>
+            <span className={"signal-dot signal-dot--" + linkStatus} />
+            <span
+              className={cn(
+                "shrink-0 font-mono text-[10px] uppercase tracking-wider",
+                linkStatus === "failed" ? "text-destructive" : "text-muted-foreground"
+              )}
+            >
+              {linkStatusLabel[linkStatus]}
+            </span>
+          </>
+        )}
+      </div>
+      <div className="mt-0.5 truncate font-mono text-[10.5px] text-muted-foreground" title={identityLine(profile)}>
+        {identityLine(profile)}
+      </div>
+    </>
+  ) : (
+    <p className="m-0 text-[11px] text-muted-foreground">选择一个会话查看状态</p>
+  );
 
   return (
     <section className="border-t border-border/70 pb-0.5 pt-2">
       <div className="flex min-w-0 items-start justify-between gap-2">
-        {profile ? (
-          <div className="min-w-0">
-            <div className="flex min-w-0 items-center gap-1.5">
-              <div className="truncate text-[13px] font-medium leading-tight">{profile.name}</div>
-              {linkStatus != null && (
-                <>
-                  <span className={"signal-dot signal-dot--" + linkStatus} />
-                  <span className="shrink-0 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-                    {linkStatusLabel[linkStatus]}
-                  </span>
-                </>
-              )}
-            </div>
-            <div className="mt-0.5 truncate font-mono text-[10.5px] text-muted-foreground" title={identityLine(profile)}>
-              {identityLine(profile)}
-            </div>
-          </div>
+        {canReconnect ? (
+          <button
+            type="button"
+            className="min-w-0 flex-1 cursor-pointer rounded-sm border-0 bg-transparent p-0 text-left text-foreground hover:bg-muted/70"
+            title="点击重连"
+            onClick={onReconnect}
+          >
+            {identity}
+          </button>
         ) : (
-          <p className="m-0 text-[11px] text-muted-foreground">选择一个会话查看状态</p>
+          <div className="min-w-0 flex-1">{identity}</div>
         )}
         <IconButton
           className="h-6 min-w-6 shrink-0 p-0"
-          title="刷新服务器状态"
-          icon={<RefreshCcw size={13} className={serverStatusLoading ? "animate-spin" : undefined} />}
-          onClick={onRefreshServerStatus}
-          disabled={!canRefresh || serverStatusLoading}
+          title={canReconnect ? "重连" : "刷新服务器状态"}
+          icon={<RefreshCcw size={13} className={iconBusy ? "animate-spin" : undefined} />}
+          onClick={canReconnect ? onReconnect : onRefreshServerStatus}
+          disabled={canReconnect ? connecting : !canRefresh || serverStatusLoading}
         />
       </div>
 

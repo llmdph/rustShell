@@ -13,11 +13,24 @@ import {
   type TerminalSearchOptions,
   type TerminalSearchResult
 } from "./TerminalSearchOverlay";
+import {
+  pasteClipboardIntoTerminal,
+  registerTerminalClipboard,
+  writeTerminalSelection
+} from "./terminalClipboard";
 
 /// Same stack as `--font-mono` (bottom snippet chips). Keep the quoted
 /// family first — xterm writes this into both CSS and OffscreenCanvas.
 const TERMINAL_FONT_FAMILY =
   '"Geist Mono Variable", ui-monospace, "Cascadia Mono", Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace';
+
+const TERMINAL_FONT_SIZE_MIN = 10;
+const TERMINAL_FONT_SIZE_MAX = 28;
+
+function terminalFontSize(value: number) {
+  if (!Number.isFinite(value)) return 14;
+  return clampNumber(value, TERMINAL_FONT_SIZE_MIN, TERMINAL_FONT_SIZE_MAX);
+}
 
 function loadTerminalFont(fontSize: number) {
   if (!document.fonts?.load) return Promise.resolve();
@@ -78,6 +91,58 @@ const XTERM_ANSI = {
   brightWhite: "#eeeeec"
 } as const;
 
+const XTERM_CUBE_LEVELS = [0, 95, 135, 175, 215, 255] as const;
+
+function xterm256Palette() {
+  const colors: string[] = [
+    XTERM_ANSI.black,
+    XTERM_ANSI.red,
+    XTERM_ANSI.green,
+    XTERM_ANSI.yellow,
+    XTERM_ANSI.blue,
+    XTERM_ANSI.magenta,
+    XTERM_ANSI.cyan,
+    XTERM_ANSI.white,
+    XTERM_ANSI.brightBlack,
+    XTERM_ANSI.brightRed,
+    XTERM_ANSI.brightGreen,
+    XTERM_ANSI.brightYellow,
+    XTERM_ANSI.brightBlue,
+    XTERM_ANSI.brightMagenta,
+    XTERM_ANSI.brightCyan,
+    XTERM_ANSI.brightWhite
+  ];
+  for (let i = 0; i < 216; i += 1) {
+    const r = XTERM_CUBE_LEVELS[Math.floor(i / 36)];
+    const g = XTERM_CUBE_LEVELS[Math.floor(i / 6) % 6];
+    const b = XTERM_CUBE_LEVELS[i % 6];
+    colors.push(`#${hexByte(r)}${hexByte(g)}${hexByte(b)}`);
+  }
+  for (let i = 0; i < 24; i += 1) {
+    const v = 8 + i * 10;
+    colors.push(`#${hexByte(v)}${hexByte(v)}${hexByte(v)}`);
+  }
+  return colors;
+}
+
+/// WebView2 has dropped xterm's injected (non-important) SGR classes before.
+/// Own the 256-color sheet with !important so prompt/ls/git stay colored.
+function injectXtermAnsiColors(host: HTMLElement) {
+  let sheet = host.querySelector(":scope > style[data-xterm-ansi]");
+  if (!(sheet instanceof HTMLStyleElement)) {
+    sheet = document.createElement("style");
+    sheet.dataset.xtermAnsi = "";
+    host.appendChild(sheet);
+  }
+  sheet.textContent = xterm256Palette()
+    .map(
+      (color, index) =>
+        `[data-xterm-host] .xterm-fg-${index}{color:${color}!important}` +
+        `[data-xterm-host] .xterm-bg-${index}{background-color:${color}!important}`
+    )
+    .join("");
+}
+
 function xtermTheme(theme: AppSettings["theme"], backgroundAlpha = 100) {
   // Chrome stays neutral; ANSI semantic colors stay vivid for prompts / ls / git.
   // Cursor colors stay fully opaque — blending a transparent bg onto the caret
@@ -88,7 +153,10 @@ function xtermTheme(theme: AppSettings["theme"], backgroundAlpha = 100) {
       foreground: "#171717",
       cursor: "#171717",
       cursorAccent: "#ffffff",
-      selectionBackground: "#d4d4d4",
+      // 8-digit hex keeps alpha. Opaque #rrggbb is forced to 30% by xterm and
+      // disappears on a near-white cell.
+      selectionBackground: "#17171748",
+      selectionInactiveBackground: "#1717172e",
       ...XTERM_ANSI
     };
   }
@@ -97,7 +165,8 @@ function xtermTheme(theme: AppSettings["theme"], backgroundAlpha = 100) {
     foreground: "#e5e5e5",
     cursor: "#fafafa",
     cursorAccent: "#0a0a0a",
-    selectionBackground: "#404040",
+    selectionBackground: "#ffffff4d",
+    selectionInactiveBackground: "#ffffff2e",
     ...XTERM_ANSI
   };
 }
@@ -200,15 +269,16 @@ function syncTermCaret(term: Terminal) {
     return;
   }
 
-  // If xterm did emit a cursor cell, snap to its box so we cannot drift from
-  // the glyph grid. A collapsed (0-width) span still has a correct origin.
+  const barW = 2;
+  // If xterm did emit a cursor cell, snap to its origin so we cannot drift
+  // from the glyph grid. A collapsed (0-width) span still has a correct origin.
   const native = screen.querySelector(".xterm-cursor");
   if (native instanceof HTMLElement) {
     const screenRect = screen.getBoundingClientRect();
     const cellRect = native.getBoundingClientRect();
     if (cellRect.height >= 1) {
       caret.style.visibility = "visible";
-      caret.style.width = `${cellRect.width >= 1 ? cellRect.width : cellW}px`;
+      caret.style.width = `${barW}px`;
       caret.style.height = `${cellRect.height}px`;
       caret.style.transform = `translate(${cellRect.left - screenRect.left}px, ${cellRect.top - screenRect.top}px)`;
       return;
@@ -219,9 +289,63 @@ function syncTermCaret(term: Terminal) {
   const x = Math.max(0, Math.min(buf.cursorX, cols - 1));
   const y = Math.max(0, Math.min(buf.cursorY, rows - 1));
   caret.style.visibility = "visible";
-  caret.style.width = `${cellW}px`;
+  caret.style.width = `${barW}px`;
   caret.style.height = `${cellH}px`;
   caret.style.transform = `translate(${x * cellW}px, ${y * cellH}px)`;
+}
+
+/// xterm's selection overlay is placed with CharSizeService cell metrics.
+/// OffscreenCanvas often reports a different line box than the DOM rows (Geist
+/// vs fallback face), so the wash lands on the wrong row. Paint from the
+/// actual row boxes, same origin as the caret.
+function syncTermSelection(term: Terminal, keepIfEmpty = false) {
+  const screen = term.element?.querySelector(".xterm-screen");
+  if (!(screen instanceof HTMLElement)) return;
+  let layer = screen.querySelector(":scope > [data-xterm-selection]");
+  if (!(layer instanceof HTMLDivElement)) {
+    layer = document.createElement("div");
+    layer.dataset.xtermSelection = "";
+    layer.setAttribute("aria-hidden", "true");
+    screen.appendChild(layer);
+  }
+  const pos = term.getSelectionPosition();
+  if (!pos || !term.hasSelection()) {
+    if (!keepIfEmpty) layer.replaceChildren();
+    return;
+  }
+  const viewportY = term.buffer.active.viewportY;
+  const startY = pos.start.y - viewportY;
+  const endY = pos.end.y - viewportY;
+  const startX = pos.start.x;
+  const endX = pos.end.x;
+  const rowEls = screen.querySelectorAll(".xterm-rows > div");
+  const screenRect = screen.getBoundingClientRect();
+  const cols = Math.max(term.cols, 1);
+  const from = Math.max(0, startY);
+  const to = Math.min(rowEls.length - 1, endY);
+  const fragment = document.createDocumentFragment();
+  for (let y = from; y <= to; y++) {
+    const row = rowEls[y];
+    if (!(row instanceof HTMLElement)) continue;
+    const rowRect = row.getBoundingClientRect();
+    if (rowRect.height < 1) continue;
+    const cellW = rowRect.width / cols;
+    const colStart = y === startY ? startX : 0;
+    const colEnd = y === endY ? endX : cols;
+    if (colEnd <= colStart) continue;
+    const div = document.createElement("div");
+    div.style.left = `${(rowRect.left - screenRect.left) + colStart * cellW}px`;
+    div.style.width = `${(colEnd - colStart) * cellW}px`;
+    div.style.top = `${rowRect.top - screenRect.top}px`;
+    div.style.height = `${rowRect.height}px`;
+    fragment.appendChild(div);
+  }
+  layer.replaceChildren(fragment);
+}
+
+function syncTermOverlays(term: Terminal, keepIfEmpty = false) {
+  syncTermCaret(term);
+  syncTermSelection(term, keepIfEmpty);
 }
 
 /// xterm's DomRenderer only emits a .xterm-cursor cell after
@@ -282,6 +406,7 @@ function schedulePrimeCursor(term: Terminal, frames = 2) {
 
 export function XtermView({ terminal, settings, active, visible, paneStyle, terminalBackgroundAlpha, onActivate, onDrain, onReplayConsumed }: XtermViewProps) {
   const shown = visible ?? active;
+  const fontSize = terminalFontSize(settings.fontSize);
   const terminalTheme = xtermTheme(settings.theme, terminalBackgroundAlpha);
   const terminalBackground = terminalTheme.background;
   const terminalCursor = terminalTheme.cursor;
@@ -308,7 +433,13 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
   const lastHostSizeRef = useRef({ width: 0, height: 0 });
   const lastTermSizeRef = useRef({ cols: 0, rows: 0 });
   const pendingResizeRef = useRef(false);
+  const fontSizeRef = useRef(fontSize);
+  const copyOnSelectRef = useRef(settings.copyOnSelect);
+  const statusRef = useRef(terminal.status);
   const onDrainRef = useRef(onDrain);
+  fontSizeRef.current = fontSize;
+  copyOnSelectRef.current = settings.copyOnSelect;
+  statusRef.current = terminal.status;
 
   useEffect(() => {
     onDrainRef.current = onDrain;
@@ -418,6 +549,29 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
         openSearch();
         return;
       }
+      const target = event.target;
+      const inChrome =
+        target instanceof HTMLElement &&
+        Boolean(target.closest("[data-terminal-search], input, textarea:not(.xterm-helper-textarea)"));
+      const composing = event.isComposing || event.keyCode === 229;
+      const isInsert = event.key === "Insert" || event.code === "Insert";
+      if (!inChrome && !composing) {
+        // Ctrl+C stays SIGINT. Copy/paste use the Windows Terminal chords.
+        if ((modifier && event.shiftKey && event.key.toLowerCase() === "c") || (event.ctrlKey && !event.shiftKey && !event.altKey && isInsert)) {
+          event.preventDefault();
+          event.stopPropagation();
+          const term = termRef.current;
+          if (term) void writeTerminalSelection(term);
+          return;
+        }
+        if ((modifier && event.shiftKey && event.key.toLowerCase() === "v") || (event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey && isInsert)) {
+          event.preventDefault();
+          event.stopPropagation();
+          const term = termRef.current;
+          if (term && statusRef.current === "connected") void pasteClipboardIntoTerminal(term);
+          return;
+        }
+      }
       // Space is not emitted from xterm's keydown path (keyCode 32 < 48); it
       // waits for the 0×0 helper textarea's input/keypress. WebView2 then
       // treats Space as page-down on the overflow:scroll viewport — at the
@@ -427,16 +581,9 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
         !event.ctrlKey &&
         !event.altKey &&
         !event.metaKey &&
-        !event.isComposing &&
-        event.keyCode !== 229
+        !composing
       ) {
-        const target = event.target;
-        if (
-          target instanceof HTMLElement &&
-          target.closest("[data-terminal-search], input, textarea:not(.xterm-helper-textarea)")
-        ) {
-          return;
-        }
+        if (inChrome) return;
         event.preventDefault();
         event.stopPropagation();
         termRef.current?.input(" ");
@@ -539,7 +686,8 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
   };
 
   useEffect(() => {
-    if (!hostRef.current || !terminalMountRef.current) return;
+    const host = hostRef.current;
+    if (!host || !terminalMountRef.current) return;
     let disposed = false;
     const theme = xtermTheme(settings.theme, terminalBackgroundAlpha);
     const term = new Terminal({
@@ -548,18 +696,19 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       // which xterm still gates behind the proposed-API flag. Without this the
       // addon throws on every findNext and the overlay reports zero matches.
       allowProposedApi: true,
-      // Solid block. Blink keyframes use `background-color: inherit` on the off
-      // frame; WebView2 / reduced-motion can freeze there and the caret vanishes.
+      // Overlay caret is a solid 2px bar. Native xterm blink can freeze
+      // invisible in WebView2; we do not add our own blink either.
       cursorBlink: false,
-      cursorStyle: "block",
-      // Unfocused panes keep a solid block so the caret never disappears when
-      // the tools bar or another tab steals focus.
-      cursorInactiveStyle: "block",
+      cursorStyle: "bar",
+      cursorWidth: 2,
+      cursorInactiveStyle: "bar",
       convertEol: true,
+      drawBoldTextInBrightColors: true,
+      minimumContrastRatio: 1,
       // DOM renderer + ClearType. Avoid WebGL atlas (no subpixel AA → jaggies).
       // Face is locked again in CSS; this string is what CharSizeService measures.
       fontFamily: TERMINAL_FONT_FAMILY,
-      fontSize: settings.fontSize,
+      fontSize,
       fontWeight: "400",
       fontWeightBold: "700",
       letterSpacing: 0,
@@ -578,7 +727,10 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     termRef.current = term;
     fitRef.current = fit;
     searchRef.current = search;
-    if (hostRef.current) hostRef.current.dataset.xtermRenderer = "dom";
+    if (hostRef.current) {
+      hostRef.current.dataset.xtermRenderer = "dom";
+      injectXtermAnsiColors(hostRef.current);
+    }
     const initialReplay = terminal.text;
     if (initialReplay) {
       term.write(initialReplay, () => {
@@ -608,18 +760,19 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       try {
         // Touch fontFamily so CharSizeService remeasures after @font-face is in.
         term.options.fontFamily = TERMINAL_FONT_FAMILY;
-        term.options.fontSize = settings.fontSize;
+        term.options.fontSize = fontSizeRef.current;
         fit.fit();
         term.refresh(0, Math.max(0, term.rows - 1));
         term.scrollToBottom();
         primeCursor(term);
+        syncTermSelection(term);
         if (active) term.focus();
       } catch {
         // fit can throw if the host is display:none mid-unmount
       }
       updateTerminalScrollbar();
     };
-    void loadTerminalFont(settings.fontSize).then(refreshAfterFonts);
+    void loadTerminalFont(fontSize).then(refreshAfterFonts);
     if (document.fonts?.ready) {
       void document.fonts.ready.then(refreshAfterFonts);
     }
@@ -628,12 +781,13 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     const viewport = hostRef.current.querySelector<HTMLElement>(".xterm-viewport");
     const handleViewportScroll = () => updateTerminalScrollbar(true);
     viewport?.addEventListener("scroll", handleViewportScroll, { passive: true });
+    let selecting = false;
     const scrollDisposable = term.onScroll(() => {
       updateTerminalScrollbar(true);
-      syncTermCaret(term);
+      syncTermOverlays(term, selecting);
     });
-    const renderDisposable = term.onRender(() => syncTermCaret(term));
-    const cursorDisposable = term.onCursorMove(() => syncTermCaret(term));
+    const renderDisposable = term.onRender(() => syncTermOverlays(term, selecting));
+    const cursorDisposable = term.onCursorMove(() => syncTermOverlays(term, selecting));
 
     const flushInput = () => {
       sendFrameRef.current = null;
@@ -645,12 +799,96 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       api.terminalSend(terminal.id, payload).catch(() => undefined);
     };
 
+    let caretIdleTimer = 0;
+    const markCaretTyping = () => {
+      const caret = host.querySelector("[data-xterm-caret]");
+      if (!(caret instanceof HTMLElement)) return;
+      caret.classList.add("is-typing");
+      window.clearTimeout(caretIdleTimer);
+      caretIdleTimer = window.setTimeout(() => caret.classList.remove("is-typing"), 700);
+    };
+
     term.onData((data) => {
+      markCaretTyping();
       sendBufferRef.current += data;
       if (sendScheduledRef.current) return;
       sendScheduledRef.current = true;
       sendFrameRef.current = window.requestAnimationFrame(flushInput);
     });
+
+    let selectionPaintFrame = 0;
+    const eventInChrome = (event: Event) => {
+      const target = event.target;
+      return (
+        target instanceof HTMLElement &&
+        Boolean(target.closest("[data-terminal-search], input, textarea:not(.xterm-helper-textarea)"))
+      );
+    };
+    const paintLiveSelection = () => {
+      selectionPaintFrame = 0;
+      if (disposed) return;
+      syncTermSelection(term);
+    };
+    const scheduleSelectionPaint = () => {
+      if (selectionPaintFrame) return;
+      selectionPaintFrame = window.requestAnimationFrame(paintLiveSelection);
+    };
+    const onSelectMouseDown = (event: MouseEvent) => {
+      if (event.button === 0 && !eventInChrome(event)) {
+        selecting = true;
+        scheduleSelectionPaint();
+      }
+    };
+    const onSelectMouseMove = () => {
+      if (selecting) scheduleSelectionPaint();
+    };
+    // xterm's drag mousemove calls stopImmediatePropagation on document, so
+    // bubble listeners on window never run. Capture on document sees the
+    // move first; the rAF then paints after xterm has updated the model.
+    const onSelectMouseUp = (event: MouseEvent) => {
+      if (event.button !== 0) return;
+      const wasSelecting = selecting;
+      selecting = false;
+      if (!wasSelecting) return;
+      scheduleSelectionPaint();
+      if (copyOnSelectRef.current) void writeTerminalSelection(term);
+    };
+    const onContextMenu = (event: MouseEvent) => {
+      if (eventInChrome(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const hasSelection = term.hasSelection();
+      if (copyOnSelectRef.current || !hasSelection) {
+        if (statusRef.current === "connected") void pasteClipboardIntoTerminal(term);
+        return;
+      }
+      void writeTerminalSelection(term).then((copied) => {
+        if (copied) term.clearSelection();
+      });
+    };
+    const selectionDisposable = term.onSelectionChange(() => {
+      syncTermSelection(term);
+      if (selecting || !copyOnSelectRef.current) return;
+      void writeTerminalSelection(term);
+    });
+    host.addEventListener("mousedown", onSelectMouseDown);
+    document.addEventListener("mousemove", onSelectMouseMove, true);
+    window.addEventListener("mouseup", onSelectMouseUp);
+    host.addEventListener("contextmenu", onContextMenu, true);
+    const nativeSelection = term.element?.querySelector(".xterm-selection");
+    const selectionObserver =
+      nativeSelection instanceof HTMLElement
+        ? new MutationObserver(() => scheduleSelectionPaint())
+        : null;
+    selectionObserver?.observe(nativeSelection as HTMLElement, { childList: true });
+    const unregisterClipboard = registerTerminalClipboard(terminal.id, {
+      copySelection: () => writeTerminalSelection(term),
+      paste: async () => {
+        if (statusRef.current !== "connected") return false;
+        return pasteClipboardIntoTerminal(term);
+      }
+    });
+
     lastHostSizeRef.current = { width: 0, height: 0 };
     lastTermSizeRef.current = { cols: 0, rows: 0 };
 
@@ -718,7 +956,17 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       scrollDisposable.dispose();
       renderDisposable.dispose();
       cursorDisposable.dispose();
+      selectionDisposable.dispose();
       searchResults.dispose();
+      selecting = false;
+      window.clearTimeout(caretIdleTimer);
+      if (selectionPaintFrame) window.cancelAnimationFrame(selectionPaintFrame);
+      selectionObserver?.disconnect();
+      host.removeEventListener("mousedown", onSelectMouseDown);
+      document.removeEventListener("mousemove", onSelectMouseMove, true);
+      window.removeEventListener("mouseup", onSelectMouseUp);
+      host.removeEventListener("contextmenu", onContextMenu, true);
+      unregisterClipboard();
       observer.disconnect();
       if (terminalScrollbarHideRef.current !== null) {
         window.clearTimeout(terminalScrollbarHideRef.current);
@@ -752,24 +1000,36 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
-    term.options.fontFamily = TERMINAL_FONT_FAMILY;
-    term.options.fontSize = settings.fontSize;
-    term.options.fontWeight = "400";
-    term.options.fontWeightBold = "700";
-    term.options.scrollback = settings.scrollback;
-    term.options.theme = xtermTheme(settings.theme, terminalBackgroundAlpha);
-    const frame = window.requestAnimationFrame(() => {
-      if (!termRef.current || !fitRef.current) return;
-      fitRef.current.fit();
-      if (lastTermSizeRef.current.cols !== termRef.current.cols || lastTermSizeRef.current.rows !== termRef.current.rows) {
-        lastTermSizeRef.current = { cols: termRef.current.cols, rows: termRef.current.rows };
-        api.terminalResize(terminal.id, termRef.current.cols, termRef.current.rows).catch(() => undefined);
+    let cancelled = false;
+    const apply = () => {
+      if (cancelled || termRef.current !== term) return;
+      term.options.fontFamily = TERMINAL_FONT_FAMILY;
+      term.options.fontSize = fontSize;
+      term.options.fontWeight = "400";
+      term.options.fontWeightBold = "700";
+      term.options.scrollback = settings.scrollback;
+      term.options.theme = xtermTheme(settings.theme, terminalBackgroundAlpha);
+      try {
+        fitRef.current?.fit();
+        term.refresh(0, Math.max(0, term.rows - 1));
+      } catch {
+        // fit can throw if the host is display:none mid-unmount
       }
-      primeCursor(termRef.current);
+      if (lastTermSizeRef.current.cols !== term.cols || lastTermSizeRef.current.rows !== term.rows) {
+        lastTermSizeRef.current = { cols: term.cols, rows: term.rows };
+        api.terminalResize(terminal.id, term.cols, term.rows).catch(() => undefined);
+      }
+      primeCursor(term);
       updateTerminalScrollbar();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [settings.fontSize, settings.scrollback, settings.theme, terminal.id, terminalBackgroundAlpha, updateTerminalScrollbar]);
+    };
+    apply();
+    void loadTerminalFont(fontSize).then(apply);
+    const frame = window.requestAnimationFrame(apply);
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frame);
+    };
+  }, [fontSize, settings.scrollback, settings.theme, terminal.id, terminalBackgroundAlpha, updateTerminalScrollbar]);
 
   useEffect(() => {
     if (!active || !hostRef.current || !termRef.current || !fitRef.current) return;
@@ -894,7 +1154,8 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
           ...paneStyle,
           "--xterm-background": terminalBackground,
           "--xterm-cursor-color": terminalCursor,
-          "--xterm-cursor-accent": terminalCursorAccent
+          "--xterm-cursor-accent": terminalCursorAccent,
+          "--terminal-font-size": `${fontSize}px`
         } as CSSProperties
       }
       onMouseDown={() => {
