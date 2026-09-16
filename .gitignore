@@ -3,9 +3,14 @@ node_modules/
 dist/
 release/
 .codex-run/
+.idea/
+.tools/
+.claude/
 
 *.pdb
 *.log
+_cursor_*
+_exe_app.js
 
 .env
 .env.*
@@ -14,5 +19,4 @@ release/
 .DS_Store
 Thumbs.db
 
-.claude/settings.local.json
 screenshot-*.png
