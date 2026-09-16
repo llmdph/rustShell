@@ -230,7 +230,9 @@ fn is_transport_error(error: &anyhow::Error) -> bool {
 }
 
 fn lock_map<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn lock_slot(slot: &Arc<Mutex<SftpSlot>>) -> MutexGuard<'_, SftpSlot> {

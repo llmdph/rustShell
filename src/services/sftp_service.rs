@@ -587,14 +587,7 @@ where
 {
     let session = connect(profile, password)?;
     let sftp = session.sftp().context("failed to start SFTP subsystem")?;
-    upload_with_sftp(
-        &sftp,
-        local_path,
-        remote_dir,
-        conflict,
-        cancel,
-        on_progress,
-    )
+    upload_with_sftp(&sftp, local_path, remote_dir, conflict, cancel, on_progress)
 }
 
 /// Upload over an already-open SFTP channel.
@@ -725,14 +718,7 @@ where
 {
     let session = connect(profile, password)?;
     let sftp = session.sftp().context("failed to start SFTP subsystem")?;
-    download_with_sftp(
-        &sftp,
-        remote_path,
-        local_dir,
-        conflict,
-        cancel,
-        on_progress,
-    )
+    download_with_sftp(&sftp, remote_path, local_dir, conflict, cancel, on_progress)
 }
 
 /// Download over an already-open SFTP channel. See [`upload_with_sftp`].

@@ -22,7 +22,7 @@ use crate::{
             search_local as search_local_impl, FileEntry, LocalPathStats, LocalTextFile,
             TransferConflictStrategy, TransferDirection,
         },
-        terminal::{HostKeyIssue, TerminalModel, TerminalSize, TerminalStatus},
+        terminal::{HostKeyIssue, PumpSignal, TerminalModel, TerminalSize, TerminalStatus},
     },
     services::{
         sftp_pool, sftp_service, ssh,
@@ -38,7 +38,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard,
     },
     thread,
     time::{Duration, Instant},
@@ -76,8 +76,8 @@ const FINISHED_TRANSFER_QUEUE_LIMIT: usize = 50;
 /// Manual refresh passes `force` and skips this. Polling is 15s, so 10s still
 /// feels live without exec-ing on every dock paint.
 const SERVER_STATUS_TTL: Duration = Duration::from_secs(10);
-const APP_ICON_RGBA: &[u8] = include_bytes!("../icons/rustshell-app-icon-64.rgba");
-const APP_ICON_SIZE: u32 = 64;
+const APP_ICON_RGBA: &[u8] = include_bytes!("../icons/rustshell-app-icon-32.rgba");
+const APP_ICON_SIZE: u32 = 32;
 const WEBVIEW2_BROWSER_ARGS: &str =
     "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy";
 
@@ -502,34 +502,6 @@ impl TerminalMetadata {
     }
 }
 
-/// Lets `terminal_send` (and connect) wake the pump the instant the user does
-/// something, so the idle backoff never shows up as input latency.
-#[derive(Default)]
-struct PumpSignal {
-    raised: Mutex<bool>,
-    condvar: Condvar,
-}
-
-impl PumpSignal {
-    fn notify(&self) {
-        *lock_poison_ok(&self.raised) = true;
-        self.condvar.notify_all();
-    }
-
-    /// Blocks until notified or `timeout` elapses, then clears the flag.
-    fn wait(&self, timeout: Duration) {
-        let mut raised = lock_poison_ok(&self.raised);
-        if !*raised {
-            let (guard, _) = self
-                .condvar
-                .wait_timeout(raised, timeout)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            raised = guard;
-        }
-        *raised = false;
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerStatusView {
@@ -546,8 +518,8 @@ struct ServerStatusView {
 #[derive(Default, Clone, Copy)]
 #[allow(non_snake_case)]
 struct FILETIME {
-  dwLowDateTime: u32,
-  dwHighDateTime: u32,
+    dwLowDateTime: u32,
+    dwHighDateTime: u32,
 }
 
 #[repr(C)]
@@ -908,10 +880,7 @@ fn list_terminals(state: State<'_, AppRuntime>) -> Result<Vec<TerminalView>, Str
 }
 
 #[tauri::command]
-async fn terminal_snapshot(
-    terminal_id: String,
-    app: AppHandle,
-) -> Result<TerminalView, String> {
+async fn terminal_snapshot(terminal_id: String, app: AppHandle) -> Result<TerminalView, String> {
     blocking(move || {
         let state = app.state::<AppRuntime>();
         let id = parse_uuid(&terminal_id)?;
@@ -938,10 +907,7 @@ fn terminal_drain(
 }
 
 #[tauri::command]
-async fn duplicate_terminal(
-    terminal_id: String,
-    app: AppHandle,
-) -> Result<TerminalView, String> {
+async fn duplicate_terminal(terminal_id: String, app: AppHandle) -> Result<TerminalView, String> {
     blocking(move || {
         let state = app.state::<AppRuntime>();
         let id = parse_uuid(&terminal_id)?;
@@ -973,10 +939,7 @@ fn load_settings(state: State<'_, AppRuntime>) -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-async fn save_settings(
-    settings: AppSettings,
-    app: AppHandle,
-) -> Result<AppSettings, String> {
+async fn save_settings(settings: AppSettings, app: AppHandle) -> Result<AppSettings, String> {
     blocking(move || {
         let state = app.state::<AppRuntime>();
         let saved = storage::save_settings(&settings).map_err(to_string)?;
@@ -1130,27 +1093,36 @@ async fn remove_local_path(request: LocalRemoveRequest) -> Result<(), String> {
 
 #[tauri::command]
 async fn duplicate_local_path(request: LocalDuplicateRequest) -> Result<String, String> {
-    blocking(move || duplicate_local_path_impl(&request.path, &request.new_name).map_err(to_string)).await
+    blocking(move || duplicate_local_path_impl(&request.path, &request.new_name).map_err(to_string))
+        .await
 }
 
 #[tauri::command]
 async fn copy_local_path(request: LocalCopyRequest) -> Result<String, String> {
-    blocking(move || copy_local_path_impl(&request.path, &request.target_path).map_err(to_string)).await
+    blocking(move || copy_local_path_impl(&request.path, &request.target_path).map_err(to_string))
+        .await
 }
 
 #[tauri::command]
 async fn move_local_path(request: LocalMoveRequest) -> Result<String, String> {
-    blocking(move || move_local_path_impl(&request.path, &request.target_path).map_err(to_string)).await
+    blocking(move || move_local_path_impl(&request.path, &request.target_path).map_err(to_string))
+        .await
 }
 
 #[tauri::command]
 async fn touch_local_path(request: LocalTouchRequest) -> Result<(), String> {
-    blocking(move || touch_local_path_impl(&request.path, request.mtime, request.recursive).map_err(to_string)).await
+    blocking(move || {
+        touch_local_path_impl(&request.path, request.mtime, request.recursive).map_err(to_string)
+    })
+    .await
 }
 
 #[tauri::command]
 async fn chmod_local_path(request: LocalChmodRequest) -> Result<(), String> {
-    blocking(move || chmod_local_path_impl(&request.path, request.mode, request.recursive).map_err(to_string)).await
+    blocking(move || {
+        chmod_local_path_impl(&request.path, request.mode, request.recursive).map_err(to_string)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1170,7 +1142,8 @@ async fn read_local_file_tail(request: LocalReadFileRequest) -> Result<LocalText
 
 #[tauri::command]
 async fn write_local_file(request: LocalWriteFileRequest) -> Result<(), String> {
-    blocking(move || write_local_file_impl(&request.path, &request.content).map_err(to_string)).await
+    blocking(move || write_local_file_impl(&request.path, &request.content).map_err(to_string))
+        .await
 }
 
 #[tauri::command]
@@ -1192,9 +1165,11 @@ async fn list_remote_dir(
     let path = request.path;
     blocking(move || {
         context.run_pooled(|pool| {
-            pool.with_detail(&context.profile, context.password.as_deref(), |connection| {
-                connection.list_dir(&path)
-            })
+            pool.with_detail(
+                &context.profile,
+                context.password.as_deref(),
+                |connection| connection.list_dir(&path),
+            )
         })
     })
     .await
@@ -1208,9 +1183,11 @@ async fn remote_home(
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
         context.run_pooled(|pool| {
-            pool.with_detail(&context.profile, context.password.as_deref(), |connection| {
-                connection.home_dir()
-            })
+            pool.with_detail(
+                &context.profile,
+                context.password.as_deref(),
+                |connection| connection.home_dir(),
+            )
         })
     })
     .await
@@ -1292,20 +1269,17 @@ async fn search_remote(
         ..
     } = request;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.search(&root, &query, max_results.unwrap_or(200))
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.search(&root, &query, max_results.unwrap_or(200)),
+        )
     })
     .await
 }
 
 #[tauri::command]
-async fn upload_file(
-    request: TransferRequest,
-    state: State<'_, AppRuntime>,
-) -> Result<(), String> {
+async fn upload_file(request: TransferRequest, state: State<'_, AppRuntime>) -> Result<(), String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     let TransferRequest {
         local_path,
@@ -1355,11 +1329,11 @@ async fn create_remote_dir(
 ) -> Result<(), String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.create_dir(&request.parent, &request.name)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.create_dir(&request.parent, &request.name),
+        )
     })
     .await
 }
@@ -1371,11 +1345,11 @@ async fn remove_remote_path(
 ) -> Result<(), String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.remove_path(&request.path, request.is_dir, request.recursive)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.remove_path(&request.path, request.is_dir, request.recursive),
+        )
     })
     .await
 }
@@ -1387,11 +1361,11 @@ async fn rename_remote_path(
 ) -> Result<String, String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.rename_path(&request.path, &request.new_name)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.rename_path(&request.path, &request.new_name),
+        )
     })
     .await
 }
@@ -1403,11 +1377,13 @@ async fn duplicate_remote_path(
 ) -> Result<String, String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| {
                 connection.duplicate_path(&request.path, request.is_dir, &request.new_name)
-            })
+            },
+        )
     })
     .await
 }
@@ -1419,11 +1395,11 @@ async fn copy_remote_path(
 ) -> Result<String, String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.copy_path(&request.path, &request.target_path, request.is_dir)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.copy_path(&request.path, &request.target_path, request.is_dir),
+        )
     })
     .await
 }
@@ -1435,11 +1411,11 @@ async fn move_remote_path(
 ) -> Result<String, String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.move_path(&request.path, &request.target_path)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.move_path(&request.path, &request.target_path),
+        )
     })
     .await
 }
@@ -1451,11 +1427,11 @@ async fn chmod_remote_path(
 ) -> Result<(), String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.chmod_path(&request.path, request.mode, request.recursive)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.chmod_path(&request.path, request.mode, request.recursive),
+        )
     })
     .await
 }
@@ -1467,11 +1443,13 @@ async fn chown_remote_path(
 ) -> Result<(), String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| {
                 connection.chown_path(&request.path, request.uid, request.gid, request.recursive)
-            })
+            },
+        )
     })
     .await
 }
@@ -1483,11 +1461,11 @@ async fn touch_remote_path(
 ) -> Result<(), String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.touch_path(&request.path, request.mtime, request.recursive)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.touch_path(&request.path, request.mtime, request.recursive),
+        )
     })
     .await
 }
@@ -1499,11 +1477,11 @@ async fn remote_path_stats(
 ) -> Result<sftp_service::RemotePathStats, String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.path_stats(&request.path)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.path_stats(&request.path),
+        )
     })
     .await
 }
@@ -1515,11 +1493,11 @@ async fn create_remote_file(
 ) -> Result<String, String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.create_file(&request.parent, &request.name)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.create_file(&request.parent, &request.name),
+        )
     })
     .await
 }
@@ -1531,11 +1509,11 @@ async fn create_remote_symlink(
 ) -> Result<String, String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.create_symlink(&request.parent, &request.name, &request.target)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.create_symlink(&request.parent, &request.name, &request.target),
+        )
     })
     .await
 }
@@ -1547,11 +1525,11 @@ async fn read_remote_file(
 ) -> Result<sftp_service::RemoteTextFile, String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.read_text_file(&request.path)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.read_text_file(&request.path),
+        )
     })
     .await
 }
@@ -1563,11 +1541,11 @@ async fn read_remote_file_tail(
 ) -> Result<sftp_service::RemoteTextFile, String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.read_text_file_tail(&request.path)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.read_text_file_tail(&request.path),
+        )
     })
     .await
 }
@@ -1579,11 +1557,11 @@ async fn write_remote_file(
 ) -> Result<(), String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.write_text_file(&request.path, &request.content)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.write_text_file(&request.path, &request.content),
+        )
     })
     .await
 }
@@ -1595,11 +1573,11 @@ async fn remote_file_sha256(
 ) -> Result<String, String> {
     let context = sftp_context(&request.profile_id, request.password.as_deref(), &state)?;
     blocking(move || {
-        context
-            .pool
-            .with(&context.profile, context.password.as_deref(), |connection| {
-                connection.file_sha256(&request.path)
-            })
+        context.pool.with(
+            &context.profile,
+            context.password.as_deref(),
+            |connection| connection.file_sha256(&request.path),
+        )
     })
     .await
 }
@@ -1681,8 +1659,10 @@ fn start_transfer_with_attempts(
             // selection fired 200 concurrent handshakes, which is both slow and
             // liable to trip sshd's MaxStartups and drop transfers at random.
             let result = worker_pool
-                .with(&worker_profile, password.as_deref(), |connection| {
-                    match worker_direction {
+                .with(
+                    &worker_profile,
+                    password.as_deref(),
+                    |connection| match worker_direction {
                         TransferDirection::Upload => sftp_service::upload_with_sftp(
                             connection.sftp(),
                             &worker_local_path,
@@ -1701,8 +1681,8 @@ fn start_transfer_with_attempts(
                             &mut on_progress,
                         )
                         .map(|path| Some(path.display().to_string())),
-                    }
-                })
+                    },
+                )
                 .map_err(anyhow::Error::msg);
 
             let mut guard = lock_poison_ok(&transfer_state);
@@ -1773,10 +1753,7 @@ fn cancel_transfer(transfer_id: String, state: State<'_, AppRuntime>) -> Result<
 }
 
 #[tauri::command]
-async fn retry_transfer(
-    transfer_id: String,
-    app: AppHandle,
-) -> Result<TransferView, String> {
+async fn retry_transfer(transfer_id: String, app: AppHandle) -> Result<TransferView, String> {
     blocking(move || {
         let state = app.state::<AppRuntime>();
         let id = parse_uuid(&transfer_id)?;
@@ -1863,10 +1840,7 @@ fn remove_transfer(
 
 #[tauri::command]
 async fn list_transfer_history() -> Result<Vec<TransferView>, String> {
-    blocking(move || {
-        Ok(storage::load_transfer_history())
-    })
-    .await
+    blocking(move || Ok(storage::load_transfer_history())).await
 }
 
 #[tauri::command]
@@ -1985,7 +1959,7 @@ fn main() {
                 .separator()
                 .text("quit-app", "退出")
                 .build()?;
-            TrayIconBuilder::with_id("rustshell-tray")
+            TrayIconBuilder::with_id("rustshell-tray-v2")
                 .icon(rustshell_window_icon())
                 .tooltip("RustShell 正在后台运行")
                 .menu(&tray_menu)
@@ -2237,7 +2211,8 @@ fn local_server_status() -> ServerStatusView {
         let mut free = 0u64;
         let mut total = 0u64;
         let mut total_free = 0u64;
-        if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut free, &mut total, &mut total_free) } != 0
+        if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut free, &mut total, &mut total_free) }
+            != 0
             && total > 0
         {
             let used = total.saturating_sub(free);
@@ -2305,7 +2280,8 @@ fn windows_cpu_percent() -> Option<f32> {
     let sample = || -> Option<(u64, u64)> {
         let (idle_ft, kernel_ft, user_ft) = win_get_current_cpu().ok()?;
         let idle = (u64::from(idle_ft.dwHighDateTime) << 32) | u64::from(idle_ft.dwLowDateTime);
-        let kernel = (u64::from(kernel_ft.dwHighDateTime) << 32) | u64::from(kernel_ft.dwLowDateTime);
+        let kernel =
+            (u64::from(kernel_ft.dwHighDateTime) << 32) | u64::from(kernel_ft.dwLowDateTime);
         let user = (u64::from(user_ft.dwHighDateTime) << 32) | u64::from(user_ft.dwLowDateTime);
         // Kernel time includes idle on Windows.
         let busy = kernel.saturating_sub(idle).saturating_add(user);
@@ -2370,7 +2346,13 @@ fn launch_terminal(
     } else {
         None
     };
-    let running = TerminalLauncher::spawn(profile.clone(), password, size, local_shell);
+    let running = TerminalLauncher::spawn(
+        profile.clone(),
+        password,
+        size,
+        local_shell,
+        state.terminal_pump.clone(),
+    );
     let mut terminal = TerminalModel::new(profile, size);
     terminal.attach(running);
     let view = snapshot_terminal(&mut terminal);

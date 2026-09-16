@@ -299,7 +299,6 @@ fn authenticate(
     Ok(())
 }
 
-
 fn private_key_appears_encrypted(path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
         return false;

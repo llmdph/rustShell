@@ -931,6 +931,48 @@ export default function App() {
               }
             }
           }}
+          onCreateFile={async (parentPath) => {
+            const name = await promptText("文件名称或相对路径");
+            if (!name) return;
+            try {
+              if (side === "remote" && profile) {
+                await api.createRemoteFile(profile.id, parentPath, name, secret || undefined);
+              } else {
+                await api.createLocalFile(parentPath, name);
+              }
+              pushToast("success", "文件已创建");
+            } catch (error) {
+              pushToast("error", `文件创建失败: ${String(error)}`);
+            }
+          }}
+          onCreateDirectory={async (parentPath) => {
+            const name = await promptText("目录名称或相对路径");
+            if (!name) return;
+            try {
+              if (side === "remote" && profile) {
+                await api.createRemoteDir(profile.id, parentPath, name, secret || undefined);
+              } else {
+                await api.createLocalDir(parentPath, name);
+              }
+              pushToast("success", "目录已创建");
+            } catch (error) {
+              pushToast("error", `创建失败: ${String(error)}`);
+            }
+          }}
+          onRenameEntry={async (entry) => {
+            const name = await promptText("新名称", { defaultValue: entry.name });
+            if (!name || name === entry.name) return;
+            try {
+              if (side === "remote" && profile) {
+                await api.renameRemotePath(profile.id, entry.path, name, secret || undefined);
+              } else {
+                await api.renameLocalPath(entry.path, name);
+              }
+              pushToast("success", "已重命名");
+            } catch (error) {
+              pushToast("error", `重命名失败: ${String(error)}`);
+            }
+          }}
           onCopyText={(options) =>
             copyWithFallback({
               ...options,
@@ -944,7 +986,7 @@ export default function App() {
         />
       );
     },
-    [activeProfile, confirmAction, copyWithFallback, dragOverDockTarget, fileDockHeightByTabId, localPath, profileSecrets, profiles, pushToast, remotePath, transferConflict, transferHistory.length, transfers]
+    [activeProfile, confirmAction, copyWithFallback, dragOverDockTarget, fileDockHeightByTabId, localPath, profileSecrets, profiles, promptText, pushToast, remotePath, transferConflict, transferHistory.length, transfers]
   );
 
   // App exit never prompts. settings.confirmOnExit only gates closing a
@@ -2069,13 +2111,14 @@ export default function App() {
   }, [resolveAppModal]);
 
   useEffect(() => {
+    if (isFileManagerWindow) return;
     window.__rustshellHardExit = () => {
       void hardExitApp();
     };
     return () => {
       delete window.__rustshellHardExit;
     };
-  }, [hardExitApp]);
+  }, [hardExitApp, isFileManagerWindow]);
 
   // If any exit-confirm dialog is injected by unexpected code, remove it and exit.
   useEffect(() => {
@@ -2101,9 +2144,10 @@ export default function App() {
     return () => observer.disconnect();
   }, [hardExitApp]);
 
-  // Belt-and-suspenders: native closeRequested always hard-exits.
+  // Main window close always hard-exits. The file-manager window must only
+  // close itself — it mounts the same App and would otherwise quit everything.
   useEffect(() => {
-    if (!hasTauriRuntime()) return;
+    if (!hasTauriRuntime() || isFileManagerWindow) return;
     let unlisten: (() => void) | null = null;
     void getCurrentWindow()
       .onCloseRequested(async (event) => {
@@ -2117,7 +2161,7 @@ export default function App() {
     return () => {
       unlisten?.();
     };
-  }, [hardExitApp]);
+  }, [hardExitApp, isFileManagerWindow]);
 
   const runWindowAction = async (action: WindowAction) => {
     if (!hasTauriRuntime()) return;
@@ -2125,7 +2169,13 @@ export default function App() {
       const appWindow = getCurrentWindow();
       if (action === "minimize") await appWindow.minimize();
       if (action === "maximize") await appWindow.toggleMaximize();
-      if (action === "close") await hardExitApp();
+      if (action === "close") {
+        if (isFileManagerWindow) {
+          await appWindow.close();
+          return;
+        }
+        await hardExitApp();
+      }
     } catch (error) {
       const message = `窗口操作失败: ${String(error)}`;
       setStatus(message);

@@ -15,7 +15,7 @@ import {
 import {
   Calculator,
   Check,
-  CirclePlus,
+  FilePlus,
   Clock,
   Copy,
   Crosshair,
@@ -128,7 +128,7 @@ export function buildRemoteFilePaneActions(params: RemoteFilePaneActionParams): 
       disabled: !params.canUseRemote || params.compareDiffCount === 0
     },
     { type: "separator" },
-    { label: "新建文件", icon: <CirclePlus size={14} />, onClick: params.onCreateFile, disabled: !params.canUseRemote },
+    { label: "新建文件", icon: <FilePlus size={14} />, onClick: params.onCreateFile, disabled: !params.canUseRemote },
     { label: "新建目录", icon: <FolderPlus size={14} />, onClick: params.onCreateDirectory, disabled: !params.canUseRemote },
     { label: "新建软链接", icon: <Link2 size={14} />, onClick: params.onCreateSymlink, disabled: !params.canUseRemote },
     { type: "separator" },
@@ -189,7 +189,7 @@ export function buildRemoteFilePaneExtraActions(params: RemoteFilePaneExtraActio
         icon={params.showHidden ? <EyeOff size={14} /> : <Eye size={14} />}
         onClick={params.onToggleHidden}
       />
-      <IconButton title="新建文件" icon={<CirclePlus size={14} />} onClick={params.onCreateFile} disabled={!params.canUseRemote} />
+      <IconButton title="新建文件" icon={<FilePlus size={14} />} onClick={params.onCreateFile} disabled={!params.canUseRemote} />
       <IconButton title="搜索" icon={<Search size={14} />} onClick={params.onSearch} disabled={!params.canUseRemote} />
       <IconButton title="下载" icon={<Download size={14} />} onClick={params.onDownload} disabled={params.selectedEntries.length === 0} />
     </>

@@ -28,7 +28,7 @@ export function AppTopbar({
       onMouseDown={onStartWindowDrag}
     >
       <div className="flex w-[138px] flex-none items-center gap-2" data-tauri-drag-region>
-        <img className="block size-7 select-none rounded-[7px] object-contain shadow-[0_0_0_1px_rgba(255,255,255,0.08)]" src="/rustshell-logo.png" alt="" aria-hidden="true" draggable={false} />
+        <img className="block size-7 select-none rounded-[7px] object-contain" src="/rustshell-logo.svg" alt="" aria-hidden="true" draggable={false} />
         <div data-tauri-drag-region>
           <div className="text-[15px] font-bold leading-[1.1]">RustShell</div>
           <div className="text-[10px] font-medium leading-none text-emerald-400">RS-20260812-N</div>

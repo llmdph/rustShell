@@ -270,21 +270,9 @@ function syncTermCaret(term: Terminal) {
   }
 
   const barW = 2;
-  // If xterm did emit a cursor cell, snap to its origin so we cannot drift
-  // from the glyph grid. A collapsed (0-width) span still has a correct origin.
-  const native = screen.querySelector(".xterm-cursor");
-  if (native instanceof HTMLElement) {
-    const screenRect = screen.getBoundingClientRect();
-    const cellRect = native.getBoundingClientRect();
-    if (cellRect.height >= 1) {
-      caret.style.visibility = "visible";
-      caret.style.width = `${barW}px`;
-      caret.style.height = `${cellRect.height}px`;
-      caret.style.transform = `translate(${cellRect.left - screenRect.left}px, ${cellRect.top - screenRect.top}px)`;
-      return;
-    }
-  }
-
+  // Buffer coordinates only. Snapping to the native cursor cell via
+  // getBoundingClientRect forced layout on every keystroke and made the
+  // overlay lag the glyph it is meant to track.
   const buf = term.buffer.active;
   const x = Math.max(0, Math.min(buf.cursorX, cols - 1));
   const y = Math.max(0, Math.min(buf.cursorY, rows - 1));
@@ -426,7 +414,6 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
   const [searchResult, setSearchResult] = useState<TerminalSearchResult>(emptyTerminalSearchResult);
   const sendBufferRef = useRef("");
   const sendScheduledRef = useRef(false);
-  const sendFrameRef = useRef<number | null>(null);
   const drainOutputRef = useRef("");
   const drainWriteFrameRef = useRef<number | null>(null);
   const resizeFrameRef = useRef<number | null>(null);
@@ -631,13 +618,13 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     drainOutputRef.current = "";
     if (!output) return;
     termRef.current?.write(output, () => {
-      if (termRef.current) {
-        try {
-          termRef.current.scrollToBottom();
-        } catch {
-          // ignore
-        }
-        primeCursor(termRef.current);
+      const term = termRef.current;
+      if (!term) return;
+      try {
+        const buf = term.buffer.active;
+        if (buf.viewportY >= buf.baseY) term.scrollToBottom();
+      } catch {
+        // ignore
       }
       updateTerminalScrollbar();
     });
@@ -647,6 +634,13 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     (output: string) => {
       drainOutputRef.current += output;
       if (drainWriteFrameRef.current !== null) return;
+      // Keystroke echo is a handful of bytes. Write it now so the glyph is
+      // not stuck until the next vsync. Larger bursts (cat, logs) still
+      // coalesce on rAF to keep the DOM renderer from falling behind.
+      if (drainOutputRef.current.length <= 128) {
+        flushDrainOutput();
+        return;
+      }
       drainWriteFrameRef.current = window.requestAnimationFrame(flushDrainOutput);
     },
     [flushDrainOutput]
@@ -790,12 +784,10 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
     const cursorDisposable = term.onCursorMove(() => syncTermOverlays(term, selecting));
 
     const flushInput = () => {
-      sendFrameRef.current = null;
       sendScheduledRef.current = false;
-      if (!sendBufferRef.current) return;
       const payload = sendBufferRef.current;
+      if (!payload) return;
       sendBufferRef.current = "";
-      if (disposed) return;
       api.terminalSend(terminal.id, payload).catch(() => undefined);
     };
 
@@ -813,7 +805,9 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       sendBufferRef.current += data;
       if (sendScheduledRef.current) return;
       sendScheduledRef.current = true;
-      sendFrameRef.current = window.requestAnimationFrame(flushInput);
+      // Same-turn coalescing (paste / composed input) without waiting for
+      // vsync. rAF added 0–16ms to every discrete keystroke.
+      queueMicrotask(flushInput);
     });
 
     let selectionPaintFrame = 0;
@@ -979,10 +973,6 @@ export function XtermView({ terminal, settings, active, visible, paneStyle, term
       if (drainWriteFrameRef.current !== null) {
         window.cancelAnimationFrame(drainWriteFrameRef.current);
         drainWriteFrameRef.current = null;
-      }
-      if (sendFrameRef.current !== null) {
-        window.cancelAnimationFrame(sendFrameRef.current);
-        sendFrameRef.current = null;
       }
       drainOutputRef.current = "";
       if (sendBufferRef.current) {

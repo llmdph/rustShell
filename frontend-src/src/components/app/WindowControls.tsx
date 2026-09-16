@@ -29,14 +29,7 @@ export function WindowControls({ onAction }: WindowControlsProps) {
         size="icon"
         className="h-7 w-8 rounded-md text-muted-foreground hover:bg-destructive hover:text-white"
         title="关闭"
-        onClick={() => {
-          // Prefer hard-exit hook so no intermediate confirm path can run.
-          if (typeof window.__rustshellHardExit === "function") {
-            void window.__rustshellHardExit();
-            return;
-          }
-          onAction("close");
-        }}
+        onClick={() => onAction("close")}
       >
         <X size={14} />
       </Button>

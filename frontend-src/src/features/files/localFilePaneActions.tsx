@@ -15,7 +15,7 @@ import {
 import {
   Calculator,
   Check,
-  CirclePlus,
+  FilePlus,
   Clock,
   Copy,
   Crosshair,
@@ -119,7 +119,7 @@ export function buildLocalFilePaneActions(params: LocalFilePaneActionParams): Fi
     },
     { label: "搜索", icon: <Search size={14} />, onClick: params.onSearch, disabled: !canUseLocalPath },
     { type: "separator" },
-    { label: "新建文件", icon: <CirclePlus size={14} />, onClick: params.onCreateFile },
+    { label: "新建文件", icon: <FilePlus size={14} />, onClick: params.onCreateFile },
     { label: "新建目录", icon: <FolderPlus size={14} />, onClick: params.onCreateDirectory },
     { label: "软链接", icon: <Link2 size={14} />, onClick: params.onCreateSymlink, disabled: !canUseLocalPath },
     { type: "separator" },
@@ -183,7 +183,7 @@ export function buildLocalFilePaneExtraActions(params: LocalFilePaneExtraActionP
 
   return (
     <>
-      <IconButton title="新建文件" icon={<CirclePlus size={14} />} onClick={params.onCreateFile} disabled={!hasLocalPath} />
+      <IconButton title="新建文件" icon={<FilePlus size={14} />} onClick={params.onCreateFile} disabled={!hasLocalPath} />
       <IconButton
         title={params.showHidden ? "隐藏隐藏项" : "显示隐藏项"}
         icon={params.showHidden ? <EyeOff size={14} /> : <Eye size={14} />}

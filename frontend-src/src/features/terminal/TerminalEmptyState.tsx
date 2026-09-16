@@ -1,4 +1,4 @@
-import { Cable, CirclePlus, Folder, Monitor } from "lucide-react";
+import { Cable, Folder, Monitor, Plus } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 
@@ -47,7 +47,7 @@ export function TerminalEmptyState({
         <p className="text-[13px] text-muted-foreground">没有打开的会话，从这里开始。</p>
         <div className="grid w-full grid-cols-1 gap-3 min-[561px]:grid-cols-2 min-[901px]:grid-cols-4">
           <Button type="button" variant="outline" className={actionKeyClass} onClick={onCreateProfile}>
-            <CirclePlus size={20} strokeWidth={1.75} className={actionIconClass} />
+            <Plus size={20} strokeWidth={1.75} className={actionIconClass} />
             <span className="text-xs font-medium">新建会话</span>
           </Button>
           <Button type="button" variant="outline" className={actionKeyClass} onClick={onQuickConnect}>

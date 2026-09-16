@@ -1,4 +1,4 @@
-import { ChevronLeft, ChevronRight, CirclePlus } from "lucide-react";
+import { ChevronLeft, ChevronRight, Plus } from "lucide-react";
 
 import type { Profile, ServerStatus } from "@/api";
 import { IconButton } from "@/components/app/IconButton";
@@ -83,7 +83,7 @@ export function SessionSidebar({
                 <div className="flex flex-none items-center gap-1">
                   <IconButton
                     title="新建会话"
-                    icon={<CirclePlus size={14} />}
+                    icon={<Plus size={14} />}
                     className="h-[26px] min-w-[26px] px-0"
                     onClick={onNewProfile}
                   />

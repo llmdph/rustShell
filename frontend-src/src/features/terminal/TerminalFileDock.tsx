@@ -1,9 +1,9 @@
-import { ArrowUp, ChevronDown, ChevronRight, Copy, Download, Folder, FolderOpen, ListChecks, ListX, MoveRight, RefreshCcw, Trash2, Upload, X } from "lucide-react";
+import { ArrowUp, ChevronDown, ChevronRight, Copy, Download, Edit3, FilePlus, Folder, FolderOpen, FolderPlus, ListChecks, ListX, MoveRight, RefreshCcw, Trash2, Upload, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 
 import type { FileEntry } from "@/api";
+import { ActionContextMenu, type FileAction } from "@/components/app/ActionContextMenu";
 import { IconButton } from "@/components/app/IconButton";
-import type { FileAction } from "@/components/app/ActionContextMenu";
 import { Input } from "@/components/ui/input";
 import { FileList } from "@/features/files/FileList";
 import {
@@ -62,6 +62,9 @@ type TerminalFileDockProps = {
   onDownloadEntries?: (entries: FileEntry[], remotePath: string) => void | Promise<void>;
   onUploadEntries?: (entries: FileEntry[], remotePath: string) => void | Promise<void>;
   onRemoveEntries?: (entries: FileEntry[], currentPath: string) => void | Promise<void>;
+  onCreateFile?: (parentPath: string) => void | Promise<void>;
+  onCreateDirectory?: (parentPath: string) => void | Promise<void>;
+  onRenameEntry?: (entry: FileEntry) => void | Promise<void>;
   onTransferEntriesToDirectory?: (entries: DockTransferEntry[], targetPath: string, operation: TreeDropOperation) => void | Promise<void>;
   onCopyText?: (options: { title: string; text: string; onCopied?: () => void }) => Promise<boolean>;
   onOpenTransferQueue?: () => void;
@@ -94,6 +97,22 @@ function rootOf(side: DockSide, path: string): string {
   if (isRemoteSide(side)) return "/";
   const match = /^([a-zA-Z]:)/.exec(path);
   return match ? `${match[1]}\\` : path;
+}
+
+function isDockRoot(side: DockSide, path: string) {
+  if (isRemoteSide(side)) return path === "/";
+  return /^[a-zA-Z]:\\?$/.test(path);
+}
+
+function directoryEntry(path: string, name: string): FileEntry {
+  return {
+    name,
+    path,
+    size: 0,
+    modifiedAt: "",
+    isDir: true,
+    fileType: "directory"
+  };
 }
 
 function nameOf(side: DockSide, path: string): string {
@@ -306,6 +325,9 @@ export function TerminalFileDock({
   onDownloadEntries,
   onUploadEntries,
   onRemoveEntries,
+  onCreateFile,
+  onCreateDirectory,
+  onRenameEntry,
   onTransferEntriesToDirectory,
   onCopyText,
   onOpenTransferQueue,
@@ -491,6 +513,13 @@ export function TerminalFileDock({
     [profileId, side]
   );
 
+  const refreshDock = useCallback(
+    (dirPath = path) => {
+      if (dirPath) void navigate(dirPath);
+    },
+    [navigate, path]
+  );
+
   const contextActions = useMemo<FileAction[]>(
     () => {
       const hasSelection = selectedEntries.length > 0;
@@ -520,6 +549,31 @@ export function TerminalFileDock({
                 if (onUploadEntries) void onUploadEntries(selectedEntries, path);
               }
             },
+        { type: "separator" },
+        {
+          label: "新建文件",
+          icon: <FilePlus size={14} />,
+          disabled: !onCreateFile || !path,
+          onClick: () => {
+            if (onCreateFile) void Promise.resolve(onCreateFile(path)).then(() => refreshDock(path));
+          }
+        },
+        {
+          label: "新建目录",
+          icon: <FolderPlus size={14} />,
+          disabled: !onCreateDirectory || !path,
+          onClick: () => {
+            if (onCreateDirectory) void Promise.resolve(onCreateDirectory(path)).then(() => refreshDock(path));
+          }
+        },
+        {
+          label: selectedEntries.length > 1 ? "批量重命名" : "重命名",
+          icon: <Edit3 size={14} />,
+          disabled: !onRenameEntry || !selected || selectedEntries.length !== 1,
+          onClick: () => {
+            if (selected && onRenameEntry) void Promise.resolve(onRenameEntry(selected)).then(() => refreshDock(path));
+          }
+        },
         { type: "separator" },
         {
           label: "删除",
@@ -576,7 +630,24 @@ export function TerminalFileDock({
         }
       ];
     },
-    [copyDockText, navigate, onDownloadEntries, onRemoveEntries, onUploadEntries, openEntry, path, removeSelectedEntries, selected, selectedEntries, side, sortedEntries]
+    [
+      copyDockText,
+      navigate,
+      onCreateDirectory,
+      onCreateFile,
+      onDownloadEntries,
+      onRemoveEntries,
+      onRenameEntry,
+      onUploadEntries,
+      openEntry,
+      path,
+      refreshDock,
+      removeSelectedEntries,
+      selected,
+      selectedEntries,
+      side,
+      sortedEntries
+    ]
   );
 
   const loadNodeChildren = useCallback(
@@ -592,6 +663,115 @@ export function TerminalFileDock({
     },
     [listDir, sessionStatus, side]
   );
+
+  const treeMenuNodeRef = useRef<DockNode | null>(null);
+
+  const treeContextActions = useCallback((): FileAction[] => {
+    const node = treeMenuNodeRef.current;
+    const targetPath = node?.path ?? path;
+    const root = !targetPath || isDockRoot(side, targetPath);
+    const folder = node ? directoryEntry(node.path, node.name) : null;
+    const refreshTarget = () => {
+      if (targetPath) void navigate(targetPath);
+      if (node) void loadNodeChildren(node);
+      else if (path) void navigate(path);
+    };
+    return [
+      {
+        label: "打开",
+        icon: <FolderOpen size={14} />,
+        disabled: !targetPath,
+        onClick: () => {
+          if (targetPath) void navigate(targetPath);
+        }
+      },
+      side === "remote"
+        ? {
+            label: "下载到本地",
+            icon: <Download size={14} />,
+            disabled: !onDownloadEntries || !folder,
+            onClick: () => {
+              if (folder && onDownloadEntries) void onDownloadEntries([folder], path);
+            }
+          }
+        : {
+            label: "上传到远程",
+            icon: <Upload size={14} />,
+            disabled: !onUploadEntries || !folder,
+            onClick: () => {
+              if (folder && onUploadEntries) void onUploadEntries([folder], path);
+            }
+          },
+      { type: "separator" },
+      {
+        label: "新建文件",
+        icon: <FilePlus size={14} />,
+        disabled: !onCreateFile || !targetPath,
+        onClick: () => {
+          if (onCreateFile && targetPath) void Promise.resolve(onCreateFile(targetPath)).then(refreshTarget);
+        }
+      },
+      {
+        label: "新建目录",
+        icon: <FolderPlus size={14} />,
+        disabled: !onCreateDirectory || !targetPath,
+        onClick: () => {
+          if (onCreateDirectory && targetPath) void Promise.resolve(onCreateDirectory(targetPath)).then(refreshTarget);
+        }
+      },
+      {
+        label: "重命名",
+        icon: <Edit3 size={14} />,
+        disabled: !onRenameEntry || !folder || root,
+        onClick: () => {
+          if (folder && onRenameEntry) void Promise.resolve(onRenameEntry(folder)).then(refreshTarget);
+        }
+      },
+      { type: "separator" },
+      {
+        label: "删除",
+        icon: <Trash2 size={14} />,
+        disabled: !onRemoveEntries || !folder || root,
+        danger: true,
+        onClick: () => {
+          if (folder && onRemoveEntries) {
+            void Promise.resolve(onRemoveEntries([folder], path)).then(() => {
+              const parent = parentPath(side, folder.path);
+              if (parent) void navigate(parent);
+              else if (path) void navigate(path);
+            });
+          }
+        }
+      },
+      { type: "separator" },
+      {
+        label: "复制路径",
+        icon: <Copy size={14} />,
+        disabled: !targetPath,
+        onClick: () => {
+          if (targetPath) void copyDockText("复制路径", targetPath);
+        }
+      },
+      {
+        label: "刷新",
+        icon: <RefreshCcw size={14} />,
+        disabled: !targetPath,
+        onClick: refreshTarget
+      }
+    ];
+  }, [
+    copyDockText,
+    loadNodeChildren,
+    navigate,
+    onCreateDirectory,
+    onCreateFile,
+    onDownloadEntries,
+    onRemoveEntries,
+    onRenameEntry,
+    onUploadEntries,
+    path,
+    side
+  ]);
 
   const toggleNode = useCallback(
     (node: DockNode) => {
@@ -788,6 +968,9 @@ export function TerminalFileDock({
         style={{ paddingLeft: `${4 + depth * 12}px` }}
         title={node.path}
         onClick={() => void navigate(node.path)}
+        onContextMenu={() => {
+          treeMenuNodeRef.current = node;
+        }}
         onDragOver={(event) => handleTreeNodeDragOver(node, event)}
         onDragLeave={(event) => handleTreeNodeDragLeave(node, event)}
         onDrop={(event) => {
@@ -877,16 +1060,23 @@ export function TerminalFileDock({
         <IconButton className="h-6 w-6 min-w-6 p-0" title="关闭文件区" icon={<X size={13} />} onClick={onClose} />
       </div>
       <div className="grid min-h-0 flex-1 grid-cols-[200px_minmax(0,1fr)] overflow-hidden">
-        <div
-          data-scroll-container
-          className={cn(
-            "min-h-0 overflow-auto border-r bg-muted/20 p-1",
-            internalDragActive && onTransferEntriesToDirectory && "bg-sky-500/[0.04]"
-          )}
-          onDragLeave={handleTreePaneDragLeave}
-        >
-          {tree ? renderNode(tree, 0) : <div className="p-2 text-xs text-muted-foreground">目录树加载中...</div>}
-        </div>
+        <ActionContextMenu actions={treeContextActions}>
+          <div
+            data-scroll-container
+            className={cn(
+              "min-h-0 overflow-auto border-r bg-muted/20 p-1",
+              internalDragActive && onTransferEntriesToDirectory && "bg-sky-500/[0.04]"
+            )}
+            onContextMenu={(event) => {
+              if (!(event.target instanceof Element) || !event.target.closest("button")) {
+                treeMenuNodeRef.current = null;
+              }
+            }}
+            onDragLeave={handleTreePaneDragLeave}
+          >
+            {tree ? renderNode(tree, 0) : <div className="p-2 text-xs text-muted-foreground">目录树加载中...</div>}
+          </div>
+        </ActionContextMenu>
         <div className="relative min-h-0 overflow-hidden">
           {error ? (
             <div

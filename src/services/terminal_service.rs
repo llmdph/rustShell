@@ -1,6 +1,6 @@
 use crate::core::{
     session::{AuthProfile, SessionProfile, SessionProtocol},
-    terminal::{RunningTerminal, TerminalCommand, TerminalEvent, TerminalSize},
+    terminal::{PumpSignal, RunningTerminal, TerminalCommand, TerminalEvent, TerminalSize},
 };
 use crate::services::ssh::{self, ConnectFailure};
 use anyhow::{Context, Result};
@@ -9,9 +9,29 @@ use portable_pty::{CommandBuilder, PtySize};
 use ssh2::{ErrorCode, PtyModeOpcode, PtyModes};
 use std::{
     io::{ErrorKind, Read, Write},
+    sync::Arc,
     thread,
     time::Duration,
 };
+
+/// Forwards worker events to the pump and wakes it so echo is not stuck
+/// behind the idle backoff that `terminal_send` often races ahead of.
+#[derive(Clone)]
+struct EventSink {
+    tx: Sender<TerminalEvent>,
+    pump: Arc<PumpSignal>,
+}
+
+impl EventSink {
+    fn send(
+        &self,
+        event: TerminalEvent,
+    ) -> Result<(), crossbeam_channel::SendError<TerminalEvent>> {
+        self.tx.send(event)?;
+        self.pump.notify();
+        Ok(())
+    }
+}
 
 pub struct TerminalLauncher;
 
@@ -21,12 +41,14 @@ impl TerminalLauncher {
         password: Option<String>,
         size: TerminalSize,
         local_shell: Option<String>,
+        pump: Arc<PumpSignal>,
     ) -> RunningTerminal {
         let (command_tx, command_rx) = unbounded();
         // Unbounded: a 64-slot bound blocked the PTY/SSH reader on key-repeat
         // echo, the socket window froze, and the next write marked the session
         // failed. The pump drains up to 1024 events per tick.
-        let (event_tx, event_rx) = unbounded();
+        let (raw_tx, event_rx) = unbounded();
+        let event_tx = EventSink { tx: raw_tx, pump };
 
         let worker_event_tx = event_tx.clone();
         if let Err(error) = thread::Builder::new()
@@ -44,13 +66,7 @@ impl TerminalLauncher {
                         // Prefer the in-process SSH stack for every auth mode so
                         // key-file sessions stay inside the app instead of
                         // popping OpenSSH/OpenSSL passphrase consoles.
-                        run_ssh_shell(
-                            profile,
-                            password,
-                            size,
-                            command_rx,
-                            worker_event_tx.clone(),
-                        )
+                        run_ssh_shell(profile, password, size, command_rx, worker_event_tx.clone())
                     }
                     SessionProtocol::SftpOnly | SessionProtocol::Serial => {
                         run_placeholder(profile, command_rx, worker_event_tx.clone())
@@ -78,7 +94,7 @@ impl TerminalLauncher {
 fn run_placeholder(
     profile: SessionProfile,
     command_rx: Receiver<TerminalCommand>,
-    event_tx: Sender<TerminalEvent>,
+    event_tx: EventSink,
 ) -> Result<()> {
     event_tx.send(TerminalEvent::Connected).ok();
     let message = match profile.protocol {
@@ -113,7 +129,7 @@ fn run_local_shell(
     local_shell: Option<String>,
     size: TerminalSize,
     command_rx: Receiver<TerminalCommand>,
-    event_tx: Sender<TerminalEvent>,
+    event_tx: EventSink,
 ) -> Result<()> {
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
@@ -221,7 +237,7 @@ fn run_ssh_shell(
     password: Option<String>,
     size: TerminalSize,
     command_rx: Receiver<TerminalCommand>,
-    event_tx: Sender<TerminalEvent>,
+    event_tx: EventSink,
 ) -> Result<()> {
     match establish_ssh_session(&profile, password.as_deref(), &event_tx)? {
         Some(session) => run_ssh_channel(session, size, command_rx, event_tx),
@@ -232,7 +248,7 @@ fn run_ssh_shell(
 fn establish_ssh_session(
     profile: &SessionProfile,
     password: Option<&str>,
-    event_tx: &Sender<TerminalEvent>,
+    event_tx: &EventSink,
 ) -> Result<Option<ssh2::Session>> {
     match ssh::establish(profile, password) {
         Ok(session) => Ok(Some(session)),
@@ -309,7 +325,7 @@ fn run_ssh_channel(
     session: ssh2::Session,
     size: TerminalSize,
     command_rx: Receiver<TerminalCommand>,
-    event_tx: Sender<TerminalEvent>,
+    event_tx: EventSink,
 ) -> Result<()> {
     let mut channel = session
         .channel_session()
@@ -397,7 +413,7 @@ fn apply_ssh_command(
     channel: &mut ssh2::Channel,
     command: TerminalCommand,
     outgoing: &mut Vec<u8>,
-    event_tx: &Sender<TerminalEvent>,
+    event_tx: &EventSink,
 ) -> Result<bool> {
     match command {
         TerminalCommand::Write(bytes) => {
@@ -451,7 +467,7 @@ fn ssh_poll_interval(idle_rounds: u32) -> Duration {
 fn write_ssh_all(
     channel: &mut ssh2::Channel,
     mut bytes: &[u8],
-    event_tx: &Sender<TerminalEvent>,
+    event_tx: &EventSink,
 ) -> Result<()> {
     let mut incoming = [0_u8; 16 * 1024];
     while !bytes.is_empty() {
@@ -479,7 +495,6 @@ fn write_ssh_all(
     channel.flush().ok();
     Ok(())
 }
-
 
 fn is_would_block(error: &std::io::Error) -> bool {
     matches!(

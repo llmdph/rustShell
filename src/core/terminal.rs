@@ -2,7 +2,10 @@ use crate::core::session::{SessionProfile, SessionProtocol};
 use crossbeam_channel::{Receiver, Sender};
 use encoding_rs::{CoderResult, Decoder, Encoding, UTF_8};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Condvar, Mutex},
+    time::Duration,
+};
 use uuid::Uuid;
 
 const TERMINAL_REPLAY_CAP: usize = 1024 * 1024;
@@ -166,6 +169,43 @@ pub struct TerminalHandle {
 pub struct RunningTerminal {
     pub command_tx: Sender<TerminalCommand>,
     pub event_rx: Receiver<TerminalEvent>,
+}
+
+/// Wakes the output pump the moment a worker has bytes (or a status change)
+/// to drain. `terminal_send` also notifies so a keystroke is not stuck behind
+/// idle backoff; that wake often races ahead of PTY echo, so workers must
+/// notify again when the echo actually lands.
+#[derive(Default)]
+pub struct PumpSignal {
+    raised: Mutex<bool>,
+    condvar: Condvar,
+}
+
+impl PumpSignal {
+    pub fn notify(&self) {
+        let mut raised = self
+            .raised
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *raised = true;
+        self.condvar.notify_all();
+    }
+
+    /// Blocks until notified or `timeout` elapses, then clears the flag.
+    pub fn wait(&self, timeout: Duration) {
+        let mut raised = self
+            .raised
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*raised {
+            let (guard, _) = self
+                .condvar
+                .wait_timeout(raised, timeout)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            raised = guard;
+        }
+        *raised = false;
+    }
 }
 
 /// In-memory backend-side terminal model used by Tauri commands. It keeps a
@@ -573,7 +613,10 @@ mod tests {
     fn stream_decoder_keeps_sgr_escape() {
         let mut decoder = terminal_encoding("UTF-8").new_decoder();
         let text = decode_terminal_stream(&mut decoder, b"\x1b[32mgreen\x1b[0m");
-        assert!(text.contains('\u{1b}'), "ANSI ESC must reach xterm: {text:?}");
+        assert!(
+            text.contains('\u{1b}'),
+            "ANSI ESC must reach xterm: {text:?}"
+        );
         assert_eq!(text, "\u{1b}[32mgreen\u{1b}[0m");
     }
 
@@ -592,7 +635,10 @@ mod tests {
     fn osc_scan_buffer_reassembles_sequence_split_across_chunks() {
         let mut terminal = TerminalModel::new(SessionProfile::new_local(), TerminalSize::default());
 
-        assert_eq!(terminal.detect_current_directory(b"\x1b]7;file:///srv"), None);
+        assert_eq!(
+            terminal.detect_current_directory(b"\x1b]7;file:///srv"),
+            None
+        );
         assert_eq!(
             terminal.detect_current_directory(b"/app\x07$ "),
             Some("/srv/app".to_owned())
@@ -618,5 +664,17 @@ mod tests {
 
         assert_eq!(decode_terminal_stream(&mut decoder, &bytes[..1]), "");
         assert_eq!(decode_terminal_stream(&mut decoder, &bytes[1..]), "中");
+    }
+
+    #[test]
+    fn pump_signal_notify_unblocks_wait() {
+        let signal = std::sync::Arc::new(PumpSignal::default());
+        let waiter = signal.clone();
+        let thread = std::thread::spawn(move || {
+            waiter.wait(Duration::from_millis(500));
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        signal.notify();
+        thread.join().expect("pump waiter should unblock on notify");
     }
 }
