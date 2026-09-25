@@ -20,7 +20,7 @@ use crate::{
             local_read_text_file_tail as read_local_file_tail_impl,
             local_remove as remove_local_path_impl, local_rename as rename_local_path_impl,
             local_touch as touch_local_path_impl, local_write_text_file as write_local_file_impl,
-            search_local as search_local_impl, DirListing, FileEntry, FileSearchResult, LocalPathStats,
+            search_local as search_local_impl, sort_entries_by_folded_text, DirListing, FileEntry, FileSearchResult, LocalPathStats,
             LocalTextFile, TransferConflictStrategy, TransferDirection, DIR_ENTRY_LIMIT,
         },
         terminal::{decode_pending, HostKeyIssue, TerminalModel, TerminalSize, TerminalStatus},
@@ -2210,7 +2210,7 @@ done
             break;
         }
     }
-    entries.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+    sort_entries_by_folded_text(&mut entries, |entry| entry.name.as_str());
     Ok(DirListing { entries, truncated })
 }
 

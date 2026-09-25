@@ -109,7 +109,7 @@ pub fn list_local_dir(path: &str) -> std::io::Result<DirListing> {
         entries.push(local_entry_from_path(path, metadata));
     }
 
-    entries.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+    sort_entries_by_folded_text(&mut entries, |entry| entry.name.as_str());
     Ok(DirListing { entries, truncated })
 }
 
@@ -137,12 +137,26 @@ pub fn search_local(
         &mut incomplete,
         &mut limited,
     )?;
-    output.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+    sort_entries_by_folded_text(&mut output, |entry| entry.name.as_str());
     Ok(FileSearchResult {
         entries: output,
         incomplete,
         limited,
     })
+}
+
+/// Directories first, then case-insensitive text. The folded text is built
+/// once; sorting by a fresh lowercase copy on every comparison is much slower
+/// on a large folder.
+pub(crate) fn sort_entries_by_folded_text(entries: &mut Vec<FileEntry>, text: impl Fn(&FileEntry) -> &str) {
+    let mut decorated = Vec::with_capacity(entries.len());
+    for entry in entries.drain(..) {
+        let rank = !entry.is_dir;
+        let folded = text(&entry).to_lowercase();
+        decorated.push((rank, folded, entry));
+    }
+    decorated.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    entries.extend(decorated.into_iter().map(|(_, _, entry)| entry));
 }
 
 pub fn local_home() -> String {
@@ -1128,6 +1142,30 @@ mod tests {
         assert!(!local_reveal_selects_item(&target));
         assert!(local_reveal_selects_item(&link));
         assert!(local_reveal_selects_item(&root.join("missing.txt")));
+    }
+
+    #[test]
+    fn large_folder_sort_keeps_directories_first_without_rebuilding_names() {
+        let names = ["b", "A", "c", "Dir"];
+        let dirs = [false, false, false, true];
+        let mut entries = Vec::new();
+        for (name, is_dir) in names.into_iter().zip(dirs) {
+            entries.push(FileEntry {
+                name: name.to_owned(),
+                path: name.to_owned(),
+                size: 0,
+                modified_at: chrono::Utc::now(),
+                is_dir,
+                file_type: if is_dir { "directory" } else { "file" }.to_owned(),
+                link_target: None,
+                permissions: None,
+                uid: None,
+                gid: None,
+            });
+        }
+        sort_entries_by_folded_text(&mut entries, |entry| entry.name.as_str());
+        let ordered: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(ordered, ["Dir", "A", "b", "c"]);
     }
 
     #[cfg(windows)]

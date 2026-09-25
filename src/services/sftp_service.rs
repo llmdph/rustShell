@@ -1,7 +1,7 @@
 use crate::core::{
     session::SessionProfile,
     sftp::{
-        local_path_is_link, path_contains_query, remote_child_path, remote_parent_path, text_contains_query,
+        local_path_is_link, path_contains_query, remote_child_path, remote_parent_path, sort_entries_by_folded_text, text_contains_query,
         DirListing,
         FileEntry, FileSearchResult,
         TransferConflictStrategy, DIR_ENTRY_LIMIT,
@@ -173,7 +173,7 @@ impl SftpConnection {
             &mut incomplete,
             &mut limited,
         )?;
-        output.sort_by_key(|entry| (!entry.is_dir, entry.path.to_lowercase()));
+        sort_entries_by_folded_text(&mut output, |entry| entry.path.as_str());
         Ok(FileSearchResult {
             entries: output,
             incomplete,
@@ -609,7 +609,7 @@ fn list_with_sftp(sftp: &ssh2::Sftp, path: &str) -> Result<DirListing> {
         entries.push(entry_from_stat(sftp, path_buf, stat));
     }
 
-    entries.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+    sort_entries_by_folded_text(&mut entries, |entry| entry.name.as_str());
     Ok(DirListing { entries, truncated })
 }
 
