@@ -1113,6 +1113,7 @@ where
                 cancel,
                 conflict,
                 &mut on_progress,
+                true,
             )
             .context("failed to download directory")?;
             preserve_local_permissions(&local_path, stat.perm);
@@ -1735,20 +1736,19 @@ fn download_dir_recursive<F>(
     cancel: Arc<AtomicBool>,
     conflict: TransferConflictStrategy,
     on_progress: &mut F,
+    fail_if_unreadable: bool,
 ) -> Result<()>
 where
     F: FnMut(u64, u64),
 {
     let mut directories = Vec::new();
     let mut files = Vec::new();
-    let mut failure = None;
-    visit_remote_entries(sftp, Path::new(remote_dir), None, |remote_path, stat| {
+    let visited = visit_remote_entries(sftp, Path::new(remote_dir), None, |remote_path, stat| {
         if cancel.load(Ordering::Relaxed) {
             return false;
         }
         let Some(name) = remote_path.file_name() else {
-            failure = Some(anyhow!("remote file name is missing"));
-            return false;
+            return true;
         };
         let local_path = local_dir.join(name);
         if stat.file_type().is_symlink() {
@@ -1765,9 +1765,15 @@ where
             files.push((remote_path, local_path, false));
         }
         true
-    })?;
-    if let Some(error) = failure {
-        return Err(error);
+    });
+    if let Err(error) = visited {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("transfer cancelled");
+        }
+        if fail_if_unreadable {
+            return Err(error);
+        }
+        return Ok(());
     }
     if cancel.load(Ordering::Relaxed) {
         bail!("transfer cancelled");
@@ -1808,7 +1814,11 @@ where
         }
         let local_path = resolve_local_path(&local_path, conflict)?;
         if !open_local_download_dir(&local_path, conflict)? {
-            let skipped = remote_total_size(sftp, Path::new(&remote_child), &cancel)?;
+            let skipped = match remote_total_size(sftp, Path::new(&remote_child), &cancel) {
+                Ok(size) => size,
+                Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
+                Err(_) => 0,
+            };
             note_skipped_bytes(transferred, total, skipped, on_progress);
             continue;
         }
@@ -1821,6 +1831,7 @@ where
             cancel.clone(),
             conflict,
             on_progress,
+            false,
         )?;
         preserve_local_permissions(&local_path, perm);
         preserve_local_times(&local_path, atime, mtime);
@@ -1899,7 +1910,11 @@ fn remote_total_size(sftp: &ssh2::Sftp, path: &Path, cancel: &AtomicBool) -> Res
         bail!("transfer cancelled");
     }
     for child in directories {
-        total += remote_total_size(sftp, &child, cancel)?;
+        match remote_total_size(sftp, &child, cancel) {
+            Ok(size) => total += size,
+            Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
+            Err(_) => continue,
+        }
     }
     Ok(total)
 }
