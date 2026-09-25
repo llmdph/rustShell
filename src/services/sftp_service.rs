@@ -918,7 +918,7 @@ where
     on_progress(transferred, total);
     if root_metadata
         .as_ref()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
+        .is_some_and(|metadata| local_path_is_link(local_path, metadata))
     {
         upload_symlink(
             sftp,
