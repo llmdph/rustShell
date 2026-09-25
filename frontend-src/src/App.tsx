@@ -2573,17 +2573,54 @@ export default function App() {
     const failures: string[] = [];
     let renamed = 0;
     let lastPath: string | null = null;
-    for (const item of items) {
+    const caseInsensitive = batchRenameSide === "local";
+    const ordered = orderBatchRenames(items, caseInsensitive);
+    const renameTo = async (path: string, newName: string) => {
+      if (batchRenameSide === "local") {
+        await api.renameLocalPath(path, newName);
+        return joinLocalPath(parentPathForSide("local", path), newName);
+      }
+      return api.renameRemotePath(activeProfile!.id, path, newName, passwordForActive);
+    };
+
+    const parked: Array<{ item: BatchRenamePlanItem; path: string; tempName: string }> = [];
+    for (const item of ordered) {
+      if (!item.needsTemp) continue;
+      const tempName = `.${Date.now()}-${parked.length}-${Math.floor(Math.random() * 1_000_000)}.rename-tmp`;
       try {
-        if (batchRenameSide === "local") {
-          await api.renameLocalPath(item.entry.path, item.newName);
-          lastPath = joinLocalPath(parentPathForSide("local", item.entry.path), item.newName);
-        } else {
-          lastPath = await api.renameRemotePath(activeProfile!.id, item.entry.path, item.newName, passwordForActive);
-        }
+        const path = await renameTo(item.entry.path, tempName);
+        parked.push({ item, path, tempName });
+      } catch (error) {
+        failures.push(`${item.entry.name} -> ${item.newName}: ${String(error)}`);
+      }
+    }
+
+    for (const item of ordered) {
+      if (item.needsTemp) continue;
+      try {
+        lastPath = await renameTo(item.entry.path, item.newName);
         renamed += 1;
       } catch (error) {
         failures.push(`${item.entry.name} -> ${item.newName}: ${String(error)}`);
+      }
+    }
+
+    for (const parkedItem of parked) {
+      try {
+        lastPath = await renameTo(parkedItem.path, parkedItem.item.newName);
+        renamed += 1;
+      } catch (error) {
+        let restored = false;
+        try {
+          await renameTo(parkedItem.path, parkedItem.item.entry.name);
+          restored = true;
+        } catch {
+          restored = false;
+        }
+        const detail = restored
+          ? String(error)
+          : `${String(error)} (${parkedItem.tempName})`;
+        failures.push(`${parkedItem.item.entry.name} -> ${parkedItem.item.newName}: ${detail}`);
       }
     }
 
@@ -8028,23 +8065,33 @@ function BatchRenameDialog({
 }) {
   const numberConfig = useMemo(() => batchRenameNumberConfig(numberStart, numberPadding), [numberPadding, numberStart]);
   const preview = useMemo(() => {
-    const selectedNames = new Set(entries.map((entry) => entry.name));
-    const existingNames = new Set(existingEntries.map((entry) => entry.name));
+    const caseInsensitive = side === "local";
     const rows = entries.map((entry, index) => ({
       entry,
       newName: batchRenameName(entry, index, { find, replace, prefix, suffix, preserveExtension, caseSensitive, ...numberConfig })
     }));
     const counts = new Map<string, number>();
-    rows.forEach((row) => counts.set(row.newName, (counts.get(row.newName) ?? 0) + 1));
+    const leaving = new Set<string>();
+    for (const row of rows) {
+      const oldKey = batchNameKey(row.entry.name, caseInsensitive);
+      const newKey = batchNameKey(row.newName, caseInsensitive);
+      counts.set(newKey, (counts.get(newKey) ?? 0) + 1);
+      if (oldKey !== newKey) leaving.add(oldKey);
+    }
+    const stableNames = new Set<string>();
+    for (const entry of existingEntries) {
+      const key = batchNameKey(entry.name, caseInsensitive);
+      if (!leaving.has(key)) stableNames.add(key);
+    }
     return rows.map((row) => {
-      const issue = batchRenameIssue(row.entry, row.newName, counts, existingNames, selectedNames);
+      const issue = batchRenameIssue(row.entry, row.newName, counts, stableNames, caseInsensitive);
       return {
         ...row,
         changed: row.newName !== row.entry.name,
         issue
       };
     });
-  }, [caseSensitive, entries, existingEntries, find, numberConfig, prefix, preserveExtension, replace, suffix]);
+  }, [caseSensitive, entries, existingEntries, find, numberConfig, prefix, preserveExtension, replace, side, suffix]);
   const plan = preview.filter((row) => row.changed && !row.issue).map((row) => ({ entry: row.entry, newName: row.newName }));
   const issues = preview.filter((row) => row.issue).length;
   const numberIssue = numberConfig.invalid ? "编号起始需为 0-999999，位数需为 0-12" : "";
@@ -9261,19 +9308,47 @@ function batchRenameNumberConfig(start: string, padding: string) {
   };
 }
 
+function batchNameKey(name: string, caseInsensitive: boolean) {
+  return caseInsensitive ? name.toLowerCase() : name;
+}
+
+function orderBatchRenames(items: BatchRenamePlanItem[], caseInsensitive: boolean) {
+  const nodes = items.map((item) => ({ ...item, needsTemp: false }));
+  const byOld = new Map(nodes.map((item) => [batchNameKey(item.entry.name, caseInsensitive), item]));
+  const visiting = new Set<string>();
+  const done = new Set<string>();
+  const order: Array<BatchRenamePlanItem & { needsTemp: boolean }> = [];
+  const visit = (item: BatchRenamePlanItem & { needsTemp: boolean }) => {
+    const key = batchNameKey(item.entry.name, caseInsensitive);
+    if (done.has(key)) return;
+    if (visiting.has(key)) {
+      item.needsTemp = true;
+      return;
+    }
+    visiting.add(key);
+    const next = byOld.get(batchNameKey(item.newName, caseInsensitive));
+    if (next && next !== item) visit(next);
+    visiting.delete(key);
+    done.add(key);
+    order.push(item);
+  };
+  for (const item of nodes) visit(item);
+  return order;
+}
+
 function batchRenameIssue(
   entry: FileEntry,
   newName: string,
   targetCounts: Map<string, number>,
-  existingNames: Set<string>,
-  selectedNames: Set<string>
+  stableNames: Set<string>,
+  caseInsensitive: boolean
 ) {
   if (!newName) return "名称为空";
   if (/[\\/]/.test(newName)) return "包含路径分隔符";
   if (newName === "." || newName === "..") return "名称不可用";
-  if ((targetCounts.get(newName) ?? 0) > 1) return "目标重名";
-  if (newName !== entry.name && selectedNames.has(newName)) return "占用原名称";
-  if (newName !== entry.name && existingNames.has(newName) && !selectedNames.has(newName)) return "已存在";
+  const key = batchNameKey(newName, caseInsensitive);
+  if ((targetCounts.get(key) ?? 0) > 1) return "目标重名";
+  if (key !== batchNameKey(entry.name, caseInsensitive) && stableNames.has(key)) return "已存在";
   return "";
 }
 
