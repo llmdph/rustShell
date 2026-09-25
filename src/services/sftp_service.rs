@@ -1,6 +1,9 @@
 use crate::core::{
     session::SessionProfile,
-    sftp::{remote_child_path, remote_parent_path, FileEntry, TransferConflictStrategy},
+    sftp::{
+        local_path_is_link, remote_child_path, remote_parent_path, FileEntry,
+        TransferConflictStrategy,
+    },
 };
 use crate::services::ssh;
 use anyhow::{anyhow, bail, Context, Result};
@@ -1276,7 +1279,7 @@ where
         let remote_name = entry.file_name().to_string_lossy().to_string();
         let metadata = fs::symlink_metadata(&local_path)
             .with_context(|| format!("failed to stat {}", local_path.display()))?;
-        if metadata.file_type().is_symlink() {
+        if local_path_is_link(&local_path, &metadata) {
             let remote_path = resolve_remote_child_path(sftp, remote_dir, &remote_name, conflict)?;
             upload_symlink(
                 sftp,
@@ -1548,7 +1551,7 @@ fn local_total_size(path: &Path, cancel: &AtomicBool) -> Result<u64> {
     }
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
+    if local_path_is_link(path, &metadata) {
         return Ok(0);
     }
     if metadata.is_file() {

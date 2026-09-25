@@ -206,7 +206,7 @@ pub fn local_duplicate(path: &str, new_name: &str) -> std::io::Result<String> {
     }
 
     let metadata = fs::symlink_metadata(&source)?;
-    if metadata.file_type().is_symlink() {
+    if local_path_is_link(&source, &metadata) {
         copy_local_symlink(&source, &target)?;
     } else if metadata.is_dir() {
         copy_dir_recursive(&source, &target)?;
@@ -390,7 +390,7 @@ pub fn local_file_sha256(path: &str) -> std::io::Result<String> {
 
 fn touch_path(path: &Path, file_time: FileTime, recursive: bool) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
+    if local_path_is_link(path, &metadata) {
         return Ok(());
     }
     set_file_mtime(path, file_time)?;
@@ -409,7 +409,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 fn chmod_path(path: &Path, mode: u32, recursive: bool) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
+    if local_path_is_link(path, &metadata) {
         return Ok(());
     }
     set_local_permissions(path, mode)?;
@@ -424,7 +424,7 @@ fn chmod_path(path: &Path, mode: u32, recursive: bool) -> std::io::Result<()> {
 
 fn collect_local_path_stats(path: &Path, stats: &mut LocalPathStats) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+    if metadata.is_dir() && !local_path_is_link(path, &metadata) {
         stats.dir_count += 1;
         for entry in fs::read_dir(path)? {
             let entry = entry?;
@@ -456,11 +456,12 @@ fn search_local_recursive(
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
+        let walk = metadata.is_dir() && !local_path_is_link(&path, &metadata);
         let file_entry = local_entry_from_path(path.clone(), metadata);
         if entry_matches_query(&file_entry, query) {
             output.push(file_entry.clone());
         }
-        if file_entry.is_dir && file_entry.file_type != "symlink" {
+        if walk {
             let _ = search_local_recursive(&path, query, max_results, output);
         }
     }
@@ -609,15 +610,14 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> std::io::Result<()> {
         let entry = entry?;
         let child_source = entry.path();
         let child_target = target.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
+        let child_metadata = fs::symlink_metadata(&child_source)?;
+        if local_path_is_link(&child_source, &child_metadata) {
             copy_local_symlink(&child_source, &child_target)?;
-        } else if file_type.is_dir() {
+        } else if child_metadata.is_dir() {
             copy_dir_recursive(&child_source, &child_target)?;
         } else {
             fs::copy(&child_source, &child_target)?;
-            let metadata = fs::symlink_metadata(&child_source)?;
-            preserve_local_metadata(&child_target, &metadata)?;
+            preserve_local_metadata(&child_target, &child_metadata)?;
         }
     }
     preserve_local_metadata(target, &metadata)?;
@@ -635,6 +635,31 @@ fn preserve_local_metadata(path: &Path, metadata: &fs::Metadata) -> std::io::Res
 fn local_path_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
+
+/// Symlinks and Windows directory junctions. Junctions look like directories,
+/// so a recursive walk would loop or leave the selected folder.
+pub(crate) fn local_path_is_link(path: &Path, metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    if !is_reparse_point(metadata) {
+        return false;
+    }
+    fs::read_link(path).is_ok()
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
 
 fn copy_local_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
     let link_target = fs::read_link(source)?;
