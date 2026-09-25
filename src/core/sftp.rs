@@ -13,6 +13,7 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 const LOCAL_TEXT_PREVIEW_LIMIT: u64 = 1024 * 1024;
+const LOCAL_TEXT_CHARSET_PROBE: u64 = 64 * 1024;
 pub const DIR_ENTRY_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -445,10 +446,9 @@ pub fn local_read_text_file(path: &str) -> std::io::Result<LocalTextFile> {
     let truncated = bytes.len() as u64 > LOCAL_TEXT_PREVIEW_LIMIT;
     if truncated {
         bytes.truncate(LOCAL_TEXT_PREVIEW_LIMIT as usize);
-        trim_partial_utf8_suffix(&mut bytes);
     }
     let is_binary = bytes.iter().any(|byte| *byte == 0);
-    let content = String::from_utf8_lossy(&bytes).to_string();
+    let content = local_text_from_bytes(&bytes, false, truncated);
 
     Ok(LocalTextFile {
         path: path.to_owned(),
@@ -481,11 +481,8 @@ pub fn local_read_text_file_tail(path: &str) -> std::io::Result<LocalTextFile> {
     let mut bytes = Vec::new();
     file.take(LOCAL_TEXT_PREVIEW_LIMIT)
         .read_to_end(&mut bytes)?;
-    if start > 0 {
-        trim_partial_utf8_prefix(&mut bytes);
-    }
     let is_binary = bytes.iter().any(|byte| *byte == 0);
-    let content = String::from_utf8_lossy(&bytes).to_string();
+    let content = local_text_from_bytes(&bytes, start > 0, false);
 
     Ok(LocalTextFile {
         path: path.to_owned(),
@@ -523,9 +520,11 @@ pub fn local_write_text_file(path: &str, content: &str) -> std::io::Result<()> {
             "保存失败：同目录下有未完成的临时文件，原文件未改动",
         ));
     }
+    let encoding = local_text_encoding(path)?;
+    let encoded = encode_local_text(content, encoding)?;
     let write_result = (|| -> std::io::Result<()> {
         let mut file = fs::File::create(&temp)?;
-        file.write_all(content.as_bytes())?;
+        file.write_all(&encoded)?;
         file.sync_all()?;
         Ok(())
     })();
@@ -794,6 +793,109 @@ fn fold_path_char(ch: char) -> char {
     }
 }
 
+
+fn local_fallback_charset() -> &'static encoding_rs::Encoding {
+    encoding_rs::Encoding::for_label(local_fallback_charset_label().as_bytes())
+        .unwrap_or(encoding_rs::UTF_8)
+}
+
+#[cfg(windows)]
+fn local_fallback_charset_label() -> &'static str {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetACP() -> u32;
+    }
+    charset_label_for_code_page(unsafe { GetACP() })
+}
+
+#[cfg(not(windows))]
+fn local_fallback_charset_label() -> &'static str {
+    "utf-8"
+}
+
+fn charset_label_for_code_page(code_page: u32) -> &'static str {
+    match code_page {
+        936 => "gbk",
+        54936 => "gb18030",
+        950 => "big5",
+        932 => "shift_jis",
+        949 => "euc-kr",
+        874 => "windows-874",
+        1250 => "windows-1250",
+        1251 => "windows-1251",
+        1252 => "windows-1252",
+        1253 => "windows-1253",
+        1254 => "windows-1254",
+        1255 => "windows-1255",
+        1256 => "windows-1256",
+        1257 => "windows-1257",
+        1258 => "windows-1258",
+        _ => "utf-8",
+    }
+}
+
+fn local_text_encoding(path: &Path) -> std::io::Result<&'static encoding_rs::Encoding> {
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(LOCAL_TEXT_CHARSET_PROBE + 1)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() as u64 > LOCAL_TEXT_CHARSET_PROBE;
+    if truncated {
+        bytes.truncate(LOCAL_TEXT_CHARSET_PROBE as usize);
+    }
+    if local_bytes_are_utf8(&bytes, truncated) {
+        Ok(encoding_rs::UTF_8)
+    } else {
+        Ok(local_fallback_charset())
+    }
+}
+
+fn local_bytes_are_utf8(bytes: &[u8], trim_suffix: bool) -> bool {
+    if !trim_suffix {
+        return std::str::from_utf8(bytes).is_ok();
+    }
+    // Only a cut sample may end on a partial character. Trimming a complete
+    // file can make a non-UTF-8 tail look like UTF-8.
+    let mut sample = bytes.to_vec();
+    trim_partial_utf8_suffix(&mut sample);
+    std::str::from_utf8(&sample).is_ok()
+}
+
+fn local_text_from_bytes(bytes: &[u8], trim_prefix: bool, trim_suffix: bool) -> String {
+    if trim_prefix || trim_suffix {
+        let mut sample = bytes.to_vec();
+        if trim_prefix {
+            trim_partial_utf8_prefix(&mut sample);
+        }
+        if trim_suffix {
+            trim_partial_utf8_suffix(&mut sample);
+        }
+        if let Ok(text) = std::str::from_utf8(&sample) {
+            return text.to_owned();
+        }
+    } else if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    local_fallback_charset().decode(bytes).0.into_owned()
+}
+
+fn encode_local_text(
+    content: &str,
+    encoding: &'static encoding_rs::Encoding,
+) -> std::io::Result<Vec<u8>> {
+    if encoding == encoding_rs::UTF_8 {
+        return Ok(content.as_bytes().to_vec());
+    }
+    let (bytes, _, unmappable) = encoding.encode(content);
+    if unmappable {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "当前编码无法保存这些字符，原文件未改动",
+        ));
+    }
+    Ok(bytes.into_owned())
+}
 
 fn trim_partial_utf8_prefix(bytes: &mut Vec<u8>) {
     let mut index = 0;
@@ -1166,6 +1268,97 @@ mod tests {
         sort_entries_by_folded_text(&mut entries, |entry| entry.name.as_str());
         let ordered: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(ordered, ["Dir", "A", "b", "c"]);
+    }
+
+    #[test]
+    fn local_charset_labels_cover_the_common_ansi_code_pages() {
+        assert_eq!(charset_label_for_code_page(936), "gbk");
+        assert_eq!(charset_label_for_code_page(54936), "gb18030");
+        assert_eq!(charset_label_for_code_page(950), "big5");
+        assert_eq!(charset_label_for_code_page(932), "shift_jis");
+        assert_eq!(charset_label_for_code_page(949), "euc-kr");
+        assert_eq!(charset_label_for_code_page(1252), "windows-1252");
+        assert_eq!(charset_label_for_code_page(65001), "utf-8");
+        assert_eq!(charset_label_for_code_page(0), "utf-8");
+        assert!(encoding_rs::Encoding::for_label(
+            charset_label_for_code_page(936).as_bytes()
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn local_text_round_trip_keeps_utf8_and_the_system_encoding() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-local-text-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+
+        let utf8_path = root.join("utf8.txt");
+        let original = "\u{4e2d}\u{6587}".as_bytes();
+        std::fs::write(&utf8_path, original).unwrap();
+        let path = utf8_path.display().to_string();
+        let read = local_read_text_file(&path).unwrap();
+        assert_eq!(read.content, "\u{4e2d}\u{6587}");
+        assert!(!read.truncated);
+        local_write_text_file(&path, "\u{4e2d}\u{6587}!").unwrap();
+        assert_eq!(
+            std::fs::read(&utf8_path).unwrap(),
+            "\u{4e2d}\u{6587}!".as_bytes()
+        );
+
+        let probe = LOCAL_TEXT_CHARSET_PROBE as usize;
+        let mut raw = Vec::new();
+        while raw.len() <= probe + 4 {
+            raw.extend_from_slice("\u{4e2d}".as_bytes());
+        }
+        assert!(std::str::from_utf8(&raw[..probe]).is_err());
+        let big_path = root.join("big-utf8.txt");
+        std::fs::write(&big_path, &raw).unwrap();
+        let big_name = big_path.display().to_string();
+        let edited = String::from_utf8(raw).unwrap() + "!";
+        local_write_text_file(&big_name, &edited).unwrap();
+        assert_eq!(std::fs::read(&big_path).unwrap(), edited.as_bytes());
+
+        let encoding = local_fallback_charset();
+        if encoding == encoding_rs::UTF_8 {
+            return;
+        }
+        let (encoded, _, unmappable) = encoding.encode("\u{4e2d}\u{6587}");
+        if unmappable {
+            return;
+        }
+        let encoded = encoded.into_owned();
+        assert!(std::str::from_utf8(&encoded).is_err());
+        let legacy_path = root.join("legacy.txt");
+        std::fs::write(&legacy_path, &encoded).unwrap();
+        let legacy = legacy_path.display().to_string();
+        let read = local_read_text_file(&legacy).unwrap();
+        assert_eq!(read.content, "\u{4e2d}\u{6587}");
+        let tail = local_read_text_file_tail(&legacy).unwrap();
+        assert_eq!(tail.content, "\u{4e2d}\u{6587}");
+        local_write_text_file(&legacy, "\u{4e2d}\u{6587}\u{4e2d}").unwrap();
+        let (expected, _, expected_unmappable) = encoding.encode("\u{4e2d}\u{6587}\u{4e2d}");
+        assert!(!expected_unmappable);
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), expected.as_ref());
+
+        let (_emoji, _, emoji_unmappable) = encoding.encode("\u{1f600}");
+        if emoji_unmappable {
+            let before = std::fs::read(&legacy_path).unwrap();
+            assert!(local_write_text_file(&legacy, "\u{1f600}").is_err());
+            assert_eq!(std::fs::read(&legacy_path).unwrap(), before);
+        }
     }
 
     #[cfg(windows)]
