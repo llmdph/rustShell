@@ -311,6 +311,8 @@ export default function App() {
   const [remotePathBookmarks, setRemotePathBookmarks] = useState<PathBookmark[]>(() => loadPathBookmarks("remote"));
   const [localFiles, setLocalFiles] = useState<FileEntry[]>([]);
   const [remoteFiles, setRemoteFiles] = useState<FileEntry[]>([]);
+  const [localDirTruncated, setLocalDirTruncated] = useState(false);
+  const [remoteDirTruncated, setRemoteDirTruncated] = useState(false);
   const [showLocalHidden, setShowLocalHidden] = useState(true);
   const [showRemoteHidden, setShowRemoteHidden] = useState(true);
   const [localFilter, setLocalFilter] = useState("");
@@ -1109,9 +1111,11 @@ export default function App() {
     const preferredPath = preferPath ?? pendingLocalPreferPathRef.current ?? undefined;
     pendingLocalPreferPathRef.current = null;
     try {
-      const files = await api.listLocalDir(localPath);
+      const listing = await api.listLocalDir(localPath);
+      const files = listing.entries;
       const picked = pickSelection(files, preferredPath, selectedLocalRef.current);
       setLocalFiles(files);
+      setLocalDirTruncated(listing.truncated);
       setSelectedLocal(picked);
       setSelectedLocalPaths(picked ? [picked.path] : []);
       setLocalSearch(null);
@@ -1123,9 +1127,11 @@ export default function App() {
   }, [localPath, pushToast]);
 
   const loadRemoteFilesFor = useCallback(async (profile: Profile, path: string, password: string | null, preferPath?: string) => {
-    const files = await api.listRemoteDir(profile.id, path, password);
+    const listing = await api.listRemoteDir(profile.id, path, password);
+    const files = listing.entries;
     const picked = pickSelection(files, preferPath, selectedRemoteRef.current);
     setRemoteFiles(files);
+    setRemoteDirTruncated(listing.truncated);
     setSelectedRemote(picked);
     setSelectedRemotePaths(picked ? [picked.path] : []);
     setRemoteSearch(null);
@@ -1135,6 +1141,7 @@ export default function App() {
   const refreshRemoteFiles = useCallback(async (preferPath?: string) => {
     if (!activeProfile || isLocalProtocol(activeProfile.protocol)) {
       setRemoteFiles([]);
+      setRemoteDirTruncated(false);
       clearRemoteSelection();
       setRemoteSearch(null);
       return;
@@ -1209,6 +1216,7 @@ export default function App() {
     if (!activeProfile || isLocalProtocol(activeProfile.protocol) || !remoteBrowserReady) {
       setRemoteHomeReady(false);
       setRemoteFiles([]);
+      setRemoteDirTruncated(false);
       return;
     }
     let disposed = false;
@@ -1233,6 +1241,7 @@ export default function App() {
         setRemoteForwardHistory([]);
         setRemotePath(".");
         setRemoteFiles([]);
+        setRemoteDirTruncated(false);
         setRemoteHomeReady(false);
         setStatus(`远程主目录读取失败: ${message}`);
         if (!shouldPromptForPassword(activeProfile, message)) {
@@ -3326,8 +3335,9 @@ export default function App() {
     if (!targetPath) return;
     try {
       if (side === "local") {
-        const files = await api.listLocalDir(targetPath);
-        setLocalFiles(files);
+        const listing = await api.listLocalDir(targetPath);
+        setLocalFiles(listing.entries);
+        setLocalDirTruncated(listing.truncated);
         setSelectedLocal(null);
         setSelectedLocalPaths([]);
         navigateLocalPath(targetPath);
@@ -3335,8 +3345,9 @@ export default function App() {
       }
 
       if (!activeProfile || isLocalProtocol(activeProfile.protocol)) return;
-      const files = await api.listRemoteDir(activeProfile.id, targetPath, passwordForActive);
-      setRemoteFiles(files);
+      const listing = await api.listRemoteDir(activeProfile.id, targetPath, passwordForActive);
+      setRemoteFiles(listing.entries);
+      setRemoteDirTruncated(listing.truncated);
       setSelectedRemote(null);
       setSelectedRemotePaths([]);
       navigateRemotePath(targetPath);
@@ -3382,6 +3393,7 @@ export default function App() {
     try {
       const files = await api.searchRemote(activeProfile.id, remotePath, query.trim(), 300, passwordForActive);
       setRemoteFiles(files);
+      setRemoteDirTruncated(false);
       clearRemoteSelection();
       setRemoteSearch({ root: remotePath, query: query.trim(), count: files.length });
       setStatus(`远程搜索 ${remotePath}: ${query.trim()} (${files.length})`);
@@ -3397,6 +3409,7 @@ export default function App() {
     try {
       const files = await api.searchLocal(localPath, query.trim(), 300);
       setLocalFiles(files);
+      setLocalDirTruncated(false);
       clearLocalSelection();
       setLocalSearch({ root: localPath, query: query.trim(), count: files.length });
       setStatus(`本地搜索 ${localPath}: ${query.trim()} (${files.length})`);
@@ -3881,6 +3894,7 @@ export default function App() {
     setRemoteBrowserProfileId(profileId);
     setRemoteHomeReady(false);
     setRemoteFiles([]);
+    setRemoteDirTruncated(false);
     setRemoteSearch(null);
     setRemoteBackHistory([]);
     setRemoteForwardHistory([]);
@@ -3897,6 +3911,7 @@ export default function App() {
       setRemoteBrowserProfileId(profileId);
       setRemoteHomeReady(false);
       setRemoteFiles([]);
+      setRemoteDirTruncated(false);
       setRemoteSearch(null);
       setRemoteBackHistory([]);
       setRemoteForwardHistory([]);
@@ -4690,14 +4705,17 @@ export default function App() {
               onOpenBookmark={(path) => openPathBookmark("local", path)}
               onRemoveBookmark={(path) => removePathBookmark("local", path)}
               notice={
-                localSearch && (
-                  <SearchNotice
-                    root={localSearch.root}
-                    query={localSearch.query}
-                    count={localSearch.count}
-                    onClear={refreshLocalFiles}
-                  />
-                )
+                <>
+                  {localSearch && (
+                    <SearchNotice
+                      root={localSearch.root}
+                      query={localSearch.query}
+                      count={localSearch.count}
+                      onClear={refreshLocalFiles}
+                    />
+                  )}
+                  {!localSearch && localDirTruncated && <DirLimitNotice count={localFiles.length} />}
+                </>
               }
               contextActions={[
                 {
@@ -5450,14 +5468,17 @@ export default function App() {
                 }
               ]}
               notice={
-                remoteSearch && (
-                  <SearchNotice
-                    root={remoteSearch.root}
-                    query={remoteSearch.query}
-                    count={remoteSearch.count}
-                    onClear={refreshRemoteFiles}
-                  />
-                )
+                <>
+                  {remoteSearch && (
+                    <SearchNotice
+                      root={remoteSearch.root}
+                      query={remoteSearch.query}
+                      count={remoteSearch.count}
+                      onClear={refreshRemoteFiles}
+                    />
+                  )}
+                  {!remoteSearch && remoteDirTruncated && <DirLimitNotice count={remoteFiles.length} />}
+                </>
               }
               extraActions={
                 <>
@@ -6531,6 +6552,10 @@ function FilePane({
       )}
     </div>
   );
+}
+
+function DirLimitNotice({ count }: { count: number }) {
+  return <div className="file-limit-notice">目录项过多，列表只显示 {count} 项</div>;
 }
 
 function SearchNotice({

@@ -13,7 +13,7 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 const LOCAL_TEXT_PREVIEW_LIMIT: u64 = 1024 * 1024;
-const LOCAL_DIR_ENTRY_LIMIT: usize = 10_000;
+pub const DIR_ENTRY_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +32,13 @@ pub struct FileEntry {
     pub uid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gid: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirListing {
+    pub entries: Vec<FileEntry>,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -74,24 +81,26 @@ impl Default for TransferConflictStrategy {
     }
 }
 
-pub fn list_local_dir(path: &str) -> std::io::Result<Vec<FileEntry>> {
-    let mut output = Vec::new();
+pub fn list_local_dir(path: &str) -> std::io::Result<DirListing> {
+    let mut entries = Vec::new();
+    let mut truncated = false;
     let dir = Path::new(path);
 
     for entry in fs::read_dir(dir)? {
-        if output.len() >= LOCAL_DIR_ENTRY_LIMIT {
-            break;
-        }
         let entry = entry?;
         let path = entry.path();
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
-        output.push(local_entry_from_path(path, metadata));
+        if entries.len() >= DIR_ENTRY_LIMIT {
+            truncated = true;
+            break;
+        }
+        entries.push(local_entry_from_path(path, metadata));
     }
 
-    output.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
-    Ok(output)
+    entries.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+    Ok(DirListing { entries, truncated })
 }
 
 pub fn search_local(
@@ -767,6 +776,39 @@ mod tests {
         assert_eq!(remote_parent_path("/a"), "/");
         assert_eq!(remote_parent_path("/"), "/");
         assert_eq!(remote_parent_path("rel"), ".");
+    }
+
+    #[test]
+    fn local_listing_reports_when_more_entries_exist() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-dir-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+
+        for index in 0..=DIR_ENTRY_LIMIT {
+            std::fs::write(root.join(format!("f{index:05}")), b"x").unwrap();
+        }
+        let listing = list_local_dir(&root.display().to_string()).unwrap();
+        assert!(listing.truncated);
+        assert_eq!(listing.entries.len(), DIR_ENTRY_LIMIT);
+
+        std::fs::remove_file(root.join(format!("f{DIR_ENTRY_LIMIT:05}"))).unwrap();
+        let listing = list_local_dir(&root.display().to_string()).unwrap();
+        assert!(!listing.truncated);
+        assert_eq!(listing.entries.len(), DIR_ENTRY_LIMIT);
     }
 
     #[test]

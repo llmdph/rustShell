@@ -2063,6 +2063,19 @@ select:disabled {
   padding: 0;
 }
 
+.file-limit-notice {
+  display: flex;
+  align-items: center;
+  height: 28px;
+  margin-bottom: 7px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, #c9862a 55%, var(--line));
+  border-radius: 4px;
+  background: color-mix(in srgb, #c9862a 16%, var(--panel-2));
+  color: var(--text);
+  font-size: 12px;
+}
+
 .file-filter {
   display: flex;
   align-items: center;

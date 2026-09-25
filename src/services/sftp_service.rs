@@ -1,8 +1,8 @@
 use crate::core::{
     session::SessionProfile,
     sftp::{
-        local_path_is_link, remote_child_path, remote_parent_path, FileEntry,
-        TransferConflictStrategy,
+        local_path_is_link, remote_child_path, remote_parent_path, DirListing, FileEntry,
+        TransferConflictStrategy, DIR_ENTRY_LIMIT,
     },
 };
 use crate::services::ssh;
@@ -26,7 +26,6 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 const REMOTE_TEXT_PREVIEW_LIMIT: u64 = 1024 * 1024;
-const REMOTE_DIR_ENTRY_LIMIT: usize = 10_000;
 const TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const LIBSSH2_ERROR_FILE: i32 = -16;
 const LIBSSH2_ERROR_EAGAIN: i32 = -37;
@@ -146,7 +145,7 @@ impl SftpConnection {
             .map(|path| remote_path_text(&path))
     }
 
-    pub fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>> {
+    pub fn list_dir(&self, path: &str) -> Result<DirListing> {
         list_with_sftp(&self.sftp, path)
     }
 
@@ -478,7 +477,7 @@ pub fn list_remote_dir(
     profile: &SessionProfile,
     password: Option<&str>,
     path: &str,
-) -> Result<Vec<FileEntry>> {
+) -> Result<DirListing> {
     let session = connect(profile, password)?;
     let sftp = session.sftp().context("failed to start SFTP subsystem")?;
     list_with_sftp(&sftp, path)
@@ -503,14 +502,16 @@ fn visit_remote_entries(
     dirname: &Path,
     limit: Option<usize>,
     mut visit: impl FnMut(PathBuf, ssh2::FileStat) -> bool,
-) -> Result<()> {
+) -> Result<bool> {
     let mut dir = sftp
         .opendir(dirname)
         .with_context(|| format!("failed to list {}", dirname.display()))?;
     let parent = remote_path_text(dirname);
     let mut seen = 0usize;
+    let mut truncated = false;
     loop {
         if limit.is_some_and(|limit| seen >= limit) {
+            truncated = remote_dir_has_another_entry(&mut dir, dirname)?;
             break;
         }
         match dir.readdir() {
@@ -534,23 +535,53 @@ fn visit_remote_entries(
             }
         }
     }
-    Ok(())
+    Ok(truncated)
+}
+
+fn remote_dir_has_another_entry(dir: &mut ssh2::File, dirname: &Path) -> Result<bool> {
+    loop {
+        match dir.readdir() {
+            Ok((filename, _)) => {
+                let name = filename.to_string_lossy();
+                if name == "." || name == ".." {
+                    continue;
+                }
+                return Ok(true);
+            }
+            Err(error) if is_libssh2_session_code(&error, LIBSSH2_ERROR_FILE) => return Ok(false),
+            Err(error) if is_libssh2_session_code(&error, LIBSSH2_ERROR_EAGAIN) => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to list {}", dirname.display()));
+            }
+        }
+    }
 }
 
 fn is_libssh2_session_code(error: &ssh2::Error, code: i32) -> bool {
     error.code() == ssh2::ErrorCode::Session(code)
 }
 
-fn list_with_sftp(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<FileEntry>> {
-    let entries = read_remote_entries(sftp, Path::new(path), Some(REMOTE_DIR_ENTRY_LIMIT))?;
+fn list_with_sftp(sftp: &ssh2::Sftp, path: &str) -> Result<DirListing> {
+    let mut raw_entries = Vec::new();
+    let truncated = visit_remote_entries(
+        sftp,
+        Path::new(path),
+        Some(DIR_ENTRY_LIMIT),
+        |path_buf, stat| {
+            raw_entries.push((path_buf, stat));
+            true
+        },
+    )?;
 
-    let mut output = Vec::with_capacity(entries.len());
-    for (path_buf, stat) in entries {
-        output.push(entry_from_stat(sftp, path_buf, stat));
+    let mut entries = Vec::with_capacity(raw_entries.len());
+    for (path_buf, stat) in raw_entries {
+        entries.push(entry_from_stat(sftp, path_buf, stat));
     }
 
-    output.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
-    Ok(output)
+    entries.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+    Ok(DirListing { entries, truncated })
 }
 
 fn search_remote_recursive(

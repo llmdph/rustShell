@@ -19,8 +19,8 @@ use crate::{
             local_read_text_file_tail as read_local_file_tail_impl,
             local_remove as remove_local_path_impl, local_rename as rename_local_path_impl,
             local_touch as touch_local_path_impl, local_write_text_file as write_local_file_impl,
-            search_local as search_local_impl, FileEntry, LocalPathStats, LocalTextFile,
-            TransferConflictStrategy, TransferDirection,
+            search_local as search_local_impl, DirListing, FileEntry, LocalPathStats,
+            LocalTextFile, TransferConflictStrategy, TransferDirection, DIR_ENTRY_LIMIT,
         },
         terminal::{HostKeyIssue, TerminalModel, TerminalSize, TerminalStatus},
     },
@@ -994,7 +994,7 @@ async fn close_terminal(terminal_id: String, app: AppHandle) -> Result<(), Strin
 }
 
 #[tauri::command]
-async fn list_local_dir(path: String) -> Result<Vec<FileEntry>, String> {
+async fn list_local_dir(path: String) -> Result<DirListing, String> {
     blocking(move || {
     read_local_dir(&path).map_err(to_string)
     }).await
@@ -1148,7 +1148,7 @@ where
 }
 
 #[tauri::command]
-async fn list_remote_dir(request: SftpRequest, app: AppHandle) -> Result<Vec<FileEntry>, String> {
+async fn list_remote_dir(request: SftpRequest, app: AppHandle) -> Result<DirListing, String> {
     blocking(move || {
         let state = app.state::<AppRuntime>();
         let context = sftp_context(
@@ -2124,10 +2124,10 @@ fn system_ssh_remote_home(profile: &SessionProfile) -> Result<String, String> {
     Ok(output.trim().to_owned())
 }
 
-fn system_ssh_list_dir(profile: &SessionProfile, path: &str) -> Result<Vec<FileEntry>, String> {
+fn system_ssh_list_dir(profile: &SessionProfile, path: &str) -> Result<DirListing, String> {
     let command = format!(
         r#"
-dir={}
+dir={dir}
 if [ ! -d "$dir" ]; then
   exit 2
 fi
@@ -2150,17 +2150,27 @@ for path do
   gid=$(stat -c %g "$path" 2>/dev/null || echo 0)
   printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$name" "$path" "$kind" "$size" "$mtime" "$perm" "$uid" "$gid" "$target"
 done
-' sh {{}} +
+' sh {{}} + | head -n {extra}
 "#,
-        shell_quote(path)
+        dir = shell_quote(path),
+        extra = DIR_ENTRY_LIMIT + 1,
     );
     let output = system_ssh_output(profile, &command)?;
-    let mut entries = output
-        .lines()
-        .filter_map(parse_system_ssh_entry)
-        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    for line in output.lines() {
+        let Some(entry) = parse_system_ssh_entry(line) else {
+            continue;
+        };
+        entries.push(entry);
+        if entries.len() > DIR_ENTRY_LIMIT {
+            entries.pop();
+            truncated = true;
+            break;
+        }
+    }
     entries.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
-    Ok(entries)
+    Ok(DirListing { entries, truncated })
 }
 
 fn system_ssh_output(profile: &SessionProfile, remote_command: &str) -> Result<String, String> {

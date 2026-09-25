@@ -6,7 +6,7 @@ use crate::{
             local_file_sha256, local_home, local_mkdir, local_move, local_parent, local_path_stats,
             local_read_text_file, local_read_text_file_tail, local_remove, local_rename,
             local_touch, local_write_text_file, remote_parent_path, search_local, FileEntry,
-            TransferConflictStrategy, TransferDirection,
+            TransferConflictStrategy, TransferDirection, DIR_ENTRY_LIMIT,
         },
     },
     services::{
@@ -232,7 +232,8 @@ pub fn native_local_preview(path: &str) -> NativeLocalPreview {
         path.trim().to_owned()
     };
     match list_local_dir(&path) {
-        Ok(local_entries) => {
+        Ok(listing) => {
+            let local_entries = &listing.entries;
             let (local_dir_count, local_file_count) =
                 local_entries.iter().fold((0, 0), |(dirs, files), entry| {
                     if entry.is_dir {
@@ -245,7 +246,10 @@ pub fn native_local_preview(path: &str) -> NativeLocalPreview {
                 path,
                 local_file_count,
                 local_dir_count,
-                local_listing: format_local_listing(&local_entries, 14),
+                local_listing: note_truncated_listing(
+                    format_local_listing(local_entries, 14),
+                    listing.truncated,
+                ),
                 error: None,
             }
         }
@@ -266,7 +270,8 @@ pub fn native_local_csv_preview(path: &str) -> NativeLocalPreview {
         path.trim().to_owned()
     };
     match list_local_dir(&path) {
-        Ok(local_entries) => {
+        Ok(listing) => {
+            let local_entries = &listing.entries;
             let (local_dir_count, local_file_count) =
                 local_entries.iter().fold((0, 0), |(dirs, files), entry| {
                     if entry.is_dir {
@@ -279,7 +284,10 @@ pub fn native_local_csv_preview(path: &str) -> NativeLocalPreview {
                 path,
                 local_file_count,
                 local_dir_count,
-                local_listing: format_file_csv(&local_entries),
+                local_listing: note_truncated_listing(
+                    format_file_csv(local_entries),
+                    listing.truncated,
+                ),
                 error: None,
             }
         }
@@ -689,7 +697,8 @@ pub fn native_remote_preview(
     };
 
     match connection.list_dir(&path) {
-        Ok(remote_entries) => {
+        Ok(listing) => {
+            let remote_entries = &listing.entries;
             let (remote_dir_count, remote_file_count) =
                 remote_entries.iter().fold((0, 0), |(dirs, files), entry| {
                     if entry.is_dir {
@@ -703,7 +712,10 @@ pub fn native_remote_preview(
                 path,
                 remote_file_count,
                 remote_dir_count,
-                remote_listing: format_file_listing(&remote_entries, 16),
+                remote_listing: note_truncated_listing(
+                    format_file_listing(remote_entries, 16),
+                    listing.truncated,
+                ),
                 error: None,
             }
         }
@@ -735,7 +747,8 @@ pub fn native_remote_csv_preview(
     };
 
     match connection.list_dir(&path) {
-        Ok(remote_entries) => {
+        Ok(listing) => {
+            let remote_entries = &listing.entries;
             let (remote_dir_count, remote_file_count) =
                 remote_entries.iter().fold((0, 0), |(dirs, files), entry| {
                     if entry.is_dir {
@@ -749,7 +762,10 @@ pub fn native_remote_csv_preview(
                 path,
                 remote_file_count,
                 remote_dir_count,
-                remote_listing: format_file_csv(&remote_entries),
+                remote_listing: note_truncated_listing(
+                    format_file_csv(remote_entries),
+                    listing.truncated,
+                ),
                 error: None,
             }
         }
@@ -1601,6 +1617,13 @@ pub fn native_transfer_history_clear() -> NativeTransferHistoryPreview {
     }
 }
 
+fn note_truncated_listing(text: String, truncated: bool) -> String {
+    if !truncated {
+        return text;
+    }
+    format!("{text}\n目录项过多，列表只显示 {DIR_ENTRY_LIMIT} 项")
+}
+
 fn format_local_listing(entries: &[FileEntry], limit: usize) -> String {
     format_file_listing(entries, limit)
 }
@@ -2206,6 +2229,7 @@ fn local_entry_for_path(target_path: &str) -> Option<FileEntry> {
     let parent = local_parent(target_path)?;
     list_local_dir(&parent)
         .ok()?
+        .entries
         .into_iter()
         .find(|entry| entry.path == target_path)
 }
@@ -2215,6 +2239,7 @@ fn remote_entry_for_path(connection: &SftpConnection, target_path: &str) -> Opti
     connection
         .list_dir(&parent)
         .ok()?
+        .entries
         .into_iter()
         .find(|entry| entry.path == target_path)
 }

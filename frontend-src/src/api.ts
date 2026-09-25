@@ -98,6 +98,11 @@ export type FileEntry = {
   gid?: number | null;
 };
 
+export type DirListing = {
+  entries: FileEntry[];
+  truncated: boolean;
+};
+
 export type AppSettings = {
   theme: "deep" | "graphite" | "light";
   fontSize: number;
@@ -249,7 +254,7 @@ export const api = {
   localParent: (path: string) => invoke<string | null>("local_parent", { path }),
   openLocalPath: (path: string, reveal = true) =>
     invoke<void>("open_local_path", { request: { path, reveal } }),
-  listLocalDir: (path: string) => invoke<FileEntry[]>("list_local_dir", { path }),
+  listLocalDir: (path: string) => invoke<DirListing>("list_local_dir", { path }),
   searchLocal: (root: string, query: string, maxResults = 300) =>
     invoke<FileEntry[]>("search_local", { request: { root, query, maxResults } }),
   createLocalDir: (parent: string, name: string) =>
@@ -281,7 +286,7 @@ export const api = {
   renameLocalPath: (path: string, newName: string) =>
     invoke<void>("rename_local_path", { request: { path, newName } }),
   listRemoteDir: (profileId: string, path: string, password?: string | null) =>
-    invoke<FileEntry[]>("list_remote_dir", { request: { profileId, path, password: password || null } }),
+    invoke<DirListing>("list_remote_dir", { request: { profileId, path, password: password || null } }),
   remoteHome: (profileId: string, password?: string | null) =>
     invoke<string>("remote_home", { request: { profileId, password: password || null } }),
   serverStatus: (profileId: string, password?: string | null) =>
