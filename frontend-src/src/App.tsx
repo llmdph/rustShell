@@ -9340,9 +9340,12 @@ function filterCompareView(files: FileEntry[], marks: Map<string, FileCompareMar
 }
 
 function directoryEntryKey(side: FileSide, root: string, file: FileEntry) {
-  const relative = relativePathForSide(side, root, file.path);
-  if (!relative || relative === "." || relative === file.path) return file.name;
-  return relative.replace(/\\/g, "/");
+  const relative = relativePathForSide(side, root, file.path).replace(/\\/g, "/");
+  if (!relative || relative === ".") return file.name;
+  // A nested path is its own result. Falling back to the file name makes
+  // a/report.txt and b/report.txt look like the same file.
+  if (relative.includes("/")) return relative;
+  return file.name;
 }
 
 function buildDirectoryCompare(
