@@ -2650,10 +2650,11 @@ fn open_local_path_impl(path: &str, reveal: bool) -> std::io::Result<()> {
     {
         if reveal && target.is_file() {
             let mut command = Command::new("explorer.exe");
-            command.arg(format!("/select,{}", target.display()));
-            command.spawn()?.wait()?;
+            // One argument. A comma in the file name must not split the path.
+            command.arg(format!("/select,\"{}\"", target.display()));
+            spawn_gui_command(command)?;
         } else {
-            let mut command = if reveal {
+            let command = if reveal {
                 let mut command = Command::new("explorer.exe");
                 command.arg(containing_target);
                 command
@@ -2662,7 +2663,7 @@ fn open_local_path_impl(path: &str, reveal: bool) -> std::io::Result<()> {
                 command.arg("url.dll,FileProtocolHandler").arg(target);
                 command
             };
-            command.spawn()?.wait()?;
+            spawn_gui_command(command)?;
         }
     }
 
@@ -2674,17 +2675,29 @@ fn open_local_path_impl(path: &str, reveal: bool) -> std::io::Result<()> {
         } else {
             command.arg(containing_target);
         }
-        command.spawn()?.wait()?;
+        spawn_gui_command(command)?;
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        Command::new("xdg-open")
-            .arg(containing_target)
-            .spawn()?
-            .wait()?;
+        let mut command = Command::new("xdg-open");
+        command.arg(containing_target);
+        spawn_gui_command(command)?;
     }
 
+    Ok(())
+}
+
+fn spawn_gui_command(mut command: Command) -> std::io::Result<()> {
+    // These helpers stay running after the folder is shown. Waiting would hold
+    // the action until that window closes, and Explorer's exit code is not a
+    // reliable success flag.
+    let child = command.spawn()?;
+    let _ = thread::Builder::new()
+        .name("open-local-path".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
     Ok(())
 }
 
