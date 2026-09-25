@@ -3408,12 +3408,18 @@ export default function App() {
     const query = await promptText("搜索远程文件", { defaultValue: visibleSelectedRemote?.name ?? "" });
     if (!query?.trim()) return;
     try {
-      const files = await api.searchRemote(activeProfile.id, remotePath, query.trim(), 300, passwordForActive);
-      setRemoteFiles(files);
+      const result = await api.searchRemote(activeProfile.id, remotePath, query.trim(), 300, passwordForActive);
+      setRemoteFiles(result.entries);
       setRemoteDirTruncated(false);
       clearRemoteSelection();
-      setRemoteSearch({ root: remotePath, query: query.trim(), count: files.length });
-      setStatus(`远程搜索 ${remotePath}: ${query.trim()} (${files.length})`);
+      setRemoteSearch({
+        root: remotePath,
+        query: query.trim(),
+        count: result.entries.length,
+        limited: result.limited,
+        incomplete: result.incomplete
+      });
+      setStatus(searchResultStatus("远程搜索", remotePath, query.trim(), result));
     } catch (error) {
       if (requestActiveProfileSecretIfNeeded(error)) return;
       pushToast("error", `搜索失败: ${String(error)}`);
@@ -3424,12 +3430,18 @@ export default function App() {
     const query = await promptText("搜索本地文件", { defaultValue: visibleSelectedLocal?.name ?? "" });
     if (!query?.trim()) return;
     try {
-      const files = await api.searchLocal(localPath, query.trim(), 300);
-      setLocalFiles(files);
+      const result = await api.searchLocal(localPath, query.trim(), 300);
+      setLocalFiles(result.entries);
       setLocalDirTruncated(false);
       clearLocalSelection();
-      setLocalSearch({ root: localPath, query: query.trim(), count: files.length });
-      setStatus(`本地搜索 ${localPath}: ${query.trim()} (${files.length})`);
+      setLocalSearch({
+        root: localPath,
+        query: query.trim(),
+        count: result.entries.length,
+        limited: result.limited,
+        incomplete: result.incomplete
+      });
+      setStatus(searchResultStatus("本地搜索", localPath, query.trim(), result));
     } catch (error) {
       pushToast("error", `搜索失败: ${String(error)}`);
     }
@@ -4728,6 +4740,8 @@ export default function App() {
                       root={localSearch.root}
                       query={localSearch.query}
                       count={localSearch.count}
+                      limited={localSearch.limited}
+                      incomplete={localSearch.incomplete}
                       onClear={refreshLocalFiles}
                     />
                   )}
@@ -5491,6 +5505,8 @@ export default function App() {
                       root={remoteSearch.root}
                       query={remoteSearch.query}
                       count={remoteSearch.count}
+                      limited={remoteSearch.limited}
+                      incomplete={remoteSearch.incomplete}
                       onClear={refreshRemoteFiles}
                     />
                   )}
@@ -6575,22 +6591,47 @@ function DirLimitNotice({ count }: { count: number }) {
   return <div className="file-limit-notice">目录项过多，列表只显示 {count} 项</div>;
 }
 
+function searchResultStatus(
+  kind: string,
+  root: string,
+  query: string,
+  result: { entries: { length: number }; limited: boolean; incomplete: boolean }
+) {
+  const notes = searchResultNotes(result.entries.length, result.limited, result.incomplete);
+  return notes.length === 0
+    ? `${kind} ${root}: ${query} (${result.entries.length})`
+    : `${kind} ${root}: ${query} (${result.entries.length})，${notes.join("，")}`;
+}
+
+function searchResultNotes(count: number, limited: boolean, incomplete: boolean) {
+  const notes: string[] = [];
+  if (limited) notes.push(`只显示了前 ${count} 条`);
+  if (incomplete) notes.push("有的文件夹打不开，结果可能不全");
+  return notes;
+}
+
 function SearchNotice({
   root,
   query,
   count,
+  limited,
+  incomplete,
   onClear
 }: {
   root: string;
   query: string;
   count: number;
+  limited: boolean;
+  incomplete: boolean;
   onClear: () => void;
 }) {
+  const notes = searchResultNotes(count, limited, incomplete);
+  const detail = notes.length === 0 ? "" : `，${notes.join("，")}`;
   return (
     <div className="file-search-notice">
       <Search size={13} />
-      <span title={`${root} / ${query}`}>
-        {query} · {count} 条
+      <span title={`${root} / ${query}${detail}`}>
+        {query} · {count} 条{detail}
       </span>
       <button onClick={onClear} title="退出搜索">
         <X size={13} />

@@ -2,6 +2,7 @@ use crate::core::{
     session::SessionProfile,
     sftp::{
         local_path_is_link, remote_child_path, remote_parent_path, DirListing, FileEntry,
+        FileSearchResult,
         TransferConflictStrategy, DIR_ENTRY_LIMIT,
     },
 };
@@ -154,21 +155,29 @@ impl SftpConnection {
         list_with_sftp(&self.sftp, path)
     }
 
-    pub fn search(&self, root: &str, query: &str, max_results: usize) -> Result<Vec<FileEntry>> {
+    pub fn search(&self, root: &str, query: &str, max_results: usize) -> Result<FileSearchResult> {
         let query = query.trim().to_lowercase();
         if query.is_empty() {
             bail!("search query is empty");
         }
         let mut output = Vec::new();
+        let mut incomplete = false;
+        let mut limited = false;
         search_remote_recursive(
             &self.sftp,
             Path::new(root),
             &query,
             max_results.clamp(1, 1000),
             &mut output,
+            &mut incomplete,
+            &mut limited,
         )?;
         output.sort_by_key(|entry| (!entry.is_dir, entry.path.to_lowercase()));
-        Ok(output)
+        Ok(FileSearchResult {
+            entries: output,
+            incomplete,
+            limited,
+        })
     }
 
     pub fn create_dir(&self, parent: &str, name: &str) -> Result<()> {
@@ -601,14 +610,18 @@ fn search_remote_recursive(
     query: &str,
     max_results: usize,
     output: &mut Vec<FileEntry>,
+    incomplete: &mut bool,
+    limited: &mut bool,
 ) -> Result<()> {
     if output.len() >= max_results {
+        *limited = true;
         return Ok(());
     }
 
     let mut directories = Vec::new();
     visit_remote_entries(sftp, root, None, |path_buf, stat| {
         if output.len() >= max_results {
+            *limited = true;
             return false;
         }
         let should_descend = stat.is_dir() && !stat.file_type().is_symlink();
@@ -619,14 +632,31 @@ fn search_remote_recursive(
         if should_descend {
             directories.push(path_buf);
         }
-        output.len() < max_results
+        if output.len() >= max_results {
+            *limited = true;
+            return false;
+        }
+        true
     })?;
 
     for directory in directories {
         if output.len() >= max_results {
+            *limited = true;
             break;
         }
-        search_remote_recursive(sftp, &directory, query, max_results, output)?;
+        if search_remote_recursive(
+            sftp,
+            &directory,
+            query,
+            max_results,
+            output,
+            incomplete,
+            limited,
+        )
+        .is_err()
+        {
+            *incomplete = true;
+        }
     }
     Ok(())
 }

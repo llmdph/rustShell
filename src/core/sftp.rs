@@ -43,6 +43,14 @@ pub struct DirListing {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FileSearchResult {
+    pub entries: Vec<FileEntry>,
+    pub incomplete: bool,
+    pub limited: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LocalTextFile {
     pub path: String,
     pub content: String,
@@ -107,20 +115,32 @@ pub fn search_local(
     root: &str,
     query: &str,
     max_results: usize,
-) -> std::io::Result<Vec<FileEntry>> {
+) -> std::io::Result<FileSearchResult> {
     let mut output = Vec::new();
+    let mut incomplete = false;
+    let mut limited = false;
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
-        return Ok(output);
+        return Ok(FileSearchResult {
+            entries: output,
+            incomplete,
+            limited,
+        });
     }
     search_local_recursive(
         Path::new(root),
         &needle,
         max_results.clamp(1, 1000),
         &mut output,
+        &mut incomplete,
+        &mut limited,
     )?;
     output.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
-    Ok(output)
+    Ok(FileSearchResult {
+        entries: output,
+        incomplete,
+        limited,
+    })
 }
 
 pub fn local_home() -> String {
@@ -492,13 +512,17 @@ fn search_local_recursive(
     query: &str,
     max_results: usize,
     output: &mut Vec<FileEntry>,
+    incomplete: &mut bool,
+    limited: &mut bool,
 ) -> std::io::Result<()> {
     if output.len() >= max_results {
+        *limited = true;
         return Ok(());
     }
 
     for entry in fs::read_dir(root)? {
         if output.len() >= max_results {
+            *limited = true;
             break;
         }
         let entry = entry?;
@@ -509,10 +533,10 @@ fn search_local_recursive(
         let walk = metadata.is_dir() && !local_path_is_link(&path, &metadata);
         let file_entry = local_entry_from_path(path.clone(), metadata);
         if entry_matches_query(&file_entry, query) {
-            output.push(file_entry.clone());
+            output.push(file_entry);
         }
-        if walk {
-            let _ = search_local_recursive(&path, query, max_results, output);
+        if walk && search_local_recursive(&path, query, max_results, output, incomplete, limited).is_err() {
+            *incomplete = true;
         }
     }
     Ok(())
@@ -946,5 +970,37 @@ mod tests {
             std::fs::read(&created).unwrap(),
             b""
         );
+    }
+
+    #[test]
+    fn search_finds_a_nested_name_and_reports_a_missing_root() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-search-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested").join("hello.txt"), b"hi").unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0.join("nested").join("hello.txt"));
+                let _ = std::fs::remove_dir(self.0.join("nested"));
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+
+        let found = search_local(&root.display().to_string(), "hello", 10).unwrap();
+        assert!(!found.incomplete);
+        assert!(!found.limited);
+        assert_eq!(found.entries.len(), 1);
+        assert_eq!(found.entries[0].name, "hello.txt");
+
+        let missing = root.join("missing");
+        assert!(search_local(&missing.display().to_string(), "hello", 10).is_err());
     }
 }

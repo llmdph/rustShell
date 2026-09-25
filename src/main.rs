@@ -19,7 +19,7 @@ use crate::{
             local_read_text_file_tail as read_local_file_tail_impl,
             local_remove as remove_local_path_impl, local_rename as rename_local_path_impl,
             local_touch as touch_local_path_impl, local_write_text_file as write_local_file_impl,
-            search_local as search_local_impl, DirListing, FileEntry, LocalPathStats,
+            search_local as search_local_impl, DirListing, FileEntry, FileSearchResult, LocalPathStats,
             LocalTextFile, TransferConflictStrategy, TransferDirection, DIR_ENTRY_LIMIT,
         },
         terminal::{HostKeyIssue, TerminalModel, TerminalSize, TerminalStatus},
@@ -1001,7 +1001,7 @@ async fn list_local_dir(path: String) -> Result<DirListing, String> {
 }
 
 #[tauri::command]
-async fn search_local(request: LocalSearchRequest) -> Result<Vec<FileEntry>, String> {
+async fn search_local(request: LocalSearchRequest) -> Result<FileSearchResult, String> {
     blocking(move || {
     search_local_impl(
         &request.root,
@@ -1250,7 +1250,7 @@ fn disconnect_sftp_session(
 async fn search_remote(
     request: RemoteSearchRequest,
     app: AppHandle,
-) -> Result<Vec<FileEntry>, String> {
+) -> Result<FileSearchResult, String> {
     blocking(move || {
         let state = app.state::<AppRuntime>();
         pooled_sftp(

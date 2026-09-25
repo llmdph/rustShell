@@ -103,6 +103,12 @@ export type DirListing = {
   truncated: boolean;
 };
 
+export type FileSearchResult = {
+  entries: FileEntry[];
+  incomplete: boolean;
+  limited: boolean;
+};
+
 export type AppSettings = {
   theme: "deep" | "graphite" | "light";
   fontSize: number;
@@ -256,7 +262,7 @@ export const api = {
     invoke<void>("open_local_path", { request: { path, reveal } }),
   listLocalDir: (path: string) => invoke<DirListing>("list_local_dir", { path }),
   searchLocal: (root: string, query: string, maxResults = 300) =>
-    invoke<FileEntry[]>("search_local", { request: { root, query, maxResults } }),
+    invoke<FileSearchResult>("search_local", { request: { root, query, maxResults } }),
   createLocalDir: (parent: string, name: string) =>
     invoke<void>("create_local_dir", { request: { parent, name } }),
   createLocalFile: (parent: string, name: string) =>
@@ -294,7 +300,7 @@ export const api = {
   disconnectSftpSession: (profileId: string) =>
     invoke<void>("disconnect_sftp_session", { request: { profileId } }),
   searchRemote: (profileId: string, root: string, query: string, maxResults = 200, password?: string | null) =>
-    invoke<FileEntry[]>("search_remote", {
+    invoke<FileSearchResult>("search_remote", {
       request: { profileId, root, query, maxResults, password: password || null }
     }),
   createRemoteDir: (profileId: string, parent: string, name: string, password?: string | null) =>

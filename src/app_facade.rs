@@ -563,6 +563,25 @@ pub fn native_local_path_stats(current_path: &str, target_path: &str) -> NativeL
     }
 }
 
+
+fn annotate_search_listing(
+    mut listing: String,
+    count: usize,
+    limited: bool,
+    incomplete: bool,
+) -> String {
+    if limited {
+        listing.push_str(&format!(
+            "\n只显示了前 {} 条",
+            count
+        ));
+    }
+    if incomplete {
+        listing.push_str("\n有的文件夹打不开，结果可能不全");
+    }
+    listing
+}
+
 pub fn native_local_search(current_path: &str, query: &str) -> NativeLocalPreview {
     let root = normalize_local_path(current_path);
     let query = query.trim();
@@ -571,11 +590,16 @@ pub fn native_local_search(current_path: &str, query: &str) -> NativeLocalPrevie
     }
 
     match search_local(&root, query, 200) {
-        Ok(entries) => NativeLocalPreview {
+        Ok(result) => NativeLocalPreview {
             path: root,
-            local_file_count: entries.iter().filter(|entry| !entry.is_dir).count(),
-            local_dir_count: entries.iter().filter(|entry| entry.is_dir).count(),
-            local_listing: format_local_listing(&entries, 60),
+            local_file_count: result.entries.iter().filter(|entry| !entry.is_dir).count(),
+            local_dir_count: result.entries.iter().filter(|entry| entry.is_dir).count(),
+            local_listing: annotate_search_listing(
+                format_local_listing(&result.entries, 60),
+                result.entries.len(),
+                result.limited,
+                result.incomplete,
+            ),
             error: None,
         },
         Err(error) => local_error_preview(&root, "搜索失败", format!("本地搜索失败: {}", error)),
@@ -1235,12 +1259,21 @@ pub fn native_remote_search(
 
     match open_remote_connection(selector, password) {
         Ok((selector, connection)) => match connection.search(&root, query, 200) {
-            Ok(entries) => NativeRemotePreview {
+            Ok(result) => NativeRemotePreview {
                 selector,
                 path: root,
-                remote_file_count: entries.iter().filter(|entry| !entry.is_dir).count(),
-                remote_dir_count: entries.iter().filter(|entry| entry.is_dir).count(),
-                remote_listing: format_file_listing(&entries, 60),
+                remote_file_count: result
+                    .entries
+                    .iter()
+                    .filter(|entry| !entry.is_dir)
+                    .count(),
+                remote_dir_count: result.entries.iter().filter(|entry| entry.is_dir).count(),
+                remote_listing: annotate_search_listing(
+                    format_file_listing(&result.entries, 60),
+                    result.entries.len(),
+                    result.limited,
+                    result.incomplete,
+                ),
                 error: None,
             },
             Err(error) => remote_error_preview(
