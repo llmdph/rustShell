@@ -1495,6 +1495,7 @@ where
     F: FnMut(u64, u64),
 {
     let mut directories = Vec::new();
+    let mut files = Vec::new();
     let mut failure = None;
     visit_remote_entries(sftp, Path::new(remote_dir), None, |remote_path, stat| {
         if cancel.load(Ordering::Relaxed) {
@@ -1505,19 +1506,8 @@ where
             return false;
         };
         let local_path = local_dir.join(name);
-        let result = if stat.file_type().is_symlink() {
-            match resolve_local_path(&local_path, conflict) {
-                Ok(local_path) => download_symlink(
-                    sftp,
-                    &remote_path,
-                    &local_path,
-                    total,
-                    transferred,
-                    conflict,
-                    on_progress,
-                ),
-                Err(error) => Err(error),
-            }
+        if stat.file_type().is_symlink() {
+            files.push((remote_path, local_path, true));
         } else if stat.is_dir() {
             directories.push((
                 remote_path_text(&remote_path),
@@ -1526,25 +1516,8 @@ where
                 stat.atime,
                 stat.mtime,
             ));
-            Ok(())
         } else {
-            match resolve_local_path(&local_path, conflict) {
-                Ok(local_path) => download_single_file(
-                    sftp,
-                    &remote_path,
-                    &local_path,
-                    total,
-                    transferred,
-                    cancel.clone(),
-                    conflict,
-                    on_progress,
-                ),
-                Err(error) => Err(error),
-            }
-        };
-        if let Err(error) = result {
-            failure = Some(error);
-            return false;
+            files.push((remote_path, local_path, false));
         }
         true
     })?;
@@ -1553,6 +1526,35 @@ where
     }
     if cancel.load(Ordering::Relaxed) {
         bail!("transfer cancelled");
+    }
+
+    for (remote_path, local_path, is_symlink) in files {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("transfer cancelled");
+        }
+        let local_path = resolve_local_path(&local_path, conflict)?;
+        if is_symlink {
+            download_symlink(
+                sftp,
+                &remote_path,
+                &local_path,
+                total,
+                transferred,
+                conflict,
+                on_progress,
+            )?;
+        } else {
+            download_single_file(
+                sftp,
+                &remote_path,
+                &local_path,
+                total,
+                transferred,
+                cancel.clone(),
+                conflict,
+                on_progress,
+            )?;
+        }
     }
 
     for (remote_child, local_path, perm, atime, mtime) in directories {
