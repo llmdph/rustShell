@@ -9310,6 +9310,14 @@ function knownModifiedMs(value: string) {
 }
 
 function compareFilePair(left: FileEntry, right: FileEntry): FileCompareMark {
+  if (left.fileType === "symlink" || right.fileType === "symlink") {
+    const reasons: string[] = [];
+    if (left.fileType !== right.fileType || left.isDir !== right.isDir) reasons.push("类型");
+    if ((left.linkTarget ?? "") !== (right.linkTarget ?? "")) reasons.push("链接目标");
+    if (reasons.length === 0) return { kind: "same", detail: "链接目标一致" };
+    return { kind: "different", detail: `差异: ${reasons.join("、")}` };
+  }
+
   const reasons: string[] = [];
   if (left.isDir !== right.isDir) reasons.push("类型");
   if (left.fileType !== right.fileType) reasons.push("文件类型");
