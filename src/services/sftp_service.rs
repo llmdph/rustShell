@@ -14,7 +14,7 @@ use filetime::{set_file_times, FileTime};
 use sha2::{Digest, Sha256};
 use ssh2::{OpenFlags, OpenType};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -1160,7 +1160,22 @@ where
     let stat = sftp
         .lstat(remote_path)
         .with_context(|| format!("failed to stat remote path {}", remote_path.display()))?;
-    let total = remote_total_size(sftp, remote_path, &cancel)?;
+    // A folder is listed once while its size is measured. The copy below uses
+    // that listing. A file or link does not read any children.
+    let cached_tree = if stat.file_type().is_symlink() || !stat.is_dir() {
+        None
+    } else {
+        Some(measure_remote_tree(
+            sftp,
+            remote_path,
+            Some(stat.clone()),
+            &cancel,
+        )?)
+    };
+    let total = match &cached_tree {
+        Some((size, _)) => *size,
+        None => remote_total_size(sftp, remote_path, &cancel)?,
+    };
     let mut transferred = 0_u64;
     on_progress(transferred, total);
     if !local_dir.is_empty() && local_dir != "." {
@@ -1188,6 +1203,7 @@ where
                 cancel,
                 conflict,
                 &mut on_progress,
+                cached_tree.as_ref().map(|(_, listing)| listing),
                 true,
             )
             .context("failed to download directory")?;
@@ -1950,6 +1966,32 @@ where
     Ok(())
 }
 
+fn queue_remote_download_entry(
+    files: &mut Vec<(PathBuf, PathBuf, bool, ssh2::FileStat)>,
+    directories: &mut Vec<(String, PathBuf, Option<u32>, Option<u64>, Option<u64>)>,
+    remote_path: PathBuf,
+    stat: ssh2::FileStat,
+    local_dir: &Path,
+) {
+    let Some(name) = remote_path.file_name() else {
+        return;
+    };
+    let local_path = local_dir.join(name);
+    if stat.file_type().is_symlink() {
+        files.push((remote_path, local_path, true, stat));
+    } else if stat.is_dir() {
+        directories.push((
+            remote_path_text(&remote_path),
+            local_path,
+            stat.perm,
+            stat.atime,
+            stat.mtime,
+        ));
+    } else {
+        files.push((remote_path, local_path, false, stat));
+    }
+}
+
 fn download_dir_recursive<F>(
     sftp: &ssh2::Sftp,
     remote_dir: &str,
@@ -1959,6 +2001,7 @@ fn download_dir_recursive<F>(
     cancel: Arc<AtomicBool>,
     conflict: TransferConflictStrategy,
     on_progress: &mut F,
+    listing: Option<&RemoteListing>,
     fail_if_unreadable: bool,
 ) -> Result<()>
 where
@@ -1966,40 +2009,48 @@ where
 {
     let mut directories = Vec::new();
     let mut files = Vec::new();
-    let visited = visit_remote_entries(sftp, Path::new(remote_dir), None, |remote_path, stat| {
-        if cancel.load(Ordering::Relaxed) {
-            return false;
-        }
-        let Some(name) = remote_path.file_name() else {
-            return true;
-        };
-        let local_path = local_dir.join(name);
-        if stat.file_type().is_symlink() {
-            files.push((remote_path, local_path, true, stat));
-        } else if stat.is_dir() {
-            directories.push((
-                remote_path_text(&remote_path),
-                local_path,
-                stat.perm,
-                stat.atime,
-                stat.mtime,
-            ));
-        } else {
-            files.push((remote_path, local_path, false, stat));
-        }
-        true
-    });
-    if let Err(error) = visited {
+    if let Some(listing) = listing {
         if cancel.load(Ordering::Relaxed) {
             bail!("transfer cancelled");
         }
-        if fail_if_unreadable {
-            return Err(error);
+        for (remote_path, stat) in &listing.entries {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("transfer cancelled");
+            }
+            queue_remote_download_entry(
+                &mut files,
+                &mut directories,
+                remote_path.clone(),
+                stat.clone(),
+                local_dir,
+            );
         }
-        // The listing stopped early. Keep names already read instead of
-        // leaving this folder empty.
-        if files.is_empty() && directories.is_empty() {
-            return Ok(());
+    } else {
+        let visited = visit_remote_entries(sftp, Path::new(remote_dir), None, |remote_path, stat| {
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+            queue_remote_download_entry(
+                &mut files,
+                &mut directories,
+                remote_path,
+                stat,
+                local_dir,
+            );
+            true
+        });
+        if let Err(error) = visited {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("transfer cancelled");
+            }
+            if fail_if_unreadable {
+                return Err(error);
+            }
+            // The listing stopped early. Keep names already read instead of
+            // leaving this folder empty.
+            if files.is_empty() && directories.is_empty() {
+                return Ok(());
+            }
         }
     }
     if cancel.load(Ordering::Relaxed) {
@@ -2100,11 +2151,18 @@ where
         }
         let local_path =
             local_child_for_conflict(&local_path, conflict, &mut listed_names)?;
+        let cached = listing.and_then(|listing| listing.children.get(&remote_child));
         if !open_local_download_dir(&local_path, conflict)? {
-            let skipped = match remote_total_size(sftp, Path::new(&remote_child), &cancel) {
-                Ok(size) => size,
-                Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
-                Err(_) => 0,
+            // This subtree was already measured with the download total. Ask
+            // the server again only when that measurement was not kept.
+            let skipped = if let Some((size, _)) = cached {
+                *size
+            } else {
+                match remote_total_size(sftp, Path::new(&remote_child), &cancel) {
+                    Ok(size) => size,
+                    Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
+                    Err(_) => 0,
+                }
             };
             note_skipped_bytes(transferred, total, skipped, on_progress);
             continue;
@@ -2118,6 +2176,7 @@ where
             cancel.clone(),
             conflict,
             on_progress,
+            cached.map(|(_, child)| child),
             false,
         )?;
         preserve_local_permissions(&local_path, perm);
@@ -2179,6 +2238,12 @@ fn local_symlink_target_text(path: &Path) -> Result<String> {
         .map(|target| target.to_string_lossy().replace('\\', "/"))
 }
 
+#[derive(Default)]
+struct RemoteListing {
+    entries: Vec<(PathBuf, ssh2::FileStat)>,
+    children: HashMap<String, (u64, RemoteListing)>,
+}
+
 fn remote_total_size(sftp: &ssh2::Sftp, path: &Path, cancel: &AtomicBool) -> Result<u64> {
     remote_total_size_known(sftp, path, None, cancel)
 }
@@ -2189,6 +2254,15 @@ fn remote_total_size_known(
     known: Option<ssh2::FileStat>,
     cancel: &AtomicBool,
 ) -> Result<u64> {
+    Ok(measure_remote_tree(sftp, path, known, cancel)?.0)
+}
+
+fn measure_remote_tree(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    known: Option<ssh2::FileStat>,
+    cancel: &AtomicBool,
+) -> Result<(u64, RemoteListing)> {
     if cancel.load(Ordering::Relaxed) {
         bail!("transfer cancelled");
     }
@@ -2200,39 +2274,54 @@ fn remote_total_size_known(
             .with_context(|| format!("failed to stat remote path {}", path.display()))?,
     };
     if stat.file_type().is_symlink() {
-        return Ok(0);
+        return Ok((0, RemoteListing::default()));
     }
     if !stat.is_dir() {
-        return Ok(stat.size.unwrap_or_default());
+        return Ok((stat.size.unwrap_or_default(), RemoteListing::default()));
     }
 
     let mut total = 0_u64;
+    let mut entries = Vec::new();
     let mut directories = Vec::new();
     visit_remote_entries(sftp, path, None, |child, child_stat| {
         if cancel.load(Ordering::Relaxed) {
             return false;
         }
-        if child_stat.file_type().is_symlink() {
-            return true;
+        if !child_stat.file_type().is_symlink() {
+            if child_stat.is_dir() {
+                directories.push((child.clone(), child_stat.clone()));
+            } else {
+                total += child_stat.size.unwrap_or_default();
+            }
         }
-        if child_stat.is_dir() {
-            directories.push((child, child_stat));
-        } else {
-            total += child_stat.size.unwrap_or_default();
-        }
+        entries.push((child, child_stat));
         true
     })?;
+    // A cancelled walk must not be reused. The names read so far are dropped.
     if cancel.load(Ordering::Relaxed) {
         bail!("transfer cancelled");
     }
+    let mut children = HashMap::new();
     for (child, child_stat) in directories {
-        match remote_total_size_known(sftp, &child, Some(child_stat), cancel) {
-            Ok(size) => total += size,
+        let child_key = remote_path_text(&child);
+        match measure_remote_tree(sftp, &child, Some(child_stat), cancel) {
+            Ok((size, listing)) => {
+                total += size;
+                children.insert(child_key, (size, listing));
+            }
+            // The copy lists this folder again. Leave it out of the total too,
+            // which is what a failed measurement did before.
             Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
             Err(_) => continue,
         }
     }
-    Ok(total)
+    Ok((
+        total,
+        RemoteListing {
+            entries,
+            children,
+        },
+    ))
 }
 
 fn resolve_remote_child_path(
