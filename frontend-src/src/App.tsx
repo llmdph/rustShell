@@ -9637,7 +9637,7 @@ function formatDate(value: string) {
 
 function formatFileDateTime(value: string, withSeconds = false) {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "-";
+  if (Number.isNaN(date.getTime()) || date.getTime() <= 0) return "-";
   const pad = (part: number) => String(part).padStart(2, "0");
   const base = `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
   return withSeconds ? `${base}:${pad(date.getSeconds())}` : base;
@@ -10386,14 +10386,14 @@ function escapeCsvCell(value: string) {
 
 function formatDateTimeLocal(value: string) {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
+  if (Number.isNaN(date.getTime()) || date.getTime() <= 0) return "";
   const pad = (part: number) => String(part).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 function touchTimestamp(value: string) {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
+  if (Number.isNaN(date.getTime()) || date.getTime() <= 0) return "";
   const pad = (part: number) => String(part).padStart(2, "0");
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}${pad(date.getHours())}${pad(date.getMinutes())}.${pad(date.getSeconds())}`;
 }
