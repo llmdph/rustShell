@@ -229,8 +229,6 @@ const defaultQuick: QuickConnectRequest = {
 const pathBookmarkStorageKey = "rustshell.pathBookmarks.v1";
 const sessionFolderStorageKey = "rustshell.sessionFolders.v1";
 const fileManagerProfileStorageKey = "rustshell.fileManagerProfileId";
-const windowDragExcludeSelector =
-  "button, input, select, textarea, a, [role='button'], [role='menu'], .window-controls, [data-window-drag-ignore]";
 
 function clampNumber(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -3209,16 +3207,6 @@ export default function App() {
     }
   };
 
-  const startWindowDrag = async (event: MouseEvent<HTMLElement>) => {
-    if (!hasTauriRuntime() || event.button !== 0) return;
-    if (event.target instanceof Element && event.target.closest(windowDragExcludeSelector)) return;
-    if (event.detail > 1) {
-      await getCurrentWindow().toggleMaximize().catch(() => undefined);
-      return;
-    }
-    await getCurrentWindow().startDragging().catch(() => undefined);
-  };
-
   useEffect(() => {
     if (!tabContextMenu) return;
     const close = () => setTabContextMenu(null);
@@ -4428,7 +4416,7 @@ export default function App() {
   return (
     <div className={`app-shell ${isFileManagerWindow ? "file-window-shell" : ""}`}>
       {!isFileManagerWindow && (
-        <header className="chrome" onMouseDown={startWindowDrag}>
+        <header className="chrome">
           <div className="titlebar" data-tauri-drag-region="deep">
             <div className="brand">
               <img className="brand-mark" src="/rustshell-logo.svg" alt="" aria-hidden="true" draggable={false} />
@@ -4741,7 +4729,6 @@ export default function App() {
                 <div
                   className="file-panel-heading"
                   data-tauri-drag-region={isFileManagerWindow ? "deep" : undefined}
-                  onMouseDown={isFileManagerWindow ? startWindowDrag : undefined}
                 >
                   <h3>
                     文件管理器
