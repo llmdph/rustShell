@@ -1019,15 +1019,14 @@ where
     };
     let remote_path = resolve_remote_child_path(sftp, remote_dir, &file_name, conflict)?;
 
-    let total = local_total_size(local_path, &cancel)?;
-    let root_metadata = fs::symlink_metadata(local_path).ok();
+    // One walk records every child. The copy uses that record, so a large
+    // folder is not listed and statted a second time before the first byte.
+    let measured = measure_local_tree(local_path, &cancel)?;
+    let total = measured.size;
     let mut transferred = 0_u64;
     on_progress(transferred, total);
     ensure_upload_directory(sftp, remote_dir)?;
-    if root_metadata
-        .as_ref()
-        .is_some_and(|metadata| local_path_is_link(local_path, metadata))
-    {
+    if measured.is_link {
         upload_symlink(
             sftp,
             local_path,
@@ -1039,26 +1038,20 @@ where
             &mut on_progress,
         )
         .context("failed to upload symlink")?;
-    } else if root_metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.is_dir())
-    {
+    } else if measured.is_dir {
         if open_remote_upload_dir(sftp, Path::new(&remote_path), conflict)? {
             upload_dir_recursive(
                 sftp,
-                local_path,
                 &remote_path,
                 total,
                 &mut transferred,
                 cancel,
                 conflict,
                 &mut on_progress,
-                true,
+                &measured,
             )
             .context("failed to upload directory")?;
-            if let Some(metadata) = root_metadata.as_ref() {
-                preserve_remote_metadata(sftp, Path::new(&remote_path), metadata);
-            }
+            preserve_remote_metadata(sftp, Path::new(&remote_path), &measured.metadata);
         } else {
             transferred = total;
             on_progress(transferred, total);
@@ -1073,7 +1066,7 @@ where
             cancel,
             conflict,
             None,
-            None,
+            Some(&measured.metadata),
             RemoteStatCache::Unknown,
             &mut on_progress,
         )
@@ -1586,7 +1579,7 @@ fn upload_single_file<F>(
     cancel: Arc<AtomicBool>,
     conflict: TransferConflictStrategy,
     opened: Option<File>,
-    known_metadata: Option<fs::Metadata>,
+    known_metadata: Option<&fs::Metadata>,
     mut known_remote: RemoteStatCache,
     on_progress: &mut F,
 ) -> Result<()>
@@ -1595,10 +1588,14 @@ where
 {
     // A folder listing already has the size and time. Statting each file
     // again is another pass over the disk.
+    let owned_metadata;
     let metadata = match known_metadata {
         Some(metadata) => metadata,
-        None => fs::metadata(local_path)
-            .with_context(|| format!("failed to stat {}", local_path.display()))?,
+        None => {
+            owned_metadata = fs::metadata(local_path)
+                .with_context(|| format!("failed to stat {}", local_path.display()))?;
+            &owned_metadata
+        }
     };
     // A folder upload already checked this and does not open a file it will skip.
     if opened.is_none() && matches!(conflict, TransferConflictStrategy::Skip) {
@@ -1629,7 +1626,7 @@ where
                 ResumeChoice::Complete => {
                     *transferred += metadata.len();
                     on_progress(*transferred, total);
-                    preserve_remote_metadata(sftp, remote_path, &metadata);
+                    preserve_remote_metadata(sftp, remote_path, metadata);
                     return Ok(());
                 }
                 ResumeChoice::TargetLarger { target, source } => {
@@ -1694,7 +1691,7 @@ where
     )?;
     drop(remote);
     drop(local);
-    preserve_remote_metadata(sftp, remote_path, &metadata);
+    preserve_remote_metadata(sftp, remote_path, metadata);
     Ok(())
 }
 
@@ -1818,35 +1815,23 @@ fn remote_upload_listing(
 
 fn upload_dir_recursive<F>(
     sftp: &ssh2::Sftp,
-    local_dir: &Path,
     remote_dir: &str,
     total: u64,
     transferred: &mut u64,
     cancel: Arc<AtomicBool>,
     conflict: TransferConflictStrategy,
     on_progress: &mut F,
-    fail_if_unreadable: bool,
+    directory: &LocalMeasuredEntry,
 ) -> Result<()>
 where
     F: FnMut(u64, u64),
 {
-    let entries = match fs::read_dir(local_dir) {
-        Ok(entries) => entries,
-        Err(error) if fail_if_unreadable => {
-            return Err(error).with_context(|| format!("failed to read {}", local_dir.display()));
-        }
-        Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
-        Err(_) => return Ok(()),
-    };
-    let mut local_entries = Vec::new();
-    for entry in entries {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("transfer cancelled");
-        }
-        local_entries.push(entry);
+    if cancel.load(Ordering::Relaxed) {
+        bail!("transfer cancelled");
     }
-    // An empty folder has nothing to compare with the server.
-    if local_entries.is_empty() {
+    // The folder was measured with the total. An unreadable or empty folder
+    // has nothing left to copy.
+    if directory.unreadable || directory.children.is_empty() {
         return Ok(());
     }
     // One listing answers existence and link type for every child. Resume
@@ -1857,8 +1842,6 @@ where
     } else {
         remote_upload_listing(sftp, remote_dir, &cancel)?
     };
-    // Read this folder's names once, and only after a file actually needs a
-    // numbered copy. Later files reuse that list instead of reading it again.
     let mut listed_names = remote_names.as_ref().map(|listing| {
         listing
             .by_name
@@ -1866,31 +1849,24 @@ where
             .cloned()
             .collect::<HashSet<_>>()
     });
-    for entry in local_entries {
+    for child in &directory.children {
         if cancel.load(Ordering::Relaxed) {
             bail!("transfer cancelled");
         }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        let local_path = entry.path();
-        let remote_name = entry.file_name().to_string_lossy().to_string();
-        let metadata = match dir_entry_metadata(&entry) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        if local_path_is_link(&local_path, &metadata) {
+        let local_path = &child.path;
+        let remote_name = child.name.as_str();
+        let metadata = &child.metadata;
+        if child.is_link {
             let remote_path = remote_child_for_conflict(
                 sftp,
                 remote_dir,
-                &remote_name,
+                remote_name,
                 conflict,
                 &mut listed_names,
             )?;
             upload_symlink(
                 sftp,
-                &local_path,
+                local_path,
                 Path::new(&remote_path),
                 total,
                 transferred,
@@ -1898,11 +1874,11 @@ where
                 listed_remote(remote_names.as_ref(), &remote_path).known_exists(),
                 on_progress,
             )?;
-        } else if metadata.is_dir() {
+        } else if child.is_dir {
             let remote_path = remote_child_for_conflict(
                 sftp,
                 remote_dir,
-                &remote_name,
+                remote_name,
                 conflict,
                 &mut listed_names,
             )?;
@@ -1912,26 +1888,25 @@ where
                 conflict,
                 listed_remote(remote_names.as_ref(), &remote_path),
             )? {
-                add_skipped_local_tree(&local_path, transferred, total, &cancel, on_progress)?;
+                note_skipped_bytes(transferred, total, child.size, on_progress);
                 continue;
             }
             upload_dir_recursive(
                 sftp,
-                &local_path,
                 &remote_path,
                 total,
                 transferred,
                 cancel.clone(),
                 conflict,
                 on_progress,
-                false,
+                child,
             )?;
-            preserve_remote_metadata(sftp, Path::new(&remote_path), &metadata);
+            preserve_remote_metadata(sftp, Path::new(&remote_path), metadata);
         } else if metadata.is_file() {
             let remote_path = remote_child_for_conflict(
                 sftp,
                 remote_dir,
-                &remote_name,
+                remote_name,
                 conflict,
                 &mut listed_names,
             )?;
@@ -1941,9 +1916,7 @@ where
                 let exists = match listed {
                     ListedRemote::Found(_) => true,
                     ListedRemote::Missing => false,
-                    ListedRemote::Unknown => {
-                        remote_path_exists(sftp, Path::new(&remote_path))
-                    }
+                    ListedRemote::Unknown => remote_path_exists(sftp, Path::new(&remote_path)),
                 };
                 if exists {
                     *transferred += metadata.len();
@@ -1969,7 +1942,7 @@ where
                         ResumeChoice::Complete => {
                             *transferred += metadata.len();
                             on_progress(*transferred, total);
-                            preserve_remote_metadata(sftp, Path::new(&remote_path), &metadata);
+                            preserve_remote_metadata(sftp, Path::new(&remote_path), metadata);
                             continue;
                         }
                         ResumeChoice::TargetLarger { target, source } => {
@@ -1993,7 +1966,7 @@ where
             // Keep this handle for the copy. A second open can fail on a busy
             // file and stop the rest of the folder. Finished files were handled
             // above, so an unreadable file is skipped only when its bytes are needed.
-            let opened = match File::open(&local_path) {
+            let opened = match File::open(local_path) {
                 Ok(file) => Some(file),
                 Err(_) => {
                     note_skipped_bytes(transferred, total, metadata.len(), on_progress);
@@ -2002,7 +1975,7 @@ where
             };
             upload_single_file(
                 sftp,
-                &local_path,
+                local_path,
                 Path::new(&remote_path),
                 total,
                 transferred,
@@ -2399,6 +2372,116 @@ where
         preserve_local_times(&local_path, atime, mtime);
     }
     Ok(())
+}
+
+struct LocalMeasuredEntry {
+    path: PathBuf,
+    name: String,
+    metadata: fs::Metadata,
+    is_link: bool,
+    is_dir: bool,
+    size: u64,
+    children: Vec<LocalMeasuredEntry>,
+    unreadable: bool,
+}
+
+fn measure_local_tree(path: &Path, cancel: &AtomicBool) -> Result<LocalMeasuredEntry> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("transfer cancelled");
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    measure_local_entry(path, name, metadata, cancel, true)
+}
+
+fn measure_local_entry(
+    path: &Path,
+    name: String,
+    metadata: fs::Metadata,
+    cancel: &AtomicBool,
+    fail_if_unreadable: bool,
+) -> Result<LocalMeasuredEntry> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("transfer cancelled");
+    }
+    let is_link = local_path_is_link(path, &metadata);
+    if is_link || !metadata.is_dir() {
+        let size = if is_link || !metadata.is_file() { 0 } else { metadata.len() };
+        return Ok(LocalMeasuredEntry {
+            path: path.to_path_buf(),
+            name,
+            metadata,
+            is_link,
+            is_dir: false,
+            size,
+            children: Vec::new(),
+            unreadable: false,
+        });
+    }
+
+    let read = match fs::read_dir(path) {
+        Ok(entries) => Some(entries),
+        Err(error) if fail_if_unreadable => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+        Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
+        Err(_) => None,
+    };
+    let Some(entries) = read else {
+        return Ok(LocalMeasuredEntry {
+            path: path.to_path_buf(),
+            name,
+            metadata,
+            is_link: false,
+            is_dir: true,
+            size: 0,
+            children: Vec::new(),
+            unreadable: true,
+        });
+    };
+
+    let mut children = Vec::new();
+    let mut size = 0_u64;
+    for entry in entries {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("transfer cancelled");
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let child_path = entry.path();
+        let child_metadata = match dir_entry_metadata(&entry) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let child_name = entry.file_name().to_string_lossy().into_owned();
+        match measure_local_entry(&child_path, child_name, child_metadata, cancel, false) {
+            Ok(node) => {
+                size += node.size;
+                children.push(node);
+            }
+            Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
+            Err(_) => continue,
+        }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        bail!("transfer cancelled");
+    }
+    Ok(LocalMeasuredEntry {
+        path: path.to_path_buf(),
+        name,
+        metadata,
+        is_link: false,
+        is_dir: true,
+        size,
+        children,
+        unreadable: false,
+    })
 }
 
 fn local_total_size(path: &Path, cancel: &AtomicBool) -> Result<u64> {
@@ -4257,6 +4340,12 @@ mod local_size_tests {
         let cancel = AtomicBool::new(false);
         let size = super::local_total_size(&root, &cancel).unwrap();
         assert_eq!(size, 5, "one locked folder should not fail the rest");
+        let measured = super::measure_local_tree(&root, &cancel).unwrap();
+        assert_eq!(measured.size, 5);
+        if let Some(locked_node) = measured.children.iter().find(|child| child.name == "locked") {
+            assert!(locked_node.unreadable);
+            assert_eq!(locked_node.size, 0);
+        }
 
         let error = super::local_total_size(&locked, &cancel).unwrap_err();
         assert!(
@@ -4483,5 +4572,57 @@ mod listing_stat_tests {
             ..bare
         };
         assert_eq!(listing_stat_with_type(typed).and_then(|stat| stat.perm), Some(0o100644));
+    }
+}
+
+#[cfg(test)]
+mod local_measure_tests {
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn measured_folder_keeps_nested_file_sizes() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-measure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        std::fs::write(root.join("sub").join("b.txt"), b"world!").unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+
+        let cancel = AtomicBool::new(false);
+        let measured = super::measure_local_tree(&root, &cancel).unwrap();
+        assert_eq!(measured.size, super::local_total_size(&root, &cancel).unwrap());
+        assert_eq!(measured.size, 11);
+        assert!(measured.is_dir);
+        assert!(!measured.is_link);
+        assert!(!measured.unreadable);
+        let file = measured
+            .children
+            .iter()
+            .find(|child| child.name == "a.txt")
+            .unwrap();
+        assert!(!file.is_dir);
+        assert_eq!(file.size, 5);
+        let sub = measured
+            .children
+            .iter()
+            .find(|child| child.name == "sub")
+            .unwrap();
+        assert!(sub.is_dir);
+        assert_eq!(sub.size, 6);
+        assert_eq!(sub.children.len(), 1);
+        assert_eq!(sub.children[0].name, "b.txt");
+        assert_eq!(sub.children[0].size, 6);
     }
 }
