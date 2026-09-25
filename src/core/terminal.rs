@@ -9,6 +9,8 @@ const TERMINAL_REPLAY_CAP: usize = 1024 * 1024;
 const TERMINAL_PENDING_CAP: usize = 1024 * 1024;
 const TERMINAL_OSC_SCAN_CAP: usize = 8 * 1024;
 const MAX_EVENTS_PER_PUMP: usize = 256;
+/// One screen update. A bigger slice makes the window stop answering keys.
+const TERMINAL_DRAIN_CHUNK: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSize {
@@ -294,15 +296,37 @@ impl TerminalModel {
     }
 
     pub fn drain_output(&mut self) -> String {
-        let (output, decoder) = self.pump_pending_output();
-        decode_pending(&decoder, &output)
+        let mut output = String::new();
+        loop {
+            let (bytes, decoder) = self.pump_pending_output();
+            if bytes.is_empty() {
+                break;
+            }
+            output.push_str(&decode_pending(&decoder, &bytes));
+        }
+        output
     }
 
     /// Pump and detach the bytes so the caller can decode them without holding
     /// the terminal map lock. Typing stays responsive while a large chunk is decoded.
     pub fn pump_pending_output(&mut self) -> (Vec<u8>, Arc<Mutex<Decoder>>) {
         self.pump_events();
-        let output = std::mem::take(&mut self.pending_output);
+        if self.pending_output.len() <= TERMINAL_DRAIN_CHUNK {
+            let output = std::mem::take(&mut self.pending_output);
+            return (output, Arc::clone(&self.output_decoder));
+        }
+        // Keep the rest for the next update so one burst cannot freeze the window.
+        let cut = align_terminal_cut(
+            &self.pending_output,
+            TERMINAL_DRAIN_CHUNK,
+            &self.profile.charset,
+        );
+        if cut == 0 || cut >= self.pending_output.len() {
+            let output = std::mem::take(&mut self.pending_output);
+            return (output, Arc::clone(&self.output_decoder));
+        }
+        let rest = self.pending_output.split_off(cut);
+        let output = std::mem::replace(&mut self.pending_output, rest);
         (output, Arc::clone(&self.output_decoder))
     }
 
@@ -830,5 +854,31 @@ mod tests {
             .unwrap();
         assert_eq!(model.drain_output(), " \u{4e2d}");
         assert_eq!(model.screen_text(), "ready \u{4e2d}");
+    }
+
+    #[test]
+    fn a_large_burst_reaches_the_screen_in_order() {
+        let (mut model, event_tx) = model_with_charset("UTF-8");
+        let mut bytes = Vec::new();
+        while bytes.len() < TERMINAL_DRAIN_CHUNK + 8_000 {
+            bytes.extend_from_slice("\u{4e2d}a".as_bytes());
+        }
+        event_tx.send(TerminalEvent::Output(bytes.clone())).unwrap();
+
+        let mut collected = Vec::new();
+        let mut rounds = 0usize;
+        loop {
+            let (next, decoder) = model.pump_pending_output();
+            if next.is_empty() {
+                break;
+            }
+            let text = decode_pending(&decoder, &next);
+            assert!(!text.is_empty(), "drain stalled at {}", collected.len());
+            collected.extend(text.into_bytes());
+            rounds += 1;
+            assert!(rounds < 8, "drain did not finish");
+        }
+        assert_eq!(collected, bytes);
+        assert!(rounds > 1);
     }
 }
