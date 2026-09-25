@@ -9472,7 +9472,7 @@ function bookmarkLabel(path: string) {
 }
 
 function visibleFiles(files: FileEntry[], showHidden: boolean, filter: string) {
-  const needle = filter.trim().toLowerCase();
+  const needle = filterNeedle(filter);
   if (showHidden && !needle) return files;
   return files.filter((file) => {
     if (!showHidden && isHiddenFile(file)) return false;
@@ -9484,9 +9484,13 @@ function visibleFiles(files: FileEntry[], showHidden: boolean, filter: string) {
 function visibleSelection(selected: FileEntry | null, showHidden: boolean, filter: string) {
   if (!selected) return null;
   if (!showHidden && isHiddenFile(selected)) return null;
-  const needle = filter.trim().toLowerCase();
+  const needle = filterNeedle(filter);
   if (needle && !fileSearchText(selected).includes(needle)) return null;
   return selected;
+}
+
+function filterNeedle(filter: string) {
+  return filter.trim().toLowerCase().replace(/\\/g, "/");
 }
 
 function selectionVisibleInFiles(selected: FileEntry | null, files: FileEntry[]) {
@@ -9767,7 +9771,7 @@ const fileSearchTextCache = new WeakMap<FileEntry, string>();
 function fileSearchText(file: FileEntry) {
   const cached = fileSearchTextCache.get(file);
   if (cached !== undefined) return cached;
-  const text = `${file.name}\n${file.path}\n${file.linkTarget ?? ""}`.toLowerCase();
+  const text = `${file.name}\n${file.path}\n${file.linkTarget ?? ""}`.replace(/\\/g, "/").toLowerCase();
   fileSearchTextCache.set(file, text);
   return text;
 }
