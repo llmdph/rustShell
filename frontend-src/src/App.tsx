@@ -9631,13 +9631,6 @@ function localRelativePath(basePath: string, path: string) {
   return target.startsWith(prefix) ? path.replace(/\\/g, "/").slice(prefix.length) : path;
 }
 
-function normalizeRemotePath(path: string) {
-  const collapsed = path.trim().replace(/\/+/g, "/");
-  if (!collapsed) return ".";
-  if (collapsed === "/") return "/";
-  return collapsed.replace(/\/+$/g, "");
-}
-
 function normalizeLocalComparablePath(path: string) {
   const trimmed = path.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
   return trimmed.toLowerCase();
@@ -9706,12 +9699,14 @@ function joinLocalPath(parent: string, child: string) {
 }
 
 function normalizeRemotePath(path: string) {
-  const absolute = path.startsWith("/");
+  const trimmed = path.trim();
+  const absolute = trimmed.startsWith("/");
   const parts: string[] = [];
-  for (const part of path.split("/")) {
+  for (const part of trimmed.split("/")) {
     if (!part || part === ".") continue;
     if (part === "..") {
-      parts.pop();
+      if (parts.length > 0 && parts[parts.length - 1] !== "..") parts.pop();
+      else if (!absolute) parts.push("..");
       continue;
     }
     parts.push(part);
