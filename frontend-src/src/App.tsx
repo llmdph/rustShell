@@ -336,6 +336,8 @@ export default function App() {
   const pendingRemotePreferPathRef = useRef<string | null>(null);
   const localListGenerationRef = useRef(0);
   const remoteListGenerationRef = useRef(0);
+  const skipNextLocalListRef = useRef(false);
+  const skipNextRemoteListRef = useRef(false);
   const localSelectionAnchorRef = useRef<string | null>(null);
   const remoteSelectionAnchorRef = useRef<string | null>(null);
   const [chmodTarget, setChmodTarget] = useState<FileEntry | null>(null);
@@ -1253,6 +1255,10 @@ export default function App() {
   }, [settings.theme]);
 
   useEffect(() => {
+    if (skipNextLocalListRef.current) {
+      skipNextLocalListRef.current = false;
+      return;
+    }
     refreshLocalFiles();
   }, [refreshLocalFiles]);
 
@@ -1300,9 +1306,12 @@ export default function App() {
   }, [activeProfile?.id, activeProfile?.protocol, passwordForActive, remoteBrowserReady]);
 
   useEffect(() => {
-    if (remoteBrowserReady && remoteHomeReady) {
-      refreshRemoteFiles();
+    if (!(remoteBrowserReady && remoteHomeReady)) return;
+    if (skipNextRemoteListRef.current) {
+      skipNextRemoteListRef.current = false;
+      return;
     }
+    refreshRemoteFiles();
   }, [refreshRemoteFiles, remoteBrowserReady, remoteHomeReady]);
 
   useEffect(() => {
@@ -3380,34 +3389,39 @@ export default function App() {
   const locateSymlinkTarget = async (side: FileSide, entry: FileEntry | null) => {
     if (!entry || entry.fileType !== "symlink" || !entry.linkTarget?.trim()) return;
     const targetPath = resolveSymlinkTargetPath(side, entry);
-    if (!targetPath) return;
+    const next = targetPath.trim();
+    if (!next) return;
     try {
       if (side === "local") {
-        const listing = await api.listLocalDir(targetPath);
+        const listing = await api.listLocalDir(next);
         localListGenerationRef.current += 1;
         setLocalFiles(listing.entries);
         setLocalDirTruncated(listing.truncated);
-        setSelectedLocal(null);
-        setSelectedLocalPaths([]);
-        navigateLocalPath(targetPath);
+        setLocalSearch(null);
+        clearLocalSelection();
+        setStatus(`本地 ${next}`);
+        if (next !== localPath) skipNextLocalListRef.current = true;
+        navigateLocalPath(next);
         return;
       }
 
       if (!activeProfile || isLocalProtocol(activeProfile.protocol)) return;
-      const listing = await api.listRemoteDir(activeProfile.id, targetPath, passwordForActive);
+      const listing = await api.listRemoteDir(activeProfile.id, next, passwordForActive);
       remoteListGenerationRef.current += 1;
       setRemoteFiles(listing.entries);
       setRemoteDirTruncated(listing.truncated);
-      setSelectedRemote(null);
-      setSelectedRemotePaths([]);
-      navigateRemotePath(targetPath);
+      setRemoteSearch(null);
+      clearRemoteSelection();
+      setStatus(`远程 ${activeProfile.host}:${next}`);
+      if (next !== remotePath) skipNextRemoteListRef.current = true;
+      navigateRemotePath(next);
     } catch (error) {
       if (side === "remote" && requestActiveProfileSecretIfNeeded(error)) return;
-      const parentPath = parentPathForSide(side, targetPath);
+      const parentPath = parentPathForSide(side, next);
       if (side === "local") {
-        navigateLocalPath(parentPath, targetPath);
+        navigateLocalPath(parentPath, next);
       } else {
-        navigateRemotePath(parentPath, targetPath);
+        navigateRemotePath(parentPath, next);
       }
       pushToast("info", "已定位到链接目标所在目录");
     }
