@@ -675,6 +675,13 @@ fn entry_matches_query(entry: &FileEntry, query: &str) -> bool {
 }
 
 fn entry_from_stat(sftp: &ssh2::Sftp, path_buf: PathBuf, stat: ssh2::FileStat) -> FileEntry {
+    // Some servers omit permissions in a directory listing, and without them
+    // every entry looks like a file. A follow-up stat is only needed then.
+    let stat = if stat.perm.is_some() {
+        stat
+    } else {
+        sftp.lstat(&path_buf).unwrap_or(stat)
+    };
     let name = path_buf
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
