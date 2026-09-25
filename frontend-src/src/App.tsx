@@ -10015,17 +10015,23 @@ function uniqueDuplicateName(name: string, occupiedNames: Set<string>) {
 
 function remoteParentPath(path: string) {
   const trimmed = path.trim().replace(/\/+$/g, "");
-  if (!trimmed || trimmed === ".") return ".";
-  if (trimmed === "/") return "/";
+  // "/" is empty after the trailing slash is removed. That is still the top folder.
+  if (!trimmed) return "/";
+  if (trimmed === ".") return ".";
   const index = trimmed.lastIndexOf("/");
-  if (index === 0) return "/";
-  if (index > 0) return trimmed.slice(0, index);
-  return ".";
+  if (index <= 0) return index === 0 ? "/" : ".";
+  return trimmed.slice(0, index);
 }
 
 function localParentPath(path: string) {
-  const trimmed = path.trim().replace(/[\\/]+$/g, "");
-  if (!trimmed) return ".";
+  const raw = path.trim();
+  const trimmed = raw.replace(/[\\/]+$/g, "");
+  if (!trimmed) {
+    if (/^[\\/]+$/.test(raw)) {
+      return raw.includes("\\") && !raw.includes("/") ? "\\" : "/";
+    }
+    return ".";
+  }
   if (/^[A-Za-z]:$/.test(trimmed)) return `${trimmed}\\`;
   if (/^\\\\[^\\]+$/.test(trimmed) || /^\/\/[^/]+$/.test(trimmed)) return trimmed;
   if (/^\\\\[^\\]+\\[^\\]+$/.test(trimmed) || /^\/\/[^/]+\/[^/]+$/.test(trimmed)) return trimmed;
