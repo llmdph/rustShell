@@ -1066,6 +1066,7 @@ where
             cancel,
             conflict,
             None,
+            None,
             RemoteStatCache::Unknown,
             &mut on_progress,
         )
@@ -1578,14 +1579,20 @@ fn upload_single_file<F>(
     cancel: Arc<AtomicBool>,
     conflict: TransferConflictStrategy,
     opened: Option<File>,
+    known_metadata: Option<fs::Metadata>,
     mut known_remote: RemoteStatCache,
     on_progress: &mut F,
 ) -> Result<()>
 where
     F: FnMut(u64, u64),
 {
-    let metadata = fs::metadata(local_path)
-        .with_context(|| format!("failed to stat {}", local_path.display()))?;
+    // A folder listing already has the size and time. Statting each file
+    // again is another pass over the disk.
+    let metadata = match known_metadata {
+        Some(metadata) => metadata,
+        None => fs::metadata(local_path)
+            .with_context(|| format!("failed to stat {}", local_path.display()))?,
+    };
     // A folder upload already checked this and does not open a file it will skip.
     if opened.is_none() && matches!(conflict, TransferConflictStrategy::Skip) {
         let exists = match &known_remote {
@@ -1995,6 +2002,7 @@ where
                 cancel.clone(),
                 conflict,
                 opened,
+                Some(metadata),
                 known_remote,
                 on_progress,
             )?;
