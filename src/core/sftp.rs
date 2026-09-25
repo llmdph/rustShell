@@ -95,7 +95,9 @@ pub fn list_local_dir(path: &str) -> std::io::Result<DirListing> {
     let dir = Path::new(path);
 
     for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path();
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
