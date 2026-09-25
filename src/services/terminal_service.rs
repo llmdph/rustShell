@@ -8,12 +8,17 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use portable_pty::{CommandBuilder, PtySize};
 use ssh2::ErrorCode;
 use std::{
+    collections::VecDeque,
     io::{ErrorKind, Read, Write},
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::Duration,
 };
 
 const TERMINAL_EVENT_CHANNEL_CAP: usize = 64;
+/// Unread terminal output kept while the window is behind. Past this, the
+/// oldest unread bytes are dropped so a fast command can still be stopped.
+const PTY_OUTPUT_BACKLOG: usize = 1024 * 1024;
 
 pub struct TerminalLauncher;
 
@@ -108,6 +113,122 @@ fn run_placeholder(
     Ok(())
 }
 
+
+struct PtyOutputQueue {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    finished: bool,
+}
+
+fn lock_pty_output(queue: &Mutex<PtyOutputQueue>) -> std::sync::MutexGuard<'_, PtyOutputQueue> {
+    queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn spawn_pty_output_reader(
+    reader: Box<dyn Read + Send>,
+    event_tx: Sender<TerminalEvent>,
+) -> std::io::Result<()> {
+    let queue = Arc::new(Mutex::new(PtyOutputQueue {
+        chunks: VecDeque::new(),
+        bytes: 0,
+        finished: false,
+    }));
+    let ready = Arc::new(Condvar::new());
+
+    let sender_queue = Arc::clone(&queue);
+    let sender_ready = Arc::clone(&ready);
+    let sender_tx = event_tx.clone();
+    thread::Builder::new()
+        .name("pty-output".to_owned())
+        .spawn(move || send_pty_output(sender_queue, sender_ready, sender_tx))?;
+
+    let reader_queue = Arc::clone(&queue);
+    let reader_ready = Arc::clone(&ready);
+    if let Err(error) = thread::Builder::new()
+        .name("pty-reader".to_owned())
+        .spawn(move || read_pty_output(reader, reader_queue, reader_ready, event_tx))
+    {
+        let mut guard = lock_pty_output(&queue);
+        guard.finished = true;
+        ready.notify_one();
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn read_pty_output(
+    mut reader: Box<dyn Read + Send>,
+    queue: Arc<Mutex<PtyOutputQueue>>,
+    ready: Arc<Condvar>,
+    event_tx: Sender<TerminalEvent>,
+) {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        if lock_pty_output(&queue).finished {
+            break;
+        }
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = buffer[..n].to_vec();
+                let mut guard = lock_pty_output(&queue);
+                if guard.finished {
+                    break;
+                }
+                guard.bytes += chunk.len();
+                guard.chunks.push_back(chunk);
+                while guard.bytes > PTY_OUTPUT_BACKLOG {
+                    let Some(old) = guard.chunks.pop_front() else {
+                        break;
+                    };
+                    guard.bytes = guard.bytes.saturating_sub(old.len());
+                }
+                ready.notify_one();
+            }
+            Err(error) => {
+                let _ = event_tx.try_send(TerminalEvent::Error(error.to_string()));
+                break;
+            }
+        }
+    }
+    let mut guard = lock_pty_output(&queue);
+    guard.finished = true;
+    ready.notify_one();
+}
+
+fn send_pty_output(
+    queue: Arc<Mutex<PtyOutputQueue>>,
+    ready: Arc<Condvar>,
+    event_tx: Sender<TerminalEvent>,
+) {
+    loop {
+        let chunk = {
+            let mut guard = lock_pty_output(&queue);
+            loop {
+                if let Some(chunk) = guard.chunks.pop_front() {
+                    guard.bytes = guard.bytes.saturating_sub(chunk.len());
+                    break Some(chunk);
+                }
+                if guard.finished {
+                    break None;
+                }
+                guard = ready.wait(guard).unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
+        let Some(chunk) = chunk else {
+            return;
+        };
+        if event_tx.send(TerminalEvent::Output(chunk)).is_err() {
+            let mut guard = lock_pty_output(&queue);
+            guard.finished = true;
+            guard.chunks.clear();
+            guard.bytes = 0;
+            ready.notify_one();
+            return;
+        }
+    }
+}
+
 fn run_local_shell(
     _profile: SessionProfile,
     local_shell: Option<String>,
@@ -139,7 +260,7 @@ fn run_local_shell(
         .context("failed to spawn local shell")?;
     drop(pair.slave);
 
-    let mut reader = pair
+    let reader = pair
         .master
         .try_clone_reader()
         .context("failed to clone PTY reader")?;
@@ -150,30 +271,9 @@ fn run_local_shell(
 
     event_tx.send(TerminalEvent::Connected).ok();
 
-    let reader_tx = event_tx.clone();
-    thread::Builder::new()
-        .name("local-pty-reader".to_owned())
-        .spawn(move || {
-            let mut buffer = [0_u8; 16 * 1024];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if reader_tx
-                            .send(TerminalEvent::Output(buffer[..n].to_vec()))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        reader_tx.send(TerminalEvent::Error(error.to_string())).ok();
-                        break;
-                    }
-                }
-            }
-        })
-        .context("failed to spawn PTY reader")?;
+    // Reading stays ahead of the window. Otherwise a command that prints
+    // faster than the screen can fill the console and stop accepting input.
+    spawn_pty_output_reader(reader, event_tx.clone()).context("failed to spawn PTY reader")?;
 
     let master = pair.master;
     while let Ok(command) = command_rx.recv() {
@@ -255,7 +355,7 @@ fn run_system_ssh_shell(
         .context("failed to spawn system ssh")?;
     drop(pair.slave);
 
-    let mut reader = pair
+    let reader = pair
         .master
         .try_clone_reader()
         .context("failed to clone SSH PTY reader")?;
@@ -266,30 +366,7 @@ fn run_system_ssh_shell(
 
     event_tx.send(TerminalEvent::Connected).ok();
 
-    let reader_tx = event_tx.clone();
-    thread::Builder::new()
-        .name("system-ssh-reader".to_owned())
-        .spawn(move || {
-            let mut buffer = [0_u8; 16 * 1024];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if reader_tx
-                            .send(TerminalEvent::Output(buffer[..n].to_vec()))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        reader_tx.send(TerminalEvent::Error(error.to_string())).ok();
-                        break;
-                    }
-                }
-            }
-        })
-        .context("failed to spawn SSH PTY reader")?;
+    spawn_pty_output_reader(reader, event_tx.clone()).context("failed to spawn SSH PTY reader")?;
 
     let master = pair.master;
     while let Ok(command) = command_rx.recv() {
