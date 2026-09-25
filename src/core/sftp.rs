@@ -281,6 +281,7 @@ pub fn local_read_text_file(path: &str) -> std::io::Result<LocalTextFile> {
     let truncated = bytes.len() as u64 > LOCAL_TEXT_PREVIEW_LIMIT;
     if truncated {
         bytes.truncate(LOCAL_TEXT_PREVIEW_LIMIT as usize);
+        trim_partial_utf8_suffix(&mut bytes);
     }
     let is_binary = bytes.iter().any(|byte| *byte == 0);
     let content = String::from_utf8_lossy(&bytes).to_string();
@@ -316,6 +317,9 @@ pub fn local_read_text_file_tail(path: &str) -> std::io::Result<LocalTextFile> {
     let mut bytes = Vec::new();
     file.take(LOCAL_TEXT_PREVIEW_LIMIT)
         .read_to_end(&mut bytes)?;
+    if start > 0 {
+        trim_partial_utf8_prefix(&mut bytes);
+    }
     let is_binary = bytes.iter().any(|byte| *byte == 0);
     let content = String::from_utf8_lossy(&bytes).to_string();
 
@@ -470,6 +474,51 @@ fn entry_matches_query(entry: &FileEntry, query: &str) -> bool {
             .link_target
             .as_deref()
             .is_some_and(|target| target.to_lowercase().contains(query))
+}
+
+
+fn trim_partial_utf8_prefix(bytes: &mut Vec<u8>) {
+    let mut index = 0;
+    while index < bytes.len() && bytes[index] & 0b1100_0000 == 0b1000_0000 {
+        index += 1;
+    }
+    if index > 0 {
+        bytes.drain(..index);
+    }
+}
+
+fn trim_partial_utf8_suffix(bytes: &mut Vec<u8>) {
+    if bytes.is_empty() {
+        return;
+    }
+    let mut index = bytes.len() - 1;
+    let mut continuations = 0usize;
+    loop {
+        let byte = bytes[index];
+        if byte & 0b1100_0000 != 0b1000_0000 {
+            let needed = match byte {
+                0x00..=0x7F => 1,
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF7 => 4,
+                _ => 1,
+            };
+            if continuations + 1 < needed {
+                bytes.truncate(index);
+            }
+            return;
+        }
+        if index == 0 {
+            bytes.clear();
+            return;
+        }
+        index -= 1;
+        continuations += 1;
+        if continuations >= 3 {
+            bytes.truncate(index);
+            return;
+        }
+    }
 }
 
 fn local_entry_from_path(path_buf: PathBuf, metadata: fs::Metadata) -> FileEntry {
