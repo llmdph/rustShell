@@ -580,6 +580,14 @@ fn remote_dir_has_another_entry(dir: &mut ssh2::File, dirname: &Path) -> Result<
     }
 }
 
+fn sftp_item_is_unavailable(error: &ssh2::Error) -> bool {
+    // NO_SUCH_FILE, PERMISSION_DENIED, NO_SUCH_PATH. A dead session is not one of these.
+    matches!(
+        error.code(),
+        ssh2::ErrorCode::SFTP(2) | ssh2::ErrorCode::SFTP(3) | ssh2::ErrorCode::SFTP(10)
+    )
+}
+
 fn is_libssh2_session_code(error: &ssh2::Error, code: i32) -> bool {
     error.code() == ssh2::ErrorCode::Session(code)
 }
@@ -1799,6 +1807,23 @@ where
                 on_progress,
             )?;
         } else {
+            match sftp.open(&remote_path) {
+                Ok(file) => drop(file),
+                Err(error) if sftp_item_is_unavailable(&error) => {
+                    let size = sftp
+                        .lstat(&remote_path)
+                        .ok()
+                        .and_then(|stat| stat.size)
+                        .unwrap_or(0);
+                    note_skipped_bytes(transferred, total, size, on_progress);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to open remote file {}", remote_path.display())
+                    });
+                }
+            }
             download_single_file(
                 sftp,
                 &remote_path,
