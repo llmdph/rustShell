@@ -1950,6 +1950,15 @@ select:disabled {
   pointer-events: none;
 }
 
+.file-drop-hint.file-drop-folder {
+  inset: auto 8px 8px;
+  height: 28px;
+  padding: 0 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .file-pane-head {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
@@ -2326,6 +2335,11 @@ select:disabled {
 
 .file-row.selected {
   background: color-mix(in srgb, var(--primary) 24%, var(--panel-2));
+}
+
+.file-row.drop-target {
+  background: color-mix(in srgb, var(--primary) 28%, var(--panel-2));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 82%, transparent);
 }
 
 .compare-badge {

@@ -382,6 +382,7 @@ export default function App() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [hostKeyPrompt, setHostKeyPrompt] = useState<{ profileId: string; issue: HostKeyIssue } | null>(null);
   const [dragOverSide, setDragOverSide] = useState<FileSide | null>(null);
+  const [dragOverDirectory, setDragOverDirectory] = useState<string | null>(null);
   const [profileSecrets, setProfileSecrets] = useState<Record<string, string>>({});
   const [profileSecretDrafts, setProfileSecretDrafts] = useState<Record<string, string>>({});
   const bootedRef = useRef(false);
@@ -3531,17 +3532,18 @@ export default function App() {
     }
   };
 
-  const startTransferEntries = async (direction: "upload" | "download", entries: FileEntry[], successPrefix = "传输") => {
+  const startTransferEntries = async (direction: "upload" | "download", entries: FileEntry[], successPrefix = "传输", destination?: string) => {
     if (!activeProfile || isLocalProtocol(activeProfile.protocol)) return;
     if (entries.length === 0) return;
+    const targetDirectory = destination?.trim() || (direction === "upload" ? remotePath : localPath);
     const failures: string[] = [];
     let started = 0;
     for (const entry of entries) {
       try {
         if (direction === "upload") {
-          await api.startTransfer(activeProfile.id, "upload", entry.path, remotePath, transferConflict, passwordForActive);
+          await api.startTransfer(activeProfile.id, "upload", entry.path, targetDirectory, transferConflict, passwordForActive);
         } else {
-          await api.startTransfer(activeProfile.id, "download", localPath, entry.path, transferConflict, passwordForActive);
+          await api.startTransfer(activeProfile.id, "download", targetDirectory, entry.path, transferConflict, passwordForActive);
         }
         started += 1;
       } catch (error) {
@@ -3608,7 +3610,7 @@ export default function App() {
   };
 
   const uploadExternalPaths = useCallback(
-    async (paths: string[]) => {
+    async (paths: string[], destination?: string | null) => {
       if (!activeProfile || isLocalProtocol(activeProfile.protocol)) {
         pushToast("info", "请选择远程会话后再拖入上传");
         return;
@@ -3619,12 +3621,13 @@ export default function App() {
       }
       const uniquePaths = Array.from(new Set(paths.map((path) => path.trim()).filter(Boolean)));
       if (uniquePaths.length === 0) return;
+      const targetDirectory = destination?.trim() || remotePath;
 
       const failures: string[] = [];
       let started = 0;
       for (const path of uniquePaths) {
         try {
-          await api.startTransfer(activeProfile.id, "upload", path, remotePath, transferConflict, passwordForActive);
+          await api.startTransfer(activeProfile.id, "upload", path, targetDirectory, transferConflict, passwordForActive);
           started += 1;
         } catch (error) {
           failures.push(`${pathBaseName(path) || path}: ${String(error)}`);
@@ -3819,22 +3822,6 @@ export default function App() {
     }
   };
 
-  const filePaneSideAtPosition = useCallback((position: { x: number; y: number }): FileSide | null => {
-    const ratio = window.devicePixelRatio || 1;
-    const candidates = [
-      { x: position.x, y: position.y },
-      { x: position.x / ratio, y: position.y / ratio }
-    ];
-    for (const point of candidates) {
-      if (point.x < 0 || point.y < 0 || point.x > window.innerWidth || point.y > window.innerHeight) continue;
-      const element = document.elementFromPoint(point.x, point.y) as HTMLElement | null;
-      const pane = element?.closest<HTMLElement>("[data-file-pane-side]");
-      const side = pane?.dataset.filePaneSide;
-      if (side === "local" || side === "remote") return side;
-    }
-    return null;
-  }, []);
-
   useEffect(() => {
     if (!hasTauriRuntime()) return;
     let disposed = false;
@@ -3845,21 +3832,26 @@ export default function App() {
         const payload = event.payload;
         if (payload.type === "leave") {
           setDragOverSide((current) => (current === "remote" ? null : current));
+          setDragOverDirectory(null);
           return;
         }
 
-        const side = filePaneSideAtPosition(payload.position);
+        const element = dragPointElement(payload.position);
+        const side = filePaneSideFromElement(element);
         if (payload.type === "enter" || payload.type === "over") {
           if (remoteBrowserReady && remoteHomeReady && (side === "remote" || (isFileManagerWindow && side !== "local"))) {
             setDragOverSide("remote");
+            setDragOverDirectory(side === "remote" ? directoryPathFromDropTarget(element) : null);
           } else {
             setDragOverSide((current) => (current === "remote" ? null : current));
+            setDragOverDirectory(null);
           }
           return;
         }
 
         if (payload.type === "drop") {
           setDragOverSide((current) => (current === "remote" ? null : current));
+          setDragOverDirectory(null);
           if (side === "local") {
             pushToast("info", "请拖放到远程面板上传");
             return;
@@ -3867,7 +3859,8 @@ export default function App() {
           if (side !== "remote" && !isFileManagerWindow) {
             return;
           }
-          void uploadExternalPaths(payload.paths);
+          const directory = side === "remote" ? directoryPathFromDropTarget(element) : null;
+          void uploadExternalPaths(payload.paths, directory);
         }
       })
       .then((nextUnlisten) => {
@@ -3885,7 +3878,7 @@ export default function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [filePaneSideAtPosition, isFileManagerWindow, pushToast, remoteBrowserReady, remoteHomeReady, uploadExternalPaths]);
+  }, [isFileManagerWindow, pushToast, remoteBrowserReady, remoteHomeReady, uploadExternalPaths]);
 
   const beginFileDrag = (side: FileSide, file: FileEntry, event: DragEvent<HTMLButtonElement>) => {
     const selectedPaths = side === "local" ? selectedLocalPaths : selectedRemotePaths;
@@ -3902,31 +3895,37 @@ export default function App() {
     if (!activeProfile || isLocalProtocol(activeProfile.protocol)) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
+    const directory = directoryPathFromDropTarget(event.target);
     setDragOverSide(side);
+    setDragOverDirectory((current) => (current === directory ? current : directory));
   };
 
   const handleFileDragLeave = (side: FileSide, event: DragEvent<HTMLDivElement>) => {
     const nextTarget = event.relatedTarget as Node | null;
     if (nextTarget && event.currentTarget.contains(nextTarget)) return;
     setDragOverSide((current) => (current === side ? null : current));
+    setDragOverDirectory(null);
   };
 
   const handleFileDrop = async (side: FileSide, event: DragEvent<HTMLDivElement>) => {
     const payload = fileDragRef.current;
+    const directory = directoryPathFromDropTarget(event.target);
     fileDragRef.current = null;
     setDragOverSide(null);
+    setDragOverDirectory(null);
     if (!payload || payload.side === side) return;
     event.preventDefault();
     if (payload.side === "local" && side === "remote") {
-      await startTransferEntries("upload", payload.entries);
+      await startTransferEntries("upload", payload.entries, undefined, directory ?? undefined);
     } else if (payload.side === "remote" && side === "local") {
-      await startTransferEntries("download", payload.entries);
+      await startTransferEntries("download", payload.entries, undefined, directory ?? undefined);
     }
   };
 
   const endFileDrag = () => {
     fileDragRef.current = null;
     setDragOverSide(null);
+    setDragOverDirectory(null);
   };
 
   const filteredProfiles = useMemo(() => {
@@ -4749,6 +4748,7 @@ export default function App() {
               onDragLeave={(event) => handleFileDragLeave("local", event)}
               onDrop={(event) => handleFileDrop("local", event)}
               dropActive={dragOverSide === "local"}
+              dropDirectory={dragOverSide === "local" ? dragOverDirectory : null}
               onSort={(key) => setLocalSort((current) => nextFileSort(current, key))}
               onOpen={(file) =>
                 file.isDir ? navigateLocalPath(file.path) : file.fileType === "symlink" ? locateSymlinkTarget("local", file) : openLocalEditor(file)
@@ -5094,6 +5094,7 @@ export default function App() {
                 onDragLeave={(event) => handleFileDragLeave("remote", event)}
                 onDrop={(event) => handleFileDrop("remote", event)}
                 dropActive={dragOverSide === "remote"}
+                dropDirectory={dragOverSide === "remote" ? dragOverDirectory : null}
                 onSort={(key) => setRemoteSort((current) => nextFileSort(current, key))}
                 onOpen={(file) =>
                   file.isDir ? navigateRemotePath(file.path) : file.fileType === "symlink" ? locateSymlinkTarget("remote", file) : openRemoteEditor(file)
@@ -6377,6 +6378,37 @@ function SessionTree({
   );
 }
 
+
+function dragPointElement(position: { x: number; y: number }): HTMLElement | null {
+  const ratio = window.devicePixelRatio || 1;
+  const candidates = [
+    { x: position.x, y: position.y },
+    { x: position.x / ratio, y: position.y / ratio }
+  ];
+  let fallback: HTMLElement | null = null;
+  for (const point of candidates) {
+    if (point.x < 0 || point.y < 0 || point.x > window.innerWidth || point.y > window.innerHeight) continue;
+    const element = document.elementFromPoint(point.x, point.y);
+    if (!(element instanceof HTMLElement)) continue;
+    if (!fallback) fallback = element;
+    if (element.closest("[data-file-pane-side]")) return element;
+  }
+  return fallback;
+}
+
+function filePaneSideFromElement(element: HTMLElement | null): FileSide | null {
+  const side = element?.closest<HTMLElement>("[data-file-pane-side]")?.dataset.filePaneSide;
+  return side === "local" || side === "remote" ? side : null;
+}
+
+function directoryPathFromDropTarget(target: EventTarget | null): string | null {
+  const element = target instanceof Element ? target : target instanceof Node ? target.parentElement : null;
+  const row = element?.closest<HTMLElement>("[data-entry-path]");
+  if (!row || row.dataset.entryDir !== "1") return null;
+  const path = row.dataset.entryPath?.trim() ?? "";
+  return path || null;
+}
+
 function FilePane({
   side,
   title,
@@ -6398,6 +6430,7 @@ function FilePane({
   onDragLeave,
   onDrop,
   dropActive,
+  dropDirectory,
   onSort,
   onOpen,
   onBack,
@@ -6440,6 +6473,7 @@ function FilePane({
   onDragLeave: (event: DragEvent<HTMLDivElement>) => void;
   onDrop: (event: DragEvent<HTMLDivElement>) => void;
   dropActive: boolean;
+  dropDirectory: string | null;
   onSort: (key: FileSortKey) => void;
   onOpen: (file: FileEntry) => void;
   onBack: () => void;
@@ -6521,7 +6555,13 @@ function FilePane({
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      {dropActive && <div className="file-drop-hint">拖放到{side === "local" ? "本地下载" : "远程上传"}</div>}
+      {dropActive && (
+        <div className={`file-drop-hint ${dropDirectory ? "file-drop-folder" : ""}`}>
+          {dropDirectory
+            ? `放入 ${pathBaseName(dropDirectory) || dropDirectory}`
+            : `拖放到${side === "local" ? "本地下载" : "远程上传"}`}
+        </div>
+      )}
       <div className="file-pane-head">
         <div className="file-pane-title">{title}</div>
         <div className="file-toolbar">
@@ -6605,6 +6645,7 @@ function FilePane({
         onOpen={onOpen}
         onDragStart={onDragStart}
         onDragEnd={onDragEnd}
+        dropDirectory={dropDirectory}
         onSelectAll={onSelectAll}
         onClearSelection={onClearSelection}
         onRemove={onRemove}
@@ -6841,6 +6882,7 @@ function FileList({
   onOpen,
   onDragStart,
   onDragEnd,
+  dropDirectory,
   onSelectAll,
   onClearSelection,
   onRemove,
@@ -6857,6 +6899,7 @@ function FileList({
   onOpen: (file: FileEntry) => void;
   onDragStart: (file: FileEntry, event: DragEvent<HTMLButtonElement>) => void;
   onDragEnd: () => void;
+  dropDirectory: string | null;
   onSelectAll: () => void;
   onClearSelection: () => void;
   onRemove: () => void;
@@ -6954,7 +6997,9 @@ function FileList({
             style={virtual ? { top: rowIndex * FILE_ROW_HEIGHT } : undefined}
             className={`file-row ${virtual ? "file-virtual" : ""} ${compareMark ? `compare-${compareMark.kind}` : ""} ${
               selectedPathSet.has(file.path) ? "selected" : ""
-            } ${selected?.path === file.path ? "primary" : ""}`}
+            } ${selected?.path === file.path ? "primary" : ""} ${dropDirectory === file.path ? "drop-target" : ""}`}
+            data-entry-path={file.path}
+            data-entry-dir={file.isDir ? "1" : undefined}
             onClick={(event) => onSelect(file, event)}
             onDoubleClick={() => onOpen(file)}
             draggable
