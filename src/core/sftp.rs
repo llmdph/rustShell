@@ -697,26 +697,38 @@ fn query_has_separator(query: &str) -> bool {
 }
 
 fn separator_folded_contains(haystack: &str, needle: &str) -> bool {
-    if haystack.is_ascii() && needle.is_ascii() {
-        let needle_bytes: Vec<u8> = needle.bytes().map(fold_ascii_path_byte).collect();
-        if needle_bytes.is_empty() || haystack.len() < needle_bytes.len() {
-            return needle_bytes.is_empty();
-        }
-        return haystack
-            .bytes()
-            .map(fold_ascii_path_byte)
-            .collect::<Vec<u8>>()
-            .windows(needle_bytes.len())
-            .any(|window| window == needle_bytes.as_slice());
-    }
-    let needle_chars: Vec<char> = needle.chars().map(fold_path_char).collect();
-    if needle_chars.is_empty() {
+    if needle.is_empty() {
         return true;
     }
-    let haystack_chars: Vec<char> = haystack.chars().map(fold_path_char).collect();
-    haystack_chars
-        .windows(needle_chars.len())
-        .any(|window| window == needle_chars.as_slice())
+    if haystack.is_ascii() && needle.is_ascii() {
+        let haystack = haystack.as_bytes();
+        let needle = needle.as_bytes();
+        if haystack.len() < needle.len() {
+            return false;
+        }
+        return haystack.windows(needle.len()).any(|window| {
+            window
+                .iter()
+                .zip(needle)
+                .all(|(left, right)| fold_ascii_path_byte(*left) == fold_ascii_path_byte(*right))
+        });
+    }
+    haystack
+        .char_indices()
+        .any(|(index, _)| folded_chars_match(haystack[index..].chars(), needle.chars()))
+}
+
+fn folded_chars_match(
+    mut haystack: impl Iterator<Item = char>,
+    needle: impl Iterator<Item = char>,
+) -> bool {
+    for expected in needle {
+        match haystack.next() {
+            Some(actual) if fold_path_char(actual) == fold_path_char(expected) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn fold_ascii_path_byte(byte: u8) -> u8 {
@@ -1054,6 +1066,11 @@ mod tests {
         assert!(!text_contains_query("notes.txt", "\u{62a5}\u{544a}"));
         assert!(path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), "notes"));
         assert!(path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), "projects/notes"));
+        assert!(path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), r"projects\notes"));
+        assert!(path_contains_query(
+            Path::new("\u{76ee}\u{5f55}/\u{62a5}\u{544a}.TXT"),
+            "\u{76ee}\u{5f55}\\\u{62a5}\u{544a}"
+        ));
         assert!(!path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), "png"));
     }
 
