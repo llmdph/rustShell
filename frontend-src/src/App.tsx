@@ -4071,17 +4071,30 @@ export default function App() {
     const selectedEntries = side === "local" ? visibleSelectedLocalEntries : visibleSelectedRemoteEntries;
     const entries = selectedPaths.includes(file.path) && selectedEntries.length > 0 ? selectedEntries : [file];
     fileDragRef.current = { side, entries };
-    event.dataTransfer.effectAllowed = "copy";
+    event.dataTransfer.effectAllowed = "copyMove";
     event.dataTransfer.setData("text/plain", entries.map((entry) => entry.path).join("\n"));
   };
 
   const handleFileDragOver = (side: FileSide, event: DragEvent<HTMLDivElement>) => {
     const payload = fileDragRef.current;
-    if (!payload || payload.side === side) return;
+    if (!payload) return;
+    const directory = directoryPathFromDropTarget(event.target);
+    if (payload.side === side) {
+      const canMove = Boolean(directory) && payload.entries.some((entry) => canDropEntryInto(side, entry.path, directory!));
+      if (!canMove || !directory) {
+        setDragOverSide((current) => (current === side ? null : current));
+        setDragOverDirectory(null);
+        return;
+      }
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      setDragOverSide(side);
+      setDragOverDirectory((current) => (current === directory ? current : directory));
+      return;
+    }
     if (!activeProfile || isLocalProtocol(activeProfile.protocol)) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
-    const directory = directoryPathFromDropTarget(event.target);
     setDragOverSide(side);
     setDragOverDirectory((current) => (current === directory ? current : directory));
   };
@@ -4093,13 +4106,53 @@ export default function App() {
     setDragOverDirectory(null);
   };
 
+  const moveDroppedEntries = async (side: FileSide, entries: FileEntry[], directory: string) => {
+    if (side === "remote" && (!activeProfile || isLocalProtocol(activeProfile.protocol))) return;
+    const failures: string[] = [];
+    let moved = 0;
+    let lastPath = "";
+    for (const entry of entries) {
+      try {
+        lastPath =
+          side === "local"
+            ? await api.moveLocalPath(entry.path, directory)
+            : await api.moveRemotePath(activeProfile!.id, entry.path, directory, passwordForActive);
+        moved += 1;
+      } catch (error) {
+        failures.push(`${entry.name}: ${String(error)}`);
+      }
+    }
+    if (side === "local") {
+      await refreshLocalFiles(entries.length === 1 ? lastPath : undefined);
+    } else {
+      await refreshRemoteFiles(entries.length === 1 ? lastPath : undefined);
+    }
+    if (moved > 0) {
+      pushToast("success", moved === 1 ? "\u5df2\u79fb\u5165\u8be5\u6587\u4ef6\u5939" : `\u5df2\u79fb\u5165 ${moved} \u9879`);
+    }
+    if (failures.length > 0) {
+      const summary = failures.slice(0, 3).join("\uff1b");
+      setStatus(`\u79fb\u52a8\u5931\u8d25 ${failures.length} \u9879\uff1a${summary}${failures.length > 3 ? "..." : ""}`);
+      pushToast("error", `\u79fb\u52a8\u5931\u8d25 ${failures.length} \u9879`);
+      if (side === "remote") requestActiveProfileSecretIfNeeded(failures[0]);
+    }
+  };
+
   const handleFileDrop = async (side: FileSide, event: DragEvent<HTMLDivElement>) => {
     const payload = fileDragRef.current;
     const directory = directoryPathFromDropTarget(event.target);
     fileDragRef.current = null;
     setDragOverSide(null);
     setDragOverDirectory(null);
-    if (!payload || payload.side === side) return;
+    if (!payload) return;
+    if (payload.side === side) {
+      if (!directory) return;
+      const entries = payload.entries.filter((entry) => canDropEntryInto(side, entry.path, directory));
+      if (entries.length === 0) return;
+      event.preventDefault();
+      await moveDroppedEntries(side, entries, directory);
+      return;
+    }
     event.preventDefault();
     if (payload.side === "local" && side === "remote") {
       await startTransferEntries("upload", payload.entries, undefined, directory ?? undefined);
@@ -10192,6 +10245,26 @@ function samePathParts(left: string[], right: string[]) {
 function pathPartsStartWith(path: string[], prefix: string[]) {
   if (prefix.length === 0 || path.length <= prefix.length) return false;
   return prefix.every((part, index) => part === path[index]);
+}
+
+
+function canDropEntryInto(side: FileSide, entryPath: string, directory: string) {
+  if (entryContainsPath(side, entryPath, directory)) return false;
+  const parent = side === "remote" ? remoteParentPath(entryPath) : localParentPath(entryPath);
+  return comparablePath(side, parent) !== comparablePath(side, directory);
+}
+
+function entryContainsPath(side: FileSide, parentPath: string, childPath: string) {
+  const parent = comparablePath(side, parentPath);
+  const child = comparablePath(side, childPath);
+  if (!parent || parent === "." || !child) return false;
+  if (parent === child) return true;
+  if (parent === "/") return child !== "/";
+  return child.startsWith(`${parent}/`);
+}
+
+function comparablePath(side: FileSide, path: string) {
+  return side === "remote" ? normalizeRemotePath(path) : normalizeLocalComparablePath(path);
 }
 
 function normalizeLocalComparablePath(path: string) {
