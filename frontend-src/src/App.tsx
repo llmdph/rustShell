@@ -9196,7 +9196,13 @@ function compareFilePair(left: FileEntry, right: FileEntry): FileCompareMark {
   if (left.fileType !== right.fileType) reasons.push("文件类型");
   if ((left.linkTarget ?? "") !== (right.linkTarget ?? "")) reasons.push("链接目标");
   if ((left.permissions ?? null) !== (right.permissions ?? null)) reasons.push("权限");
-  if ((left.uid ?? null) !== (right.uid ?? null) || (left.gid ?? null) !== (right.gid ?? null)) reasons.push("属主");
+  if (
+    (left.uid != null || left.gid != null) &&
+    (right.uid != null || right.gid != null) &&
+    ((left.uid ?? null) !== (right.uid ?? null) || (left.gid ?? null) !== (right.gid ?? null))
+  ) {
+    reasons.push("属主");
+  }
   if (!left.isDir && !right.isDir && left.size !== right.size) reasons.push("大小");
 
   const leftTime = new Date(left.modifiedAt).getTime();
@@ -9204,7 +9210,16 @@ function compareFilePair(left: FileEntry, right: FileEntry): FileCompareMark {
   const comparableTime = !Number.isNaN(leftTime) && !Number.isNaN(rightTime);
   if (comparableTime && Math.abs(leftTime - rightTime) > 2000) reasons.push("时间");
 
-  if (reasons.length === 0) return { kind: "same", detail: "内容、时间、权限、属主一致" };
+  if (reasons.length === 0) {
+    const ownerCompared =
+      (left.uid != null || left.gid != null) && (right.uid != null || right.gid != null);
+    return {
+      kind: "same",
+      detail: ownerCompared
+        ? "内容、时间、权限、属主一致"
+        : "内容、时间、权限一致"
+    };
+  }
   return { kind: "different", detail: `差异: ${reasons.join("、")}` };
 }
 
