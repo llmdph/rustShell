@@ -1502,7 +1502,11 @@ where
 {
     let metadata = fs::metadata(local_path)
         .with_context(|| format!("failed to stat {}", local_path.display()))?;
-    if matches!(conflict, TransferConflictStrategy::Skip) && sftp.lstat(remote_path).is_ok() {
+    // A folder upload already checked this and does not open a file it will skip.
+    if opened.is_none()
+        && matches!(conflict, TransferConflictStrategy::Skip)
+        && sftp.lstat(remote_path).is_ok()
+    {
         *transferred += metadata.len();
         on_progress(*transferred, total);
         return Ok(());
@@ -1657,6 +1661,21 @@ where
             )?;
             preserve_remote_metadata(sftp, Path::new(&remote_path), &metadata);
         } else if metadata.is_file() {
+            let remote_path = remote_child_for_conflict(
+                sftp,
+                remote_dir,
+                &remote_name,
+                conflict,
+                &mut listed_names,
+            )?;
+            // An existing file that will be left alone does not need to be opened.
+            if matches!(conflict, TransferConflictStrategy::Skip)
+                && remote_path_exists(sftp, Path::new(&remote_path))
+            {
+                *transferred += metadata.len();
+                on_progress(*transferred, total);
+                continue;
+            }
             // Keep this handle for the copy. A second open can fail on a busy
             // file and stop the rest of the folder.
             let opened = match File::open(&local_path) {
@@ -1666,13 +1685,6 @@ where
                     continue;
                 }
             };
-            let remote_path = remote_child_for_conflict(
-                sftp,
-                remote_dir,
-                &remote_name,
-                conflict,
-                &mut listed_names,
-            )?;
             upload_single_file(
                 sftp,
                 &local_path,
