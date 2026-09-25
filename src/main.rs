@@ -2200,7 +2200,7 @@ done
     let mut entries = Vec::new();
     let mut truncated = false;
     for line in output.lines() {
-        let Some(entry) = parse_system_ssh_entry(line) else {
+        let Some(entry) = parse_system_ssh_entry(line, &profile.charset) else {
             continue;
         };
         entries.push(entry);
@@ -2255,7 +2255,16 @@ fn system_ssh_output(profile: &SessionProfile, remote_command: &str) -> Result<S
     String::from_utf8(output.stdout).map_err(|error| format!("SSH 输出不是 UTF-8: {}", error))
 }
 
-fn parse_system_ssh_entry(line: &str) -> Option<FileEntry> {
+fn decode_shell_field(bytes: &[u8], charset: &str) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    let encoding = encoding_rs::Encoding::for_label(charset.trim().as_bytes())
+        .unwrap_or(encoding_rs::UTF_8);
+    encoding.decode(bytes).0.into_owned()
+}
+
+fn parse_system_ssh_entry(line: &str, charset: &str) -> Option<FileEntry> {
     let bytes = decode_hex_bytes(line)?;
     let mut fields = Vec::new();
     let mut start = 0usize;
@@ -2263,7 +2272,7 @@ fn parse_system_ssh_entry(line: &str) -> Option<FileEntry> {
         if *byte != 0 {
             continue;
         }
-        fields.push(String::from_utf8(bytes[start..index].to_vec()).ok()?);
+        fields.push(decode_shell_field(&bytes[start..index], charset));
         start = index + 1;
     }
     if fields.len() < 8 {
@@ -2811,7 +2820,7 @@ mod system_ssh_listing_tests {
             "1",
             "2",
             "",
-        ]))
+        ]), "utf-8")
         .unwrap();
         assert_eq!(entry.name, "readme");
         assert_eq!(entry.path, "/tmp/readme");
@@ -2836,7 +2845,7 @@ mod system_ssh_listing_tests {
             "3",
             "4",
             "target\tthere",
-        ]))
+        ]), "utf-8")
         .unwrap();
         assert_eq!(entry.name, "weird\tname\na");
         assert_eq!(entry.path, "/tmp/weird\tname\na");
@@ -2860,7 +2869,7 @@ mod system_ssh_listing_tests {
             "0",
             "0",
             "",
-        ]))
+        ]), "utf-8")
         .unwrap();
         assert!(entry.is_dir);
         assert_eq!(entry.file_type, "directory");
@@ -2869,8 +2878,35 @@ mod system_ssh_listing_tests {
 
     #[test]
     fn short_or_corrupt_line_is_ignored() {
-        assert!(parse_system_ssh_entry("only-a-name").is_none());
-        assert!(parse_system_ssh_entry("zz").is_none());
-        assert!(parse_system_ssh_entry("0").is_none());
+        assert!(parse_system_ssh_entry("only-a-name", "utf-8").is_none());
+        assert!(parse_system_ssh_entry("zz", "utf-8").is_none());
+        assert!(parse_system_ssh_entry("0", "utf-8").is_none());
+    }
+
+    #[test]
+    fn non_utf8_name_stays_in_the_listing() {
+        let (name, _, unmappable) = encoding_rs::GBK.encode("\u{4e2d}\u{6587}");
+        assert!(!unmappable);
+        let name = name.as_ref();
+        let mut bytes = Vec::new();
+        let mut push = |field: &[u8]| {
+            bytes.extend_from_slice(field);
+            bytes.push(0);
+        };
+        push(name);
+        let mut path = b"/tmp/".to_vec();
+        path.extend_from_slice(name);
+        push(&path);
+        for field in ["file", "4", "10", "644", "1", "2", ""] {
+            push(field.as_bytes());
+        }
+        let line: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let entry = parse_system_ssh_entry(&line, "gbk").unwrap();
+        assert_eq!(entry.name, "\u{4e2d}\u{6587}");
+        assert!(entry.path.ends_with("\u{4e2d}\u{6587}"));
+
+        let shown = parse_system_ssh_entry(&line, "utf-8").unwrap();
+        assert_eq!(shown.path.starts_with("/tmp/"), true);
+        assert_ne!(shown.name, "\u{4e2d}\u{6587}");
     }
 }
