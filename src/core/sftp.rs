@@ -549,8 +549,13 @@ fn touch_path(path: &Path, file_time: FileTime, recursive: bool) -> std::io::Res
     set_file_mtime(path, file_time)?;
     if recursive && metadata.is_dir() {
         for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            touch_path(&entry.path(), file_time, true)?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            if touch_path(&entry.path(), file_time, true).is_err() {
+                continue;
+            }
         }
     }
     Ok(())
@@ -568,8 +573,13 @@ fn chmod_path(path: &Path, mode: u32, recursive: bool) -> std::io::Result<()> {
     set_local_permissions(path, mode)?;
     if recursive && metadata.is_dir() {
         for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            chmod_path(&entry.path(), mode, true)?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            if chmod_path(&entry.path(), mode, true).is_err() {
+                continue;
+            }
         }
     }
     Ok(())
@@ -1454,5 +1464,64 @@ mod tests {
         assert!(copied.join("locked").is_dir());
         assert!(!copied.join("locked").join("secret.txt").exists());
         assert!(local_duplicate(&locked.display().to_string(), "locked-copy").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recursive_touch_skips_an_unreadable_child() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-touch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let user = std::env::var("USERNAME").unwrap_or_default();
+                let _ = std::process::Command::new("icacls")
+                    .arg(self.0.join("locked"))
+                    .arg("/grant")
+                    .arg(format!("{user}:(OI)(CI)F"))
+                    .status();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let file = root.join("ok.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("secret.txt"), b"secret-data").unwrap();
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        let deny_user = format!("{user}:(RX)");
+        let commands: [&[&str]; 3] = [
+            &["/inheritance:r"],
+            &["/deny", deny_user.as_str()],
+            &["/deny", "*S-1-1-0:(RX)"],
+        ];
+        for args in commands {
+            let status = std::process::Command::new("icacls")
+                .arg(&locked)
+                .args(args)
+                .status()
+                .expect("icacls");
+            assert!(status.success(), "icacls failed");
+        }
+
+        let when = 1_700_000_000_u64;
+        local_touch(&root.display().to_string(), when, true).unwrap();
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let secs = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(secs, when);
+        assert!(local_touch(&locked.display().to_string(), when, true).is_err());
+        assert!(local_chmod(&root.display().to_string(), 0o644, true).is_ok());
+        assert!(local_chmod(&locked.display().to_string(), 0o644, true).is_err());
     }
 }
