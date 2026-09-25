@@ -986,6 +986,7 @@ where
                 cancel,
                 conflict,
                 &mut on_progress,
+                true,
             )
             .context("failed to upload directory")?;
             if let Some(metadata) = root_metadata.as_ref() {
@@ -1525,21 +1526,33 @@ fn upload_dir_recursive<F>(
     cancel: Arc<AtomicBool>,
     conflict: TransferConflictStrategy,
     on_progress: &mut F,
+    fail_if_unreadable: bool,
 ) -> Result<()>
 where
     F: FnMut(u64, u64),
 {
-    for entry in fs::read_dir(local_dir)
-        .with_context(|| format!("failed to read {}", local_dir.display()))?
-    {
+    let entries = match fs::read_dir(local_dir) {
+        Ok(entries) => entries,
+        Err(error) if fail_if_unreadable => {
+            return Err(error).with_context(|| format!("failed to read {}", local_dir.display()));
+        }
+        Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
         if cancel.load(Ordering::Relaxed) {
             bail!("transfer cancelled");
         }
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
         let local_path = entry.path();
         let remote_name = entry.file_name().to_string_lossy().to_string();
-        let metadata = fs::symlink_metadata(&local_path)
-            .with_context(|| format!("failed to stat {}", local_path.display()))?;
+        let metadata = match fs::symlink_metadata(&local_path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
         if local_path_is_link(&local_path, &metadata) {
             let remote_path = resolve_remote_child_path(sftp, remote_dir, &remote_name, conflict)?;
             upload_symlink(
@@ -1566,6 +1579,7 @@ where
                 cancel.clone(),
                 conflict,
                 on_progress,
+                false,
             )?;
             preserve_remote_metadata(sftp, Path::new(&remote_path), &metadata);
         } else if metadata.is_file() {
@@ -1832,7 +1846,15 @@ fn local_total_size(path: &Path, cancel: &AtomicBool) -> Result<u64> {
 
     let mut total = 0_u64;
     for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        total += local_total_size(&entry?.path(), cancel)?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        match local_total_size(&entry.path(), cancel) {
+            Ok(size) => total += size,
+            Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
+            Err(_) => continue,
+        }
     }
     Ok(total)
 }
@@ -2156,7 +2178,11 @@ fn add_skipped_local_tree<F>(
 where
     F: FnMut(u64, u64),
 {
-    let size = local_total_size(path, cancel)?;
+    let size = match local_total_size(path, cancel) {
+        Ok(size) => size,
+        Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
+        Err(_) => 0,
+    };
     note_skipped_bytes(transferred, total, size, on_progress);
     Ok(())
 }
@@ -2871,6 +2897,88 @@ mod directory_link_tests {
             let link = self.0.join("link");
             let _ = std::fs::remove_file(&link);
             let _ = std::fs::remove_dir(&link);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod local_size_tests {
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn folder_size_skips_an_unreadable_child() {
+        let root = scratch_dir("unreadable-child");
+        let _cleanup = AclCleanup(root.clone());
+        std::fs::write(root.join("ok.txt"), b"hello").unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("secret.txt"), b"secret-data").unwrap();
+        deny_list_access(&locked);
+
+        let cancel = AtomicBool::new(false);
+        let size = super::local_total_size(&root, &cancel).unwrap();
+        assert_eq!(size, 5, "one locked folder should not fail the rest");
+
+        let error = super::local_total_size(&locked, &cancel).unwrap_err();
+        assert!(
+            error.to_string().contains("failed to read"),
+            "the locked folder itself should still fail: {error}"
+        );
+
+        let mut transferred = 0_u64;
+        super::add_skipped_local_tree(&locked, &mut transferred, 5, &cancel, &mut |_, _| {}).unwrap();
+        assert_eq!(transferred, 0);
+        super::add_skipped_local_tree(&root.join("ok.txt"), &mut transferred, 5, &cancel, &mut |_, _| {})
+            .unwrap();
+        assert_eq!(transferred, 5);
+    }
+
+    fn deny_list_access(path: &std::path::Path) {
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        let deny_user = format!("{user}:(RX)");
+        let commands: [&[&str]; 3] = [
+            &["/inheritance:r"],
+            &["/deny", deny_user.as_str()],
+            &["/deny", "*S-1-1-0:(RX)"],
+        ];
+        for args in commands {
+            let status = std::process::Command::new("icacls")
+                .arg(path)
+                .args(args)
+                .status()
+                .expect("icacls");
+            assert!(status.success(), "icacls failed");
+        }
+    }
+
+    fn allow_list_access(path: &std::path::Path) {
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let _ = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/grant")
+            .arg(format!("{user}:(OI)(CI)F"))
+            .status();
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    struct AclCleanup(std::path::PathBuf);
+
+    impl Drop for AclCleanup {
+        fn drop(&mut self) {
+            allow_list_access(&self.0.join("locked"));
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
