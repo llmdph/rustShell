@@ -96,6 +96,7 @@ export type FileEntry = {
   permissions?: number | null;
   uid?: number | null;
   gid?: number | null;
+  hidden?: boolean;
 };
 
 export type DirListing = {

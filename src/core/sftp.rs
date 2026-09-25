@@ -32,6 +32,30 @@ pub struct FileEntry {
     pub uid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gid: Option<u32>,
+    /// Dot names, and on Windows the hidden file attribute.
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+pub(crate) fn name_is_hidden(name: &str) -> bool {
+    name.starts_with('.') && name != "." && name != ".."
+}
+
+fn local_file_is_hidden(name: &str, metadata: &fs::Metadata) -> bool {
+    if name_is_hidden(name) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1146,11 +1170,12 @@ fn local_entry_from_path(
     } else {
         "file"
     };
+    let name = path_buf
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| path_buf.display().to_string());
     FileEntry {
-        name: path_buf
-            .file_name()
-            .map(|value| value.to_string_lossy().to_string())
-            .unwrap_or_else(|| path_buf.display().to_string()),
+        name: name.clone(),
         path: path_buf.display().to_string(),
         size: metadata.len(),
         modified_at,
@@ -1160,6 +1185,7 @@ fn local_entry_from_path(
         permissions: Some(local_mode(&metadata)),
         uid: None,
         gid: None,
+        hidden: local_file_is_hidden(&name, &metadata),
     }
 }
 
@@ -1515,6 +1541,65 @@ mod tests {
     }
 
     #[test]
+    fn dot_names_are_hidden_and_normal_names_are_not() {
+        assert!(name_is_hidden(".bashrc"));
+        assert!(name_is_hidden(".git"));
+        assert!(!name_is_hidden("bashrc"));
+        assert!(!name_is_hidden("a.b"));
+        assert!(!name_is_hidden("."));
+        assert!(!name_is_hidden(".."));
+        assert!(!name_is_hidden(""));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hidden_attribute_is_recorded() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-hidden-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("attrib")
+                    .arg("-H")
+                    .arg(self.0.join("desktop.ini"))
+                    .status();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        std::fs::write(root.join("readme.txt"), b"hi").unwrap();
+        let hidden = root.join("desktop.ini");
+        std::fs::write(&hidden, b"x").unwrap();
+        let status = std::process::Command::new("attrib")
+            .arg("+H")
+            .arg(&hidden)
+            .status()
+            .expect("attrib");
+        assert!(status.success(), "could not mark the file hidden");
+
+        let listing = list_local_dir(&root.display().to_string()).unwrap();
+        let marked = listing
+            .entries
+            .iter()
+            .find(|entry| entry.name == "desktop.ini")
+            .expect("hidden file");
+        assert!(marked.hidden);
+        let visible = listing
+            .entries
+            .iter()
+            .find(|entry| entry.name == "readme.txt")
+            .expect("visible file");
+        assert!(!visible.hidden);
+    }
+
+    #[test]
     fn large_folder_sort_keeps_directories_first_without_rebuilding_names() {
         let names = ["b", "A", "c", "Dir"];
         let dirs = [false, false, false, true];
@@ -1531,6 +1616,7 @@ mod tests {
                 permissions: None,
                 uid: None,
                 gid: None,
+                hidden: false,
             });
         }
         sort_entries_by_folded_text(&mut entries, |entry| entry.name.as_str());

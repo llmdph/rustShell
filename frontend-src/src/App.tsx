@@ -10077,6 +10077,7 @@ function commonEntryValue(entries: FileEntry[], getValue: (entry: FileEntry) => 
 }
 
 function isHiddenFile(file: FileEntry) {
+  if (file.hidden) return true;
   return file.name.startsWith(".") && file.name !== "." && file.name !== "..";
 }
 

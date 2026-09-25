@@ -920,6 +920,7 @@ fn entry_from_stat(
         permissions: stat.perm.map(|perm| perm & 0o7777),
         uid: stat.uid,
         gid: stat.gid,
+        hidden: crate::core::sftp::name_is_hidden(&name),
     }
 }
 
