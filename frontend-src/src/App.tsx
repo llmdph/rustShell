@@ -3689,7 +3689,11 @@ export default function App() {
         const source = item.sourceEntry;
         const target = item.targetEntry;
         if (!source || !target) continue;
-        if (source.permissions != null && source.permissions !== target.permissions) {
+        if (
+          source.permissions != null &&
+          target.permissions != null &&
+          source.permissions !== target.permissions
+        ) {
           if (plan.direction === "upload") {
             await api.chmodRemotePath(activeProfile.id, target.path, source.permissions, false, passwordForActive);
           } else {
@@ -3697,13 +3701,14 @@ export default function App() {
           }
           applied += 1;
         }
-        const sourceMtime = Math.floor(new Date(source.modifiedAt).getTime() / 1000);
-        const targetMtime = Math.floor(new Date(target.modifiedAt).getTime() / 1000);
-        if (Number.isFinite(sourceMtime) && Number.isFinite(targetMtime) && Math.abs(sourceMtime - targetMtime) > 2) {
+        const sourceMtime = knownModifiedMs(source.modifiedAt);
+        const targetMtime = knownModifiedMs(target.modifiedAt);
+        if (sourceMtime != null && targetMtime != null && Math.abs(sourceMtime - targetMtime) > 2000) {
+          const sourceSeconds = Math.floor(sourceMtime / 1000);
           if (plan.direction === "upload") {
-            await api.touchRemotePath(activeProfile.id, target.path, sourceMtime, false, passwordForActive);
+            await api.touchRemotePath(activeProfile.id, target.path, sourceSeconds, false, passwordForActive);
           } else {
-            await api.touchLocalPath(target.path, sourceMtime, false);
+            await api.touchLocalPath(target.path, sourceSeconds, false);
           }
           applied += 1;
         }
@@ -9190,35 +9195,41 @@ function buildDirectoryCompare(localFiles: FileEntry[], remoteFiles: FileEntry[]
   return { local, remote, summary };
 }
 
+function knownModifiedMs(value: string) {
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) && time > 0 ? time : null;
+}
+
 function compareFilePair(left: FileEntry, right: FileEntry): FileCompareMark {
   const reasons: string[] = [];
   if (left.isDir !== right.isDir) reasons.push("类型");
   if (left.fileType !== right.fileType) reasons.push("文件类型");
   if ((left.linkTarget ?? "") !== (right.linkTarget ?? "")) reasons.push("链接目标");
-  if ((left.permissions ?? null) !== (right.permissions ?? null)) reasons.push("权限");
+  const permissionsCompared = left.permissions != null && right.permissions != null;
+  if (permissionsCompared && left.permissions !== right.permissions) reasons.push("权限");
+  const ownerCompared =
+    (left.uid != null || left.gid != null) && (right.uid != null || right.gid != null);
   if (
-    (left.uid != null || left.gid != null) &&
-    (right.uid != null || right.gid != null) &&
+    ownerCompared &&
     ((left.uid ?? null) !== (right.uid ?? null) || (left.gid ?? null) !== (right.gid ?? null))
   ) {
     reasons.push("属主");
   }
   if (!left.isDir && !right.isDir && left.size !== right.size) reasons.push("大小");
 
-  const leftTime = new Date(left.modifiedAt).getTime();
-  const rightTime = new Date(right.modifiedAt).getTime();
-  const comparableTime = !Number.isNaN(leftTime) && !Number.isNaN(rightTime);
-  if (comparableTime && Math.abs(leftTime - rightTime) > 2000) reasons.push("时间");
+  const leftTime = knownModifiedMs(left.modifiedAt);
+  const rightTime = knownModifiedMs(right.modifiedAt);
+  const timeCompared = leftTime != null && rightTime != null;
+  if (leftTime != null && rightTime != null && Math.abs(leftTime - rightTime) > 2000) {
+    reasons.push("时间");
+  }
 
   if (reasons.length === 0) {
-    const ownerCompared =
-      (left.uid != null || left.gid != null) && (right.uid != null || right.gid != null);
-    return {
-      kind: "same",
-      detail: ownerCompared
-        ? "内容、时间、权限、属主一致"
-        : "内容、时间、权限一致"
-    };
+    const parts = ["内容"];
+    if (timeCompared) parts.push("时间");
+    if (permissionsCompared) parts.push("权限");
+    if (ownerCompared) parts.push("属主");
+    return { kind: "same", detail: `${parts.join("、")}一致` };
   }
   return { kind: "different", detail: `差异: ${reasons.join("、")}` };
 }
@@ -10151,10 +10162,16 @@ function transferAuditRecords(transfers: TransferView[], history: TransferView[]
 
 function metadataSyncChanges(source: FileEntry, target: FileEntry, direction: "upload" | "download") {
   const changes: string[] = [];
-  if (source.permissions != null && source.permissions !== target.permissions) changes.push("权限");
-  const sourceMtime = Math.floor(new Date(source.modifiedAt).getTime() / 1000);
-  const targetMtime = Math.floor(new Date(target.modifiedAt).getTime() / 1000);
-  if (Number.isFinite(sourceMtime) && Number.isFinite(targetMtime) && Math.abs(sourceMtime - targetMtime) > 2) {
+  if (
+    source.permissions != null &&
+    target.permissions != null &&
+    source.permissions !== target.permissions
+  ) {
+    changes.push("权限");
+  }
+  const sourceMtime = knownModifiedMs(source.modifiedAt);
+  const targetMtime = knownModifiedMs(target.modifiedAt);
+  if (sourceMtime != null && targetMtime != null && Math.abs(sourceMtime - targetMtime) > 2000) {
     changes.push("时间");
   }
   if (
