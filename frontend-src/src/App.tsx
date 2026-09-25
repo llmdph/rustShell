@@ -6664,6 +6664,7 @@ function FilePane({
         onClearSelection={onClearSelection}
         onRemove={onRemove}
         onRename={onRename}
+        onParent={onParent}
         onContextMenu={openContextMenu}
       />
       {contextMenu && (
@@ -6901,6 +6902,7 @@ function FileList({
   onClearSelection,
   onRemove,
   onRename,
+  onParent,
   onContextMenu
 }: {
   files: FileEntry[];
@@ -6918,6 +6920,7 @@ function FileList({
   onClearSelection: () => void;
   onRemove: () => void;
   onRename: () => void;
+  onParent: () => void;
   onContextMenu: (event: MouseEvent, file?: FileEntry, alreadySelected?: boolean) => void;
 }) {
   const selectedPathSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
@@ -6988,7 +6991,12 @@ function FileList({
       onClearSelection();
       return;
     }
-    if (event.key === "Delete" || event.key === "Backspace") {
+    if (event.key === "Backspace") {
+      event.preventDefault();
+      onParent();
+      return;
+    }
+    if (event.key === "Delete") {
       if (selectedPaths.length === 0) return;
       event.preventDefault();
       onRemove();
