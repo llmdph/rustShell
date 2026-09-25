@@ -525,10 +525,20 @@ fn search_local_recursive(
             *limited = true;
             break;
         }
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                *incomplete = true;
+                continue;
+            }
+        };
         let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                *incomplete = true;
+                continue;
+            }
         };
         let walk = metadata.is_dir() && !local_path_is_link(&path, &metadata);
         let file_entry = local_entry_from_path(path.clone(), metadata);

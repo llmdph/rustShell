@@ -619,7 +619,7 @@ fn search_remote_recursive(
     }
 
     let mut directories = Vec::new();
-    visit_remote_entries(sftp, root, None, |path_buf, stat| {
+    let visited = visit_remote_entries(sftp, root, None, |path_buf, stat| {
         if output.len() >= max_results {
             *limited = true;
             return false;
@@ -637,7 +637,13 @@ fn search_remote_recursive(
             return false;
         }
         true
-    })?;
+    });
+    if let Err(error) = visited {
+        if output.is_empty() && directories.is_empty() {
+            return Err(error);
+        }
+        *incomplete = true;
+    }
 
     for directory in directories {
         if output.len() >= max_results {
