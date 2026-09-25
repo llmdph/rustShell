@@ -675,10 +675,19 @@ pub(crate) fn text_contains_query(haystack: &str, needle: &str) -> bool {
             .windows(needle_bytes.len())
             .any(|window| window.eq_ignore_ascii_case(needle_bytes));
     }
-    if !needle.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+    // Chinese and other caseless text can match in place. Letters such as
+    // E-acute still need case folding, even when the query has no A-Z.
+    if !needle_has_cased_letter(needle) {
         return haystack.contains(needle);
     }
-    haystack.to_lowercase().contains(needle)
+    let folded_needle = needle.to_lowercase();
+    haystack.to_lowercase().contains(&folded_needle)
+}
+
+fn needle_has_cased_letter(needle: &str) -> bool {
+    needle
+        .chars()
+        .any(|ch| ch.is_uppercase() || ch.is_lowercase())
 }
 
 /// Match a path without copying it first. Filename searches never need a
@@ -1090,6 +1099,11 @@ mod tests {
         assert!(text_contains_query("notes.txt", "TXT"));
         assert!(text_contains_query("\u{76ee}\u{5f55}/\u{62a5}\u{544a}.txt", "\u{62a5}\u{544a}"));
         assert!(text_contains_query("\u{76ee}\u{5f55}/File.TXT", "txt"));
+        assert!(text_contains_query("\u{76ee}\u{5f55}.TXT", "\u{76ee}\u{5f55}.txt"));
+        assert!(text_contains_query("\u{c9}t\u{e9}.txt", "\u{e9}t\u{e9}"));
+        assert!(text_contains_query("\u{e9}t\u{e9}.txt", "\u{c9}"));
+        assert!(text_contains_query("\u{3a9}\u{3bc}\u{3ad}\u{3b3}\u{3b1}", "\u{3c9}"));
+        assert!(!text_contains_query("\u{3a9}\u{3bc}\u{3ad}\u{3b3}\u{3b1}", "\u{3b1}\u{3b1}"));
         assert!(!text_contains_query("notes.txt", "png"));
         assert!(!text_contains_query("notes.txt", "\u{62a5}\u{544a}"));
         assert!(path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), "notes"));
