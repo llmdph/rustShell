@@ -137,29 +137,12 @@ pub fn local_parent(path: &str) -> Option<String> {
 }
 
 pub fn local_mkdir(parent: &str, name: &str) -> std::io::Result<()> {
-    let segments = validate_relative_dir_path(name)?;
-    let mut path = PathBuf::from(parent);
-    for segment in segments {
-        path.push(segment);
-    }
-    if local_path_exists(&path) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "目标已存在",
-        ));
-    }
-    fs::create_dir_all(path)
+    let path = prepare_local_create_path(parent, name)?;
+    fs::create_dir(path)
 }
 
 pub fn local_create_file(parent: &str, name: &str) -> std::io::Result<String> {
-    let segments = validate_relative_dir_path(name)?;
-    let mut path = PathBuf::from(parent);
-    for segment in segments {
-        path.push(segment);
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let path = prepare_local_create_path(parent, name)?;
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -168,28 +151,56 @@ pub fn local_create_file(parent: &str, name: &str) -> std::io::Result<String> {
 }
 
 pub fn local_create_symlink(parent: &str, name: &str, target: &str) -> std::io::Result<String> {
-    let segments = validate_relative_dir_path(name)?;
     if target.trim().is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "链接目标不能为空",
         ));
     }
-    let mut link_path = PathBuf::from(parent);
-    for segment in segments {
-        link_path.push(segment);
-    }
-    if local_path_exists(&link_path) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "目标已存在",
-        ));
-    }
-    if let Some(parent) = link_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let link_path = prepare_local_create_path(parent, name)?;
     create_local_symlink(Path::new(target), &link_path)?;
     Ok(link_path.display().to_string())
+}
+
+fn prepare_local_create_path(parent: &str, relative: &str) -> std::io::Result<PathBuf> {
+    let segments = validate_relative_dir_path(relative)?;
+    let mut current = PathBuf::from(parent);
+    if !current.as_os_str().is_empty() && fs::symlink_metadata(&current).is_err() {
+        fs::create_dir_all(&current)?;
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        current.push(segment);
+        let is_leaf = index + 1 == segments.len();
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if local_path_is_link(&current, &metadata) {
+                    if is_leaf {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "目标已存在",
+                        ));
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "路径经过链接，没有在链接指向的位置新建",
+                    ));
+                }
+                if is_leaf || !metadata.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "目标已存在",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !is_leaf {
+                    fs::create_dir(&current)?;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(current)
 }
 
 pub fn local_remove(path: &str, is_dir: bool) -> std::io::Result<()> {
@@ -883,5 +894,57 @@ mod tests {
         {
             std::os::unix::fs::symlink(target, link).unwrap();
         }
+    }
+
+    #[test]
+    fn creating_through_a_directory_link_does_not_enter_it() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-create-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let link = self.0.join("link");
+                let _ = std::fs::remove_dir(self.0.join("link").join("child"));
+                let _ = std::fs::remove_file(self.0.join("link").join("note.txt"));
+                let _ = std::fs::remove_file(&link);
+                let _ = std::fs::remove_dir(&link);
+                let _ = std::fs::remove_dir_all(self.0.join("real"));
+                let _ = std::fs::remove_file(self.0.join("target").join("keep.txt"));
+                let _ = std::fs::remove_dir(self.0.join("target").join("child"));
+                let _ = std::fs::remove_file(self.0.join("target").join("note.txt"));
+                let _ = std::fs::remove_dir(self.0.join("target"));
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), b"keep").unwrap();
+        let link = root.join("link");
+        make_directory_link(&target, &link);
+
+        let mkdir_error = local_mkdir(&root.display().to_string(), "link/child").unwrap_err();
+        assert!(mkdir_error.to_string().contains("\u{94fe}\u{63a5}"));
+        assert!(!target.join("child").exists());
+
+        let file_error = local_create_file(&root.display().to_string(), "link/note.txt").unwrap_err();
+        assert!(file_error.to_string().contains("\u{94fe}\u{63a5}"));
+        assert!(!target.join("note.txt").exists());
+        assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"keep");
+
+        local_mkdir(&root.display().to_string(), "real/child").unwrap();
+        assert!(root.join("real").join("child").is_dir());
+        let created = local_create_file(&root.display().to_string(), "real/note.txt").unwrap();
+        assert_eq!(
+            std::fs::read(&created).unwrap(),
+            b""
+        );
     }
 }
