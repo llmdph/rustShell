@@ -106,16 +106,8 @@ impl HistoryBuffer {
 
     pub fn push(&mut self, bytes: &[u8], charset: &str) {
         self.data.extend_from_slice(bytes);
-        if self.data.len() > self.cap {
-            let drop_at = self.data.len() - self.cap;
-            let drop_n = align_terminal_cut(&self.data, drop_at, charset).min(self.data.len());
-            if drop_n > 0 {
-                self.data.drain(..drop_n);
-                self.start_offset += drop_n as u64;
-            }
-            if self.data.capacity() > self.cap * 2 {
-                self.data.shrink_to(self.cap);
-            }
+        if let Some(drop_n) = trim_bounded_prefix(&mut self.data, self.cap, charset) {
+            self.start_offset += drop_n as u64;
         }
     }
 
@@ -266,19 +258,10 @@ impl TerminalModel {
 
     fn push_pending_output(&mut self, bytes: &[u8]) {
         self.pending_output.extend_from_slice(bytes);
-        if self.pending_output.len() > TERMINAL_PENDING_CAP {
-            let drop_at = self.pending_output.len() - TERMINAL_PENDING_CAP;
-            let drop_n = align_terminal_cut(&self.pending_output, drop_at, &self.profile.charset)
-                .min(self.pending_output.len());
-            if drop_n > 0 {
-                self.pending_output.drain(..drop_n);
-                // Unread bytes were discarded, including any continuation the
-                // decoder was waiting on. Start clean at the aligned boundary.
-                self.output_decoder = terminal_encoding(&self.profile.charset).new_decoder();
-            }
-            if self.pending_output.capacity() > TERMINAL_PENDING_CAP * 2 {
-                self.pending_output.shrink_to(TERMINAL_PENDING_CAP);
-            }
+        if trim_bounded_prefix(&mut self.pending_output, TERMINAL_PENDING_CAP, &self.profile.charset).is_some() {
+            // Unread bytes were discarded, including any continuation the
+            // decoder was waiting on. Start clean at the aligned boundary.
+            self.output_decoder = terminal_encoding(&self.profile.charset).new_decoder();
         }
     }
 
@@ -448,6 +431,25 @@ fn decode_terminal_stream(decoder: &mut Decoder, bytes: &[u8]) -> String {
 fn encode_terminal_text(charset: &str, text: &str) -> Vec<u8> {
     let (bytes, _, _) = terminal_encoding(charset).encode(text);
     bytes.into_owned()
+}
+
+/// Drop enough leading bytes to get back under `cap`, plus a margin so the
+/// next chunks do not slide the whole buffer forward again.
+fn trim_bounded_prefix(buf: &mut Vec<u8>, cap: usize, charset: &str) -> Option<usize> {
+    if buf.len() <= cap || cap == 0 {
+        return None;
+    }
+    let slack = (cap / 16).clamp(32 * 1024, 256 * 1024).min(cap);
+    let drop_at = (buf.len() - cap + slack).min(buf.len());
+    let drop_n = align_terminal_cut(buf, drop_at, charset).min(buf.len());
+    if drop_n == 0 {
+        return None;
+    }
+    buf.drain(..drop_n);
+    if buf.capacity() > cap.saturating_mul(4) {
+        buf.shrink_to(cap.saturating_add(slack));
+    }
+    Some(drop_n)
 }
 
 /// Move a trim point forward so the kept bytes start on a character boundary.
