@@ -9307,20 +9307,31 @@ function nextFileSort(current: FileSort, key: FileSortKey): FileSort {
 
 function sortFiles(files: FileEntry[], sort: FileSort) {
   const direction = sort.direction === "asc" ? 1 : -1;
+  const modifiedAt = sort.key === "modifiedAt"
+    ? new Map(files.map((file) => [file.path, Date.parse(file.modifiedAt) || 0]))
+    : null;
   return [...files].sort((left, right) => {
     if (left.isDir !== right.isDir) return left.isDir ? -1 : 1;
-    const primary = compareFileValue(left, right, sort.key);
+    const primary = compareFileValue(left, right, sort.key, modifiedAt);
     if (primary !== 0) return primary * direction;
     return compareText(left.name, right.name);
   });
 }
 
-function compareFileValue(left: FileEntry, right: FileEntry, key: FileSortKey) {
+function compareFileValue(
+  left: FileEntry,
+  right: FileEntry,
+  key: FileSortKey,
+  modifiedAt: Map<string, number> | null
+) {
   if (key === "name") return compareText(left.name, right.name);
   if (key === "permissions") return (left.permissions ?? -1) - (right.permissions ?? -1);
   if (key === "owner") return compareText(formatOwner(left), formatOwner(right));
-  if (key === "size") return left.size - right.size;
-  return new Date(left.modifiedAt).getTime() - new Date(right.modifiedAt).getTime();
+  if (key === "size") {
+    if (left.size === right.size) return 0;
+    return left.size < right.size ? -1 : 1;
+  }
+  return (modifiedAt?.get(left.path) ?? 0) - (modifiedAt?.get(right.path) ?? 0);
 }
 
 function compareText(left: string, right: string) {
