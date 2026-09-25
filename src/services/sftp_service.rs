@@ -2059,12 +2059,25 @@ fn local_symlink_target_text(path: &Path) -> Result<String> {
 }
 
 fn remote_total_size(sftp: &ssh2::Sftp, path: &Path, cancel: &AtomicBool) -> Result<u64> {
+    remote_total_size_known(sftp, path, None, cancel)
+}
+
+fn remote_total_size_known(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    known: Option<ssh2::FileStat>,
+    cancel: &AtomicBool,
+) -> Result<u64> {
     if cancel.load(Ordering::Relaxed) {
         bail!("transfer cancelled");
     }
-    let stat = sftp
-        .lstat(path)
-        .with_context(|| format!("failed to stat remote path {}", path.display()))?;
+    // Nested folders were already described by the parent listing.
+    let stat = match known.and_then(listing_stat_with_type) {
+        Some(stat) => stat,
+        None => sftp
+            .lstat(path)
+            .with_context(|| format!("failed to stat remote path {}", path.display()))?,
+    };
     if stat.file_type().is_symlink() {
         return Ok(0);
     }
@@ -2082,7 +2095,7 @@ fn remote_total_size(sftp: &ssh2::Sftp, path: &Path, cancel: &AtomicBool) -> Res
             return true;
         }
         if child_stat.is_dir() {
-            directories.push(child);
+            directories.push((child, child_stat));
         } else {
             total += child_stat.size.unwrap_or_default();
         }
@@ -2091,8 +2104,8 @@ fn remote_total_size(sftp: &ssh2::Sftp, path: &Path, cancel: &AtomicBool) -> Res
     if cancel.load(Ordering::Relaxed) {
         bail!("transfer cancelled");
     }
-    for child in directories {
-        match remote_total_size(sftp, &child, cancel) {
+    for (child, child_stat) in directories {
+        match remote_total_size_known(sftp, &child, Some(child_stat), cancel) {
             Ok(size) => total += size,
             Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
             Err(_) => continue,
