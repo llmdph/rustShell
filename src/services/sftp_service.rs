@@ -618,7 +618,7 @@ fn list_with_sftp(sftp: &ssh2::Sftp, path: &str) -> Result<DirListing> {
 
     let mut entries = Vec::with_capacity(raw_entries.len());
     for (path_buf, stat) in raw_entries {
-        entries.push(entry_from_stat(sftp, path_buf, stat));
+        entries.push(entry_from_stat(sftp, path_buf, stat, None));
     }
 
     sort_entries_by_folded_text(&mut entries, |entry| entry.name.as_str());
@@ -652,13 +652,19 @@ fn search_remote_recursive(
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| remote_path_text(&path_buf));
         let mut matched = text_contains_query(&name, query) || path_contains_query(&path_buf, query);
-        if !matched && is_symlink {
-            if let Ok(target) = sftp.readlink(&path_buf) {
-                matched = path_contains_query(&target, query);
+        let known_link = if is_symlink {
+            let target = sftp.readlink(&path_buf).ok();
+            if !matched {
+                if let Some(target) = target.as_ref() {
+                    matched = path_contains_query(target, query);
+                }
             }
-        }
+            Some(target.map(|path| remote_path_text(&path)))
+        } else {
+            None
+        };
         if matched {
-            output.push(entry_from_stat(sftp, path_buf.clone(), stat));
+            output.push(entry_from_stat(sftp, path_buf.clone(), stat, known_link));
         }
         if should_descend {
             directories.push(path_buf);
@@ -840,7 +846,12 @@ fn trim_partial_utf8_suffix(bytes: &mut Vec<u8>) {
     }
 }
 
-fn entry_from_stat(sftp: &ssh2::Sftp, path_buf: PathBuf, stat: ssh2::FileStat) -> FileEntry {
+fn entry_from_stat(
+    sftp: &ssh2::Sftp,
+    path_buf: PathBuf,
+    stat: ssh2::FileStat,
+    known_link: Option<Option<String>>,
+) -> FileEntry {
     // Some servers omit permissions in a directory listing, and without them
     // every entry looks like a file. A follow-up stat is only needed then.
     let stat = if stat.perm.is_some() {
@@ -855,9 +866,13 @@ fn entry_from_stat(sftp: &ssh2::Sftp, path_buf: PathBuf, stat: ssh2::FileStat) -
     let is_dir = stat.is_dir();
     let is_symlink = stat.file_type().is_symlink();
     let link_target = if is_symlink {
-        sftp.readlink(&path_buf)
-            .ok()
-            .map(|path| remote_path_text(&path))
+        if let Some(known_link) = known_link {
+            known_link
+        } else {
+            sftp.readlink(&path_buf)
+                .ok()
+                .map(|path| remote_path_text(&path))
+        }
     } else {
         None
     };

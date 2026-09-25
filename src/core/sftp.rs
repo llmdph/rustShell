@@ -106,7 +106,7 @@ pub fn list_local_dir(path: &str) -> std::io::Result<DirListing> {
             truncated = true;
             break;
         }
-        entries.push(local_entry_from_path(path, metadata));
+        entries.push(local_entry_from_path(path, metadata, None));
     }
 
     sort_entries_by_folded_text(&mut entries, |entry| entry.name.as_str());
@@ -665,20 +665,26 @@ fn search_local_recursive(
                 continue;
             }
         };
-        let is_link = local_path_is_link(&path, &metadata);
+        let known_target = if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            Some(fs::read_link(&path).ok())
+        } else {
+            None
+        };
+        let is_link = metadata.file_type().is_symlink()
+            || known_target.as_ref().is_some_and(|target| target.is_some());
         let walk = metadata.is_dir() && !is_link;
         let name = path
             .file_name()
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_default();
         let mut matched = text_contains_query(&name, query) || path_contains_query(&path, query);
-        if !matched && is_link {
-            if let Ok(target) = fs::read_link(&path) {
-                matched = path_contains_query(&target, query);
+        if !matched {
+            if let Some(Some(target)) = known_target.as_ref() {
+                matched = path_contains_query(target, query);
             }
         }
         if matched {
-            output.push(local_entry_from_path(path.clone(), metadata));
+            output.push(local_entry_from_path(path.clone(), metadata, known_target));
         }
         if walk && search_local_recursive(&path, query, max_results, output, incomplete, limited).is_err() {
             *incomplete = true;
@@ -992,14 +998,20 @@ fn trim_partial_utf8_suffix(bytes: &mut Vec<u8>) {
     }
 }
 
-fn local_entry_from_path(path_buf: PathBuf, metadata: fs::Metadata) -> FileEntry {
+fn local_entry_from_path(
+    path_buf: PathBuf,
+    metadata: fs::Metadata,
+    known_target: Option<Option<PathBuf>>,
+) -> FileEntry {
     let modified_at = metadata
         .modified()
         .map(DateTime::<Utc>::from)
         .unwrap_or_else(|_| DateTime::<Utc>::from(SystemTime::UNIX_EPOCH));
     // Junctions are reparse points, not symlinks, but they still point elsewhere.
     let is_symlink = metadata.file_type().is_symlink();
-    let read_target = if is_symlink || is_reparse_point(&metadata) {
+    let read_target = if let Some(known_target) = known_target {
+        known_target
+    } else if is_symlink || is_reparse_point(&metadata) {
         fs::read_link(&path_buf).ok()
     } else {
         None
