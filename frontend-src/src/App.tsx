@@ -6721,6 +6721,13 @@ function FileList({
     };
   }, [updateRange, virtual, files.length]);
 
+  const listIdentity = `${files.length}\0${files[0]?.path ?? ""}\0${files[files.length - 1]?.path ?? ""}`;
+  useEffect(() => {
+    const node = listRef.current;
+    if (node) node.scrollTop = 0;
+    setRange({ start: 0, end: 40 });
+  }, [listIdentity]);
+
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
       event.preventDefault();
