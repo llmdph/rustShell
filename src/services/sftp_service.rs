@@ -2140,7 +2140,7 @@ fn next_free_remote_name(
             return take_free_remote_name(sftp, parent, stem, suffix, names);
         }
     } else if let Some(names) = remote_directory_names(sftp, parent) {
-        return next_free_numbered_name(stem, suffix, &names, 2);
+        return next_free_numbered_name(stem, suffix, &names, 2, false);
     }
 
     for index in 2..10_000 {
@@ -2161,7 +2161,7 @@ fn take_free_remote_name(
     names: &mut HashSet<String>,
 ) -> Option<String> {
     loop {
-        let next_name = next_free_numbered_name(stem, suffix, names, 2)?;
+        let next_name = next_free_numbered_name(stem, suffix, names, 2, false)?;
         let next_path = remote_child_path(parent, &next_name);
         names.insert(next_name.clone());
         if !remote_path_exists(sftp, Path::new(&next_path)) {
@@ -2329,7 +2329,7 @@ fn next_free_local_name(
             return take_free_local_name(parent, stem, suffix, names);
         }
     } else if let Some(names) = local_directory_names(parent) {
-        return next_free_numbered_name(stem, suffix, &names, 2);
+        return next_free_numbered_name(stem, suffix, &names, 2, cfg!(windows));
     }
 
     for index in 2..10_000 {
@@ -2348,7 +2348,7 @@ fn take_free_local_name(
     names: &mut HashSet<String>,
 ) -> Option<String> {
     loop {
-        let next_name = next_free_numbered_name(stem, suffix, names, 2)?;
+        let next_name = next_free_numbered_name(stem, suffix, names, 2, cfg!(windows))?;
         names.insert(fold_local_file_name(&next_name));
         if !local_path_exists(&parent.join(&next_name)) {
             return Some(next_name);
@@ -2595,11 +2595,18 @@ fn next_free_numbered_name(
     suffix: &str,
     occupied: &HashSet<String>,
     start: u32,
+    case_insensitive: bool,
 ) -> Option<String> {
     for index in start..10_000 {
         let name = numbered_copy_name(stem, suffix, index);
-        let key = fold_local_file_name(&name);
-        if !occupied.contains(&key) && !occupied.contains(&name) {
+        // Remote names stay case-sensitive. Folding every candidate makes
+        // Readme (2).txt look taken when only readme (2).txt exists.
+        let taken = if case_insensitive {
+            occupied.contains(&fold_local_file_name(&name))
+        } else {
+            occupied.contains(&name)
+        };
+        if !taken {
             return Some(name);
         }
     }
@@ -3723,12 +3730,12 @@ mod numbered_copy_tests {
         occupied.insert("report (1).txt".to_owned());
         occupied.insert("report (3).txt".to_owned());
         assert_eq!(
-            next_free_numbered_name("report", ".txt", &occupied, 1).as_deref(),
+            next_free_numbered_name("report", ".txt", &occupied, 1, false).as_deref(),
             Some("report (2).txt")
         );
         occupied.insert("report (2).txt".to_owned());
         assert_eq!(
-            next_free_numbered_name("report", ".txt", &occupied, 1).as_deref(),
+            next_free_numbered_name("report", ".txt", &occupied, 1, false).as_deref(),
             Some("report (4).txt")
         );
     }
@@ -3784,11 +3791,25 @@ mod numbered_copy_tests {
         let mut occupied = HashSet::new();
         occupied.insert("report.txt".to_owned());
         occupied.insert("report (1).txt".to_owned());
-        let first = next_free_numbered_name("report", ".txt", &occupied, 2).unwrap();
+        let first = next_free_numbered_name("report", ".txt", &occupied, 2, false).unwrap();
         occupied.insert(first.clone());
-        let second = next_free_numbered_name("report", ".txt", &occupied, 2).unwrap();
+        let second = next_free_numbered_name("report", ".txt", &occupied, 2, false).unwrap();
         assert_eq!(first, "report (2).txt");
         assert_eq!(second, "report (3).txt");
+    }
+
+    #[test]
+    fn a_remote_name_with_different_case_is_still_free() {
+        let mut occupied = HashSet::new();
+        occupied.insert("readme (2).txt".to_owned());
+        assert_eq!(
+            next_free_numbered_name("Readme", ".txt", &occupied, 2, false).as_deref(),
+            Some("Readme (2).txt")
+        );
+        assert_eq!(
+            next_free_numbered_name("Readme", ".txt", &occupied, 2, true).as_deref(),
+            Some("Readme (3).txt")
+        );
     }
 }
 
