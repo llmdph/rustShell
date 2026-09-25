@@ -1584,6 +1584,10 @@ where
             )?;
             preserve_remote_metadata(sftp, Path::new(&remote_path), &metadata);
         } else if metadata.is_file() {
+            if fs::File::open(&local_path).is_err() {
+                note_skipped_bytes(transferred, total, metadata.len(), on_progress);
+                continue;
+            }
             let remote_path = resolve_remote_child_path(sftp, remote_dir, &remote_name, conflict)?;
             upload_single_file(
                 sftp,
