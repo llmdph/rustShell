@@ -3375,9 +3375,9 @@ fn remove_remote_recursive_known(
     path: &Path,
     known: Option<ssh2::FileStat>,
 ) -> Result<()> {
-    // The parent listing already named the type. Another stat for every child
-    // only repeats that round trip.
-    let stat = match known.and_then(trusted_listing_stat) {
+    // Deleting only needs the type. A listing that omits size or time is still
+    // enough, and stating every child repeats a round trip.
+    let stat = match known.and_then(listing_stat_with_type) {
         Some(stat) => stat,
         None => sftp
             .lstat(path)
