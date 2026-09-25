@@ -364,29 +364,31 @@ fn run_ssh_shell(
     event_tx.send(TerminalEvent::Connected).ok();
 
     let mut buffer = [0_u8; 16 * 1024];
+    let mut pending_input = PendingSshInput::default();
     loop {
-        if dispatch_ssh_commands(&command_rx, &mut channel)? {
+        if take_ssh_commands(&command_rx, &mut channel, &mut pending_input)? {
             return Ok(());
         }
 
-        match channel.read(&mut buffer) {
+        let wrote = flush_ssh_input(&mut channel, &mut pending_input)?;
+        let read = match channel.read(&mut buffer) {
             Ok(0) if channel.eof() => break,
             Ok(n) if n > 0 => {
-                event_tx
+                if event_tx
                     .send(TerminalEvent::Output(buffer[..n].to_vec()))
-                    .ok();
-            }
-            Ok(0) => {
-                if wait_ssh_command(&command_rx, &mut channel)? {
+                    .is_err()
+                {
                     return Ok(());
                 }
+                true
             }
-            Err(error) if is_would_block(&error) => {
-                if wait_ssh_command(&command_rx, &mut channel)? {
-                    return Ok(());
-                }
-            }
+            Ok(_) => false,
+            Err(error) if is_would_block(&error) => false,
             Err(error) => return Err(error).context("failed to read SSH channel"),
+        };
+
+        if !wrote && !read && wait_ssh_command(&command_rx, &mut channel, &mut pending_input)? {
+            return Ok(());
         }
     }
 
@@ -398,12 +400,45 @@ fn run_ssh_shell(
 }
 
 
-fn dispatch_ssh_commands(
+#[derive(Default)]
+struct PendingSshInput {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+impl PendingSshInput {
+    fn is_empty(&self) -> bool {
+        self.offset >= self.bytes.len()
+    }
+
+    fn remaining(&self) -> &[u8] {
+        &self.bytes[self.offset..]
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if self.is_empty() {
+            self.bytes.clear();
+            self.offset = 0;
+        }
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    fn consume(&mut self, count: usize) {
+        self.offset += count;
+        if self.offset > 64 * 1024 && self.offset * 2 >= self.bytes.len() {
+            self.bytes.drain(..self.offset);
+            self.offset = 0;
+        }
+    }
+}
+
+fn take_ssh_commands(
     command_rx: &Receiver<TerminalCommand>,
     channel: &mut ssh2::Channel,
+    pending: &mut PendingSshInput,
 ) -> Result<bool> {
     while let Ok(command) = command_rx.try_recv() {
-        if apply_ssh_command(channel, command)? {
+        if queue_ssh_command(channel, command, pending)? {
             return Ok(true);
         }
     }
@@ -418,18 +453,23 @@ fn dispatch_ssh_commands(
 fn wait_ssh_command(
     command_rx: &Receiver<TerminalCommand>,
     channel: &mut ssh2::Channel,
+    pending: &mut PendingSshInput,
 ) -> Result<bool> {
     match command_rx.recv_timeout(Duration::from_millis(20)) {
-        Ok(command) => apply_ssh_command(channel, command),
+        Ok(command) => queue_ssh_command(channel, command, pending),
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(false),
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Ok(true),
     }
 }
 
-fn apply_ssh_command(channel: &mut ssh2::Channel, command: TerminalCommand) -> Result<bool> {
+fn queue_ssh_command(
+    channel: &mut ssh2::Channel,
+    command: TerminalCommand,
+    pending: &mut PendingSshInput,
+) -> Result<bool> {
     match command {
         TerminalCommand::Write(bytes) => {
-            write_ssh_all(channel, &bytes)?;
+            pending.push(&bytes);
             Ok(false)
         }
         TerminalCommand::Resize(next_size) => {
@@ -445,18 +485,24 @@ fn apply_ssh_command(channel: &mut ssh2::Channel, command: TerminalCommand) -> R
     }
 }
 
-fn write_ssh_all(channel: &mut ssh2::Channel, mut bytes: &[u8]) -> Result<()> {
-    while !bytes.is_empty() {
-        match channel.write(bytes) {
-            Ok(0) => thread::sleep(Duration::from_millis(10)),
-            Ok(n) => bytes = &bytes[n..],
-            Err(error) if is_would_block(&error) => thread::sleep(Duration::from_millis(10)),
-            Err(error) => return Err(error).context("failed to write SSH channel"),
-        }
+/// Write whatever the server can take, then return. Staying here until a large
+/// paste finishes would stop reading output and stall the session.
+fn flush_ssh_input(channel: &mut ssh2::Channel, pending: &mut PendingSshInput) -> Result<bool> {
+    if pending.is_empty() {
+        return Ok(false);
     }
-
-    channel.flush().ok();
-    Ok(())
+    match channel.write(pending.remaining()) {
+        Ok(0) => Ok(false),
+        Ok(count) => {
+            pending.consume(count);
+            if pending.is_empty() {
+                channel.flush().ok();
+            }
+            Ok(true)
+        }
+        Err(error) if is_would_block(&error) => Ok(false),
+        Err(error) => Err(error).context("failed to write SSH channel"),
+    }
 }
 
 fn is_would_block(error: &std::io::Error) -> bool {
