@@ -578,11 +578,10 @@ fn search_local_recursive(
             .file_name()
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let mut matched = text_contains_query(&name, query)
-            || text_contains_query(&path.display().to_string(), query);
+        let mut matched = text_contains_query(&name, query) || path_contains_query(&path, query);
         if !matched && is_link {
             if let Ok(target) = fs::read_link(&path) {
-                matched = text_contains_query(&target.display().to_string(), query);
+                matched = path_contains_query(&target, query);
             }
         }
         if matched {
@@ -607,6 +606,70 @@ pub(crate) fn text_contains_query(haystack: &str, needle: &str) -> bool {
             .any(|window| window.eq_ignore_ascii_case(needle_bytes));
     }
     haystack.to_lowercase().contains(needle)
+}
+
+/// Match a path without copying it first. Filename searches never need a
+/// separator-normalized copy, and slash direction only matters when the
+/// query itself contains a slash.
+pub(crate) fn path_contains_query(path: &Path, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    match path.to_str() {
+        Some(text) if !query_has_separator(query) => text_contains_query(text, query),
+        Some(text) => separator_folded_contains(text, query),
+        None => {
+            let text = path.to_string_lossy();
+            if !query_has_separator(query) {
+                text_contains_query(&text, query)
+            } else {
+                separator_folded_contains(&text, query)
+            }
+        }
+    }
+}
+
+fn query_has_separator(query: &str) -> bool {
+    query.bytes().any(|byte| byte == b'/' || byte == b'\\')
+}
+
+fn separator_folded_contains(haystack: &str, needle: &str) -> bool {
+    if haystack.is_ascii() && needle.is_ascii() {
+        let needle_bytes: Vec<u8> = needle.bytes().map(fold_ascii_path_byte).collect();
+        if needle_bytes.is_empty() || haystack.len() < needle_bytes.len() {
+            return needle_bytes.is_empty();
+        }
+        return haystack
+            .bytes()
+            .map(fold_ascii_path_byte)
+            .collect::<Vec<u8>>()
+            .windows(needle_bytes.len())
+            .any(|window| window == needle_bytes.as_slice());
+    }
+    let needle_chars: Vec<char> = needle.chars().map(fold_path_char).collect();
+    if needle_chars.is_empty() {
+        return true;
+    }
+    let haystack_chars: Vec<char> = haystack.chars().map(fold_path_char).collect();
+    haystack_chars
+        .windows(needle_chars.len())
+        .any(|window| window == needle_chars.as_slice())
+}
+
+fn fold_ascii_path_byte(byte: u8) -> u8 {
+    match byte {
+        b'\\' => b'/',
+        b'A'..=b'Z' => byte + 32,
+        other => other,
+    }
+}
+
+fn fold_path_char(ch: char) -> char {
+    if ch == '\\' {
+        '/'
+    } else {
+        ch.to_lowercase().next().unwrap_or(ch)
+    }
 }
 
 
@@ -922,8 +985,11 @@ mod tests {
     fn search_text_matches_ascii_case_and_other_letters() {
         assert!(text_contains_query("Hello.TXT", "hello"));
         assert!(text_contains_query("notes.txt", "TXT"));
-        assert!(text_contains_query("目录/报告.txt", "报告"));
+        assert!(text_contains_query("\u{76ee}\u{5f55}/\u{62a5}\u{544a}.txt", "\u{62a5}\u{544a}"));
         assert!(!text_contains_query("notes.txt", "png"));
+        assert!(path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), "notes"));
+        assert!(path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), "projects/notes"));
+        assert!(!path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), "png"));
     }
 
     #[test]

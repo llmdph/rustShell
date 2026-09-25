@@ -1,7 +1,8 @@
 use crate::core::{
     session::SessionProfile,
     sftp::{
-        local_path_is_link, remote_child_path, remote_parent_path, text_contains_query, DirListing,
+        local_path_is_link, path_contains_query, remote_child_path, remote_parent_path, text_contains_query,
+        DirListing,
         FileEntry, FileSearchResult,
         TransferConflictStrategy, DIR_ENTRY_LIMIT,
     },
@@ -630,11 +631,10 @@ fn search_remote_recursive(
             .file_name()
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| remote_path_text(&path_buf));
-        let mut matched =
-            text_contains_query(&name, query) || text_contains_query(&remote_path_text(&path_buf), query);
+        let mut matched = text_contains_query(&name, query) || path_contains_query(&path_buf, query);
         if !matched && is_symlink {
             if let Ok(target) = sftp.readlink(&path_buf) {
-                matched = text_contains_query(&remote_path_text(&target), query);
+                matched = path_contains_query(&target, query);
             }
         }
         if matched {
