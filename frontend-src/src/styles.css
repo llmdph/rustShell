@@ -2138,6 +2138,16 @@ select:disabled {
   background: color-mix(in srgb, var(--panel) 64%, #000000);
 }
 
+
+.file-list-body {
+  position: relative;
+}
+
+.file-row.file-virtual {
+  position: absolute;
+  left: 0;
+  right: 0;
+}
 .file-list:focus-visible {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 58%, transparent);
 }
@@ -2146,6 +2156,7 @@ select:disabled {
   display: grid;
   grid-template-columns: minmax(160px, 1.4fr) minmax(88px, 112px) minmax(42px, 58px) minmax(54px, 68px) minmax(92px, 118px);
   width: 100%;
+  height: 26px;
   min-height: 26px;
   padding: 0 5px;
   gap: 7px;

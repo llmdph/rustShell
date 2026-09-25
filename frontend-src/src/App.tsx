@@ -6638,6 +6638,9 @@ function AppSelect<T extends string>({
   );
 }
 
+const FILE_ROW_HEIGHT = 26;
+const FILE_ROW_OVERSCAN = 10;
+
 function FileList({
   files,
   compareMarks,
@@ -6672,6 +6675,35 @@ function FileList({
   onContextMenu: (event: MouseEvent, file?: FileEntry, alreadySelected?: boolean) => void;
 }) {
   const selectedPathSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const virtual = files.length > 120;
+  const [range, setRange] = useState({ start: 0, end: 40 });
+  const updateRange = useCallback(() => {
+    const node = listRef.current;
+    if (!node) return;
+    const bodyTop = Math.max(0, node.scrollTop - FILE_ROW_HEIGHT);
+    const start = Math.max(0, Math.floor(bodyTop / FILE_ROW_HEIGHT) - FILE_ROW_OVERSCAN);
+    const end = Math.min(
+      files.length,
+      Math.ceil((bodyTop + node.clientHeight) / FILE_ROW_HEIGHT) + FILE_ROW_OVERSCAN
+    );
+    setRange((current) => (current.start === start && current.end === end ? current : { start, end }));
+  }, [files.length]);
+
+  useEffect(() => {
+    updateRange();
+    const node = listRef.current;
+    if (!node || !virtual) return;
+    const onScroll = () => updateRange();
+    node.addEventListener("scroll", onScroll, { passive: true });
+    const observer = new ResizeObserver(() => updateRange());
+    observer.observe(node);
+    return () => {
+      node.removeEventListener("scroll", onScroll);
+      observer.disconnect();
+    };
+  }, [updateRange, virtual, files.length]);
+
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
       event.preventDefault();
@@ -6703,7 +6735,7 @@ function FileList({
   };
 
   return (
-    <div className="file-list" tabIndex={0} onKeyDown={handleKeyDown} onContextMenu={(event) => onContextMenu(event)}>
+    <div className="file-list" ref={listRef} tabIndex={0} onKeyDown={handleKeyDown} onContextMenu={(event) => onContextMenu(event)}>
       <div className="file-row file-head">
         <SortHeader label="名称" sortKey="name" sort={sort} onSort={onSort} />
         <SortHeader label="权限" sortKey="permissions" sort={sort} onSort={onSort} />
@@ -6711,14 +6743,20 @@ function FileList({
         <SortHeader label="大小" sortKey="size" sort={sort} onSort={onSort} />
         <SortHeader label="时间" sortKey="modifiedAt" sort={sort} onSort={onSort} />
       </div>
-      {files.map((file) => {
+      <div
+        className="file-list-body"
+        style={virtual ? { height: files.length * FILE_ROW_HEIGHT } : undefined}
+      >
+      {(virtual ? files.slice(range.start, range.end) : files).map((file, index) => {
+        const rowIndex = virtual ? range.start + index : index;
         const compareMark = compareMarks.get(file.path);
         const compareText = compareMark ? compareMarkLabel(compareMark) : "";
         const compareDetail = compareMark?.detail ?? "";
         return (
           <button
             key={file.path}
-            className={`file-row ${compareMark ? `compare-${compareMark.kind}` : ""} ${
+            style={virtual ? { top: rowIndex * FILE_ROW_HEIGHT } : undefined}
+            className={`file-row ${virtual ? "file-virtual" : ""} ${compareMark ? `compare-${compareMark.kind}` : ""} ${
               selectedPathSet.has(file.path) ? "selected" : ""
             } ${selected?.path === file.path ? "primary" : ""}`}
             onClick={(event) => onSelect(file, event)}
@@ -6744,6 +6782,7 @@ function FileList({
           </button>
         );
       })}
+      </div>
     </div>
   );
 }
