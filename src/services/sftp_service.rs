@@ -2669,12 +2669,52 @@ fn ensure_remote_parent_dirs(sftp: &ssh2::Sftp, parent: &str, segments: &[&str])
 }
 
 fn preserve_remote_metadata(sftp: &ssh2::Sftp, remote_path: &Path, metadata: &fs::Metadata) {
-    if let Some(mode) = local_mode(metadata) {
-        let _ = set_remote_permissions(sftp, remote_path, mode);
+    preserve_remote_mode_and_times(
+        sftp,
+        remote_path,
+        local_mode(metadata),
+        local_accessed_seconds(metadata),
+        local_modified_seconds(metadata),
+    );
+}
+
+fn remote_mode_and_times(
+    mode: Option<u32>,
+    atime: Option<u64>,
+    mtime: Option<u64>,
+) -> Option<ssh2::FileStat> {
+    let perm = mode.map(|mode| mode & 0o7777);
+    if perm.is_none() && atime.is_none() && mtime.is_none() {
+        return None;
     }
-    let atime = local_accessed_seconds(metadata);
-    let mtime = local_modified_seconds(metadata);
-    let _ = set_remote_times(sftp, remote_path, atime, mtime);
+    Some(ssh2::FileStat {
+        size: None,
+        uid: None,
+        gid: None,
+        perm,
+        atime,
+        mtime,
+    })
+}
+
+fn preserve_remote_mode_and_times(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    mode: Option<u32>,
+    atime: Option<u64>,
+    mtime: Option<u64>,
+) {
+    let Some(stat) = remote_mode_and_times(mode, atime, mtime) else {
+        return;
+    };
+    if sftp.setstat(path, stat).is_ok() {
+        return;
+    }
+    // Some servers reject a combined update. Each part can still succeed alone.
+    if let Some(mode) = mode {
+        let _ = set_remote_permissions(sftp, path, mode);
+    }
+    let _ = set_remote_times(sftp, path, atime, mtime);
 }
 
 #[cfg(unix)]
@@ -2849,8 +2889,7 @@ fn copy_remote_path_inner(
             Err(error) if strict => return Err(error),
             Err(_) => {
                 preserve_remote_owner(sftp, target, stat.uid, stat.gid);
-                preserve_remote_permissions(sftp, target, stat.perm);
-                let _ = set_remote_times(sftp, target, stat.atime, stat.mtime);
+                preserve_remote_mode_and_times(sftp, target, stat.perm, stat.atime, stat.mtime);
                 return Ok(());
             }
         };
@@ -2862,8 +2901,7 @@ fn copy_remote_path_inner(
             copy_remote_path_inner(sftp, &child, Path::new(&child_target), false, false)?;
         }
         preserve_remote_owner(sftp, target, stat.uid, stat.gid);
-        preserve_remote_permissions(sftp, target, stat.perm);
-        let _ = set_remote_times(sftp, target, stat.atime, stat.mtime);
+        preserve_remote_mode_and_times(sftp, target, stat.perm, stat.atime, stat.mtime);
         return Ok(());
     }
 
@@ -2882,8 +2920,7 @@ fn copy_remote_path_inner(
         .with_context(|| format!("failed to copy remote file {}", source.display()))?;
     output.flush().ok();
     preserve_remote_owner(sftp, target, stat.uid, stat.gid);
-    preserve_remote_permissions(sftp, target, stat.perm);
-    let _ = set_remote_times(sftp, target, stat.atime, stat.mtime);
+    preserve_remote_mode_and_times(sftp, target, stat.perm, stat.atime, stat.mtime);
     Ok(())
 }
 
@@ -3662,5 +3699,25 @@ mod numbered_copy_tests {
         let second = next_free_numbered_name("report", ".txt", &occupied, 2).unwrap();
         assert_eq!(first, "report (2).txt");
         assert_eq!(second, "report (3).txt");
+    }
+}
+
+#[cfg(test)]
+mod remote_attribute_tests {
+    use super::remote_mode_and_times;
+
+    #[test]
+    fn permission_and_time_go_out_together() {
+        let stat = remote_mode_and_times(Some(0o1644), Some(10), Some(20)).unwrap();
+        assert_eq!(stat.perm, Some(0o644));
+        assert_eq!(stat.atime, Some(10));
+        assert_eq!(stat.mtime, Some(20));
+        assert_eq!(stat.uid, None);
+        assert_eq!(stat.size, None);
+    }
+
+    #[test]
+    fn nothing_to_preserve_makes_no_update() {
+        assert!(remote_mode_and_times(None, None, None).is_none());
     }
 }
