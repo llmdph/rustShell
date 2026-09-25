@@ -8637,16 +8637,28 @@ function shouldPromptForPassword(profile: Profile, message: string) {
     message.includes("密钥口令") ||
     normalized.includes("authentication") ||
     normalized.includes("passphrase") ||
-    normalized.includes("password")
+    hasAuthPassword(normalized)
   ) {
     return true;
   }
-  // A remote file can be permission-denied without the login itself failing.
-  if (!normalized.includes("permission denied")) return false;
+  return false;
+}
+
+function hasAuthPassword(normalized: string) {
+  if (normalized.includes("permission denied")) {
+    return (
+      normalized.includes("publickey") ||
+      normalized.includes("keyboard-interactive") ||
+      /\([^)]*\bpassword\b[^)]*\)/.test(normalized)
+    );
+  }
   return (
-    normalized.includes("publickey") ||
-    normalized.includes("keyboard-interactive") ||
-    normalized.includes("password")
+    normalized.includes("password authentication") ||
+    normalized.includes("bad password") ||
+    normalized.includes("wrong password") ||
+    normalized.includes("incorrect password") ||
+    normalized.includes("password required") ||
+    normalized.includes("password is required")
   );
 }
 
