@@ -505,13 +505,27 @@ fn read_remote_entries(
     dirname: &Path,
     limit: Option<usize>,
 ) -> Result<Vec<(PathBuf, ssh2::FileStat)>> {
+    let mut entries = Vec::new();
+    visit_remote_entries(sftp, dirname, limit, |path, stat| {
+        entries.push((path, stat));
+        true
+    })?;
+    Ok(entries)
+}
+
+fn visit_remote_entries(
+    sftp: &ssh2::Sftp,
+    dirname: &Path,
+    limit: Option<usize>,
+    mut visit: impl FnMut(PathBuf, ssh2::FileStat) -> bool,
+) -> Result<()> {
     let mut dir = sftp
         .opendir(dirname)
         .with_context(|| format!("failed to list {}", dirname.display()))?;
-    let mut entries = Vec::new();
     let parent = remote_path_text(dirname);
+    let mut seen = 0usize;
     loop {
-        if limit.is_some_and(|limit| entries.len() >= limit) {
+        if limit.is_some_and(|limit| seen >= limit) {
             break;
         }
         match dir.readdir() {
@@ -520,8 +534,11 @@ fn read_remote_entries(
                 if name == "." || name == ".." {
                     continue;
                 }
+                seen += 1;
                 let joined = remote_child_path(&parent, &name);
-                entries.push((PathBuf::from(joined), stat));
+                if !visit(PathBuf::from(joined), stat) {
+                    break;
+                }
             }
             Err(error) if is_libssh2_session_code(&error, LIBSSH2_ERROR_FILE) => break,
             Err(error) if is_libssh2_session_code(&error, LIBSSH2_ERROR_EAGAIN) => {
@@ -532,7 +549,7 @@ fn read_remote_entries(
             }
         }
     }
-    Ok(entries)
+    Ok(())
 }
 
 fn is_libssh2_session_code(error: &ssh2::Error, code: i32) -> bool {
@@ -562,19 +579,27 @@ fn search_remote_recursive(
         return Ok(());
     }
 
-    let entries = read_remote_entries(sftp, root, None)?;
-    for (path_buf, stat) in entries {
+    let mut directories = Vec::new();
+    visit_remote_entries(sftp, root, None, |path_buf, stat| {
         if output.len() >= max_results {
-            break;
+            return false;
         }
         let should_descend = stat.is_dir() && !stat.file_type().is_symlink();
         let entry = entry_from_stat(sftp, path_buf.clone(), stat);
         if entry_matches_query(&entry, query) {
-            output.push(entry.clone());
+            output.push(entry);
         }
         if should_descend {
-            search_remote_recursive(sftp, &path_buf, query, max_results, output)?;
+            directories.push(path_buf);
         }
+        output.len() < max_results
+    })?;
+
+    for directory in directories {
+        if output.len() >= max_results {
+            break;
+        }
+        search_remote_recursive(sftp, &directory, query, max_results, output)?;
     }
     Ok(())
 }
