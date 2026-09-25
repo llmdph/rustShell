@@ -147,7 +147,7 @@ type DirectoryCompare = {
 };
 type FileDragPayload = { side: FileSide; entries: FileEntry[] };
 type PathBookmark = { label: string; path: string };
-type FileSearchState = { root: string; query: string; count: number };
+type FileSearchState = { root: string; query: string; count: number; limited: boolean; incomplete: boolean };
 type BatchRenamePlanItem = { entry: FileEntry; newName: string };
 type DeleteConfirmState = { side: FileSide; entries: FileEntry[] };
 type SyncPlanItem = {
@@ -320,6 +320,10 @@ export default function App() {
   const [remoteFilter, setRemoteFilter] = useState("");
   const [localSearch, setLocalSearch] = useState<FileSearchState | null>(null);
   const [remoteSearch, setRemoteSearch] = useState<FileSearchState | null>(null);
+  const localSearchRef = useRef<FileSearchState | null>(null);
+  const remoteSearchRef = useRef<FileSearchState | null>(null);
+  localSearchRef.current = localSearch;
+  remoteSearchRef.current = remoteSearch;
   const [compareDirectories, setCompareDirectories] = useState(false);
   const [compareView, setCompareView] = useState<CompareView>("all");
   const [localSort, setLocalSort] = useState<FileSort>(defaultFileSort);
@@ -1140,6 +1144,32 @@ export default function App() {
 
   const refreshLocalFiles = useCallback(async (preferPath?: string) => {
     if (!localPath) return;
+    const activeSearch = localSearchRef.current;
+    if (preferPath === undefined && activeSearch && activeSearch.root === localPath) {
+      const generation = ++localListGenerationRef.current;
+      try {
+        const result = await api.searchLocal(activeSearch.root, activeSearch.query, 300);
+        if (generation !== localListGenerationRef.current) return;
+        const files = result.entries;
+        const picked = pickSelection(files, undefined, selectedLocalRef.current);
+        setLocalFiles(files);
+        setLocalDirTruncated(false);
+        setSelectedLocal(picked);
+        setSelectedLocalPaths(picked ? [picked.path] : []);
+        setLocalSearch({
+          root: activeSearch.root,
+          query: activeSearch.query,
+          count: files.length,
+          limited: result.limited,
+          incomplete: result.incomplete
+        });
+      } catch (error) {
+        if (generation !== localListGenerationRef.current) return;
+        pushToast("error", `搜索失败: ${String(error)}`);
+      }
+      return;
+    }
+    localSearchRef.current = null;
     const generation = ++localListGenerationRef.current;
     const requestedPath = localPath;
     const preferredPath = preferPath ?? pendingLocalPreferPathRef.current ?? undefined;
@@ -1182,8 +1212,47 @@ export default function App() {
       setRemoteDirTruncated(false);
       clearRemoteSelection();
       setRemoteSearch(null);
+      remoteSearchRef.current = null;
       return;
     }
+    const activeSearch = remoteSearchRef.current;
+    if (preferPath === undefined && activeSearch && activeSearch.root === remotePath) {
+      const generation = ++remoteListGenerationRef.current;
+      try {
+        const result = await api.searchRemote(
+          activeProfile.id,
+          activeSearch.root,
+          activeSearch.query,
+          300,
+          passwordForActive
+        );
+        if (generation !== remoteListGenerationRef.current) return;
+        const files = result.entries;
+        const picked = pickSelection(files, undefined, selectedRemoteRef.current);
+        setRemoteFiles(files);
+        setRemoteDirTruncated(false);
+        setSelectedRemote(picked);
+        setSelectedRemotePaths(picked ? [picked.path] : []);
+        setRemoteSearch({
+          root: activeSearch.root,
+          query: activeSearch.query,
+          count: files.length,
+          limited: result.limited,
+          incomplete: result.incomplete
+        });
+      } catch (error) {
+        if (generation !== remoteListGenerationRef.current) return;
+        const message = String(error);
+        if (shouldPromptForPassword(activeProfile, message)) {
+          requestProfileSecret(activeProfile, message);
+          pushToast("info", "请输入连接密码/口令");
+          return;
+        }
+        pushToast("error", `搜索失败: ${message}`);
+      }
+      return;
+    }
+    remoteSearchRef.current = null;
     const generation = ++remoteListGenerationRef.current;
     const requestedPath = remotePath;
     const preferredPath = preferPath ?? pendingRemotePreferPathRef.current ?? undefined;
@@ -1208,6 +1277,18 @@ export default function App() {
       pushToast("error", "远程目录读取失败");
     }
   }, [activeProfile, loadRemoteFilesFor, passwordForActive, pushToast, remotePath]);
+
+  const exitLocalSearch = useCallback(() => {
+    localSearchRef.current = null;
+    setLocalSearch(null);
+    void refreshLocalFiles();
+  }, [refreshLocalFiles]);
+
+  const exitRemoteSearch = useCallback(() => {
+    remoteSearchRef.current = null;
+    setRemoteSearch(null);
+    void refreshRemoteFiles();
+  }, [refreshRemoteFiles]);
 
   const reconnectRemoteSftp = useCallback(async () => {
     if (!activeProfile || isLocalProtocol(activeProfile.protocol)) return;
@@ -4794,7 +4875,7 @@ export default function App() {
                       count={localSearch.count}
                       limited={localSearch.limited}
                       incomplete={localSearch.incomplete}
-                      onClear={refreshLocalFiles}
+                      onClear={exitLocalSearch}
                     />
                   )}
                   {!localSearch && localDirTruncated && <DirLimitNotice count={localFiles.length} />}
@@ -5561,7 +5642,7 @@ export default function App() {
                       count={remoteSearch.count}
                       limited={remoteSearch.limited}
                       incomplete={remoteSearch.incomplete}
-                      onClear={refreshRemoteFiles}
+                      onClear={exitRemoteSearch}
                     />
                   )}
                   {!remoteSearch && remoteDirTruncated && <DirLimitNotice count={remoteFiles.length} />}
