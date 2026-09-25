@@ -1583,9 +1583,10 @@ fn start_transfer_with_attempts(
     let worker_pool = state.transfer_sftp.clone();
     thread::Builder::new()
         .name(format!("transfer-{}", id))
-        // Queued files for one host share a session, so most of these threads
-        // sit blocked on the per-profile lock and do not need an 8 MiB stack.
-        .stack_size(512 * 1024)
+        // Directory walks are recursive. 512 KiB overflows on a deep tree and
+        // kills the worker. 2 MiB is enough for that without reserving 8 MiB
+        // for every queued file.
+        .stack_size(2 * 1024 * 1024)
         .spawn(move || {
             let mut on_progress = {
                 let state_for_progress = transfer_state.clone();
@@ -1595,7 +1596,8 @@ fn start_transfer_with_attempts(
             };
             // One handshake for the batch. Connecting per file trips sshd
             // MaxStartups and drops transfers at random.
-            let result = worker_pool.with(&worker_profile, password.as_deref(), |connection| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_pool.with(&worker_profile, password.as_deref(), |connection| {
                 match worker_direction {
                     TransferDirection::Upload => sftp_service::upload_with_sftp(
                         connection.sftp(),
@@ -1616,24 +1618,30 @@ fn start_transfer_with_attempts(
                     )
                     .map(|path| Some(path.display().to_string())),
                 }
-            });
+            })
+            }));
 
             let mut guard = lock_poison_ok(&transfer_state);
             match result {
-                Ok(path) => {
+                Ok(Ok(path)) => {
                     guard.status = "done".to_owned();
                     guard.finished_at = Some(Utc::now());
                     guard.message = path;
                 }
-                Err(error) if cancel.load(Ordering::Relaxed) => {
+                Ok(Err(error)) if cancel.load(Ordering::Relaxed) => {
                     guard.status = "cancelled".to_owned();
                     guard.finished_at = Some(Utc::now());
                     guard.message = Some(error.to_string());
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     guard.status = "failed".to_owned();
                     guard.finished_at = Some(Utc::now());
                     guard.message = Some(error.to_string());
+                }
+                Err(_) => {
+                    guard.status = "failed".to_owned();
+                    guard.finished_at = Some(Utc::now());
+                    guard.message = Some("传输意外中断".to_owned());
                 }
             }
 
