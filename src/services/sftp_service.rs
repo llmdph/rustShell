@@ -1055,6 +1055,7 @@ where
             cancel,
             conflict,
             None,
+            RemoteStatCache::Unknown,
             &mut on_progress,
         )
         .context("failed to upload file")?;
@@ -1501,6 +1502,41 @@ fn resume_size_unknown_message(path: &Path) -> String {
     format!("无法续传 {}：无法确认远程文件大小，已保留现有文件。如需替换，请改用覆盖", path.display())
 }
 
+enum RemoteStatCache {
+    Unknown,
+    Missing,
+    Found(ssh2::FileStat),
+}
+
+fn remote_resume_cache(sftp: &ssh2::Sftp, remote_path: &Path) -> Result<RemoteStatCache> {
+    // lstat catches a link without following it. Size is usually included;
+    // stat is only for servers that leave the size out.
+    match sftp.lstat(remote_path) {
+        Ok(stat) if stat.file_type().is_symlink() => bail!(REMOTE_LINK_KEPT),
+        Ok(stat) if stat.size.is_some() => Ok(RemoteStatCache::Found(stat)),
+        Ok(stat) => Ok(match sftp.stat(remote_path) {
+            Ok(full) => RemoteStatCache::Found(full),
+            Err(_) => RemoteStatCache::Found(stat),
+        }),
+        Err(_) => Ok(RemoteStatCache::Missing),
+    }
+}
+
+fn resume_needs_source_bytes(choice: ResumeChoice) -> bool {
+    matches!(choice, ResumeChoice::Append(_) | ResumeChoice::Restart)
+}
+
+fn resume_download_can_skip_open(local_path: &Path, remote_size: Option<u64>) -> bool {
+    let Some(remote_size) = remote_size else {
+        return false;
+    };
+    let Ok(metadata) = fs::symlink_metadata(local_path) else {
+        return false;
+    };
+    metadata.is_file()
+        && !resume_needs_source_bytes(choose_resume(Some(metadata.len()), Some(remote_size)))
+}
+
 fn upload_single_file<F>(
     sftp: &ssh2::Sftp,
     local_path: &Path,
@@ -1509,7 +1545,8 @@ fn upload_single_file<F>(
     transferred: &mut u64,
     cancel: Arc<AtomicBool>,
     conflict: TransferConflictStrategy,
-    mut opened: Option<File>,
+    opened: Option<File>,
+    mut known_remote: RemoteStatCache,
     on_progress: &mut F,
 ) -> Result<()>
 where
@@ -1526,33 +1563,19 @@ where
         on_progress(*transferred, total);
         return Ok(());
     }
-    let mut local = match opened {
-        Some(file) => file,
-        None => File::open(local_path)
-            .with_context(|| format!("failed to open {}", local_path.display()))?,
-    };
-    replace_remote_link_for_write(sftp, remote_path, conflict)?;
-    let mut remote = if matches!(conflict, TransferConflictStrategy::Resume) {
-        if let Ok(stat) = sftp.stat(remote_path) {
-            match choose_resume(stat.size, Some(metadata.len())) {
-                ResumeChoice::Append(remote_size) => {
-                    local
-                        .seek(SeekFrom::Start(remote_size))
-                        .with_context(|| format!("failed to seek {}", local_path.display()))?;
-                    let mut remote = sftp
-                        .open_mode(remote_path, OpenFlags::WRITE, 0o644, OpenType::File)
-                        .with_context(|| {
-                            format!("failed to resume remote file {}", remote_path.display())
-                        })?;
-                    remote
-                        .seek(SeekFrom::Start(remote_size))
-                        .with_context(|| {
-                            format!("failed to seek remote file {}", remote_path.display())
-                        })?;
-                    *transferred += remote_size;
-                    on_progress(*transferred, total);
-                    remote
-                }
+
+    // One lookup decides resume. A finished file can return before it is opened.
+    if matches!(conflict, TransferConflictStrategy::Resume)
+        && matches!(known_remote, RemoteStatCache::Unknown)
+    {
+        known_remote = remote_resume_cache(sftp, remote_path)?;
+    }
+
+    let resume_append_at = if matches!(conflict, TransferConflictStrategy::Resume) {
+        match &known_remote {
+            RemoteStatCache::Found(stat) => match choose_resume(stat.size, Some(metadata.len())) {
+                ResumeChoice::Append(remote_size) => Some(remote_size),
+                ResumeChoice::Restart => None,
                 ResumeChoice::Complete => {
                     *transferred += metadata.len();
                     on_progress(*transferred, total);
@@ -1568,15 +1591,37 @@ where
                 ResumeChoice::SizeUnknown => {
                     bail!("{}", resume_size_unknown_message(remote_path));
                 }
-                ResumeChoice::Restart => sftp.create(remote_path).with_context(|| {
-                    format!("failed to create remote file {}", remote_path.display())
-                })?,
-            }
-        } else {
-            sftp.create(remote_path).with_context(|| {
-                format!("failed to create remote file {}", remote_path.display())
-            })?
+            },
+            RemoteStatCache::Missing | RemoteStatCache::Unknown => None,
         }
+    } else {
+        None
+    };
+
+    let mut local = match opened {
+        Some(file) => file,
+        None => File::open(local_path)
+            .with_context(|| format!("failed to open {}", local_path.display()))?,
+    };
+    // Resume already refused a link. Checking again would ask about every file.
+    if !matches!(conflict, TransferConflictStrategy::Resume) {
+        replace_remote_link_for_write(sftp, remote_path, conflict)?;
+    }
+    let mut remote = if let Some(remote_size) = resume_append_at {
+        local
+            .seek(SeekFrom::Start(remote_size))
+            .with_context(|| format!("failed to seek {}", local_path.display()))?;
+        let mut remote = sftp
+            .open_mode(remote_path, OpenFlags::WRITE, 0o644, OpenType::File)
+            .with_context(|| {
+                format!("failed to resume remote file {}", remote_path.display())
+            })?;
+        remote
+            .seek(SeekFrom::Start(remote_size))
+            .with_context(|| format!("failed to seek remote file {}", remote_path.display()))?;
+        *transferred += remote_size;
+        on_progress(*transferred, total);
+        remote
     } else {
         sftp.create(remote_path)
             .with_context(|| format!("failed to create remote file {}", remote_path.display()))?
@@ -1691,10 +1736,43 @@ where
                 on_progress(*transferred, total);
                 continue;
             }
+            // Resume can see a finished file from one lookup. Opening it first
+            // locks every completed file in the folder.
+            let known_remote = if matches!(conflict, TransferConflictStrategy::Resume) {
+                remote_resume_cache(sftp, Path::new(&remote_path))?
+            } else {
+                RemoteStatCache::Unknown
+            };
+            if let RemoteStatCache::Found(stat) = &known_remote {
+                match choose_resume(stat.size, Some(metadata.len())) {
+                    ResumeChoice::Complete => {
+                        *transferred += metadata.len();
+                        on_progress(*transferred, total);
+                        preserve_remote_metadata(sftp, Path::new(&remote_path), &metadata);
+                        continue;
+                    }
+                    ResumeChoice::TargetLarger { target, source } => {
+                        bail!(
+                            "{}",
+                            resume_target_larger_message(
+                                Path::new(&remote_path),
+                                target,
+                                source,
+                                false
+                            )
+                        );
+                    }
+                    ResumeChoice::SizeUnknown => {
+                        bail!("{}", resume_size_unknown_message(Path::new(&remote_path)));
+                    }
+                    ResumeChoice::Append(_) | ResumeChoice::Restart => {}
+                }
+            }
             // Keep this handle for the copy. A second open can fail on a busy
-            // file and stop the rest of the folder.
+            // file and stop the rest of the folder. Finished files were handled
+            // above, so an unreadable file is skipped only when its bytes are needed.
             let opened = match File::open(&local_path) {
-                Ok(file) => file,
+                Ok(file) => Some(file),
                 Err(_) => {
                     note_skipped_bytes(transferred, total, metadata.len(), on_progress);
                     continue;
@@ -1708,7 +1786,8 @@ where
                 transferred,
                 cancel.clone(),
                 conflict,
-                Some(opened),
+                opened,
+                known_remote,
                 on_progress,
             )?;
         }
@@ -1941,6 +2020,25 @@ where
         }
         // An existing file that will be left alone does not need to be opened.
         if matches!(conflict, TransferConflictStrategy::Skip) && local_path_exists(&local_path) {
+            download_single_file(
+                sftp,
+                &remote_path,
+                &local_path,
+                total,
+                transferred,
+                cancel.clone(),
+                conflict,
+                None,
+                trusted_listing_stat(stat),
+                on_progress,
+            )?;
+            continue;
+        }
+        // The listing already has the size. A finished file does not need the
+        // remote file opened, and a larger local file fails before that open.
+        if matches!(conflict, TransferConflictStrategy::Resume)
+            && resume_download_can_skip_open(&local_path, stat.size)
+        {
             download_single_file(
                 sftp,
                 &remote_path,
@@ -3378,7 +3476,7 @@ mod preferred_transfer_name_tests {
 
 #[cfg(test)]
 mod resume_choice_tests {
-    use super::{choose_resume, ResumeChoice};
+    use super::{choose_resume, resume_needs_source_bytes, ResumeChoice};
 
     #[test]
     fn appends_when_existing_file_is_shorter() {
@@ -3427,6 +3525,21 @@ mod resume_choice_tests {
             choose_resume(Some(8), None),
             ResumeChoice::SizeUnknown
         ));
+    }
+
+    #[test]
+    fn finished_or_refused_resume_does_not_read_the_source() {
+        assert!(!resume_needs_source_bytes(choose_resume(
+            Some(10),
+            Some(10)
+        )));
+        assert!(resume_needs_source_bytes(choose_resume(Some(4), Some(10))));
+        assert!(resume_needs_source_bytes(choose_resume(None, Some(10))));
+        assert!(!resume_needs_source_bytes(choose_resume(
+            Some(11),
+            Some(10)
+        )));
+        assert!(!resume_needs_source_bytes(choose_resume(Some(8), None)));
     }
 }
 
