@@ -2820,9 +2820,22 @@ fn collect_remote_path_stats_from_stat(
 }
 
 fn remove_remote_recursive(sftp: &ssh2::Sftp, path: &Path) -> Result<()> {
-    let stat = sftp
-        .lstat(path)
-        .with_context(|| format!("failed to stat remote path {}", path.display()))?;
+    remove_remote_recursive_known(sftp, path, None)
+}
+
+fn remove_remote_recursive_known(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    known: Option<ssh2::FileStat>,
+) -> Result<()> {
+    // The parent listing already named the type. Another stat for every child
+    // only repeats that round trip.
+    let stat = match known.and_then(trusted_listing_stat) {
+        Some(stat) => stat,
+        None => sftp
+            .lstat(path)
+            .with_context(|| format!("failed to stat remote path {}", path.display()))?,
+    };
     if !stat.is_dir() || stat.file_type().is_symlink() {
         return sftp
             .unlink(path)
@@ -2830,8 +2843,8 @@ fn remove_remote_recursive(sftp: &ssh2::Sftp, path: &Path) -> Result<()> {
     }
 
     let children = read_remote_entries(sftp, path, None)?;
-    for (child, _) in children {
-        remove_remote_recursive(sftp, &child)?;
+    for (child, child_stat) in children {
+        remove_remote_recursive_known(sftp, &child, Some(child_stat))?;
     }
 
     sftp.rmdir(path)
