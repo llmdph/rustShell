@@ -1598,6 +1598,13 @@ fn start_transfer_with_attempts(
             // MaxStartups and drops transfers at random.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_pool.with(&worker_profile, password.as_deref(), |connection| {
+                {
+                    // Speed and ETA should ignore time spent waiting behind
+                    // other files on the same host.
+                    let mut guard = lock_poison_ok(&transfer_state);
+                    guard.started_at = Instant::now();
+                    guard.transferred = 0;
+                }
                 match worker_direction {
                     TransferDirection::Upload => sftp_service::upload_with_sftp(
                         connection.sftp(),
