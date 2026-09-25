@@ -1,7 +1,8 @@
 use crate::core::{
     session::SessionProfile,
     sftp::{
-        local_path_is_link, path_contains_query, remote_child_path, remote_parent_path, sort_entries_by_folded_text, text_contains_query,
+        dir_entry_metadata, local_path_is_link, path_contains_query, remote_child_path,
+        remote_parent_path, sort_entries_by_folded_text, text_contains_query,
         DirListing,
         FileEntry, FileSearchResult,
         TransferConflictStrategy, DIR_ENTRY_LIMIT,
@@ -1675,7 +1676,7 @@ where
         };
         let local_path = entry.path();
         let remote_name = entry.file_name().to_string_lossy().to_string();
-        let metadata = match fs::symlink_metadata(&local_path) {
+        let metadata = match dir_entry_metadata(&entry) {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
@@ -2125,7 +2126,18 @@ fn local_total_size(path: &Path, cancel: &AtomicBool) -> Result<u64> {
     }
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
-    if local_path_is_link(path, &metadata) {
+    local_total_size_metadata(path, &metadata, cancel)
+}
+
+fn local_total_size_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    cancel: &AtomicBool,
+) -> Result<u64> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("transfer cancelled");
+    }
+    if local_path_is_link(path, metadata) {
         return Ok(0);
     }
     if metadata.is_file() {
@@ -2141,7 +2153,12 @@ fn local_total_size(path: &Path, cancel: &AtomicBool) -> Result<u64> {
             Ok(entry) => entry,
             Err(_) => continue,
         };
-        match local_total_size(&entry.path(), cancel) {
+        let child = entry.path();
+        let child_metadata = match dir_entry_metadata(&entry) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        match local_total_size_metadata(&child, &child_metadata, cancel) {
             Ok(size) => total += size,
             Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
             Err(_) => continue,

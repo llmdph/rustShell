@@ -89,6 +89,11 @@ impl Default for TransferConflictStrategy {
     }
 }
 
+
+pub(crate) fn dir_entry_metadata(entry: &fs::DirEntry) -> std::io::Result<fs::Metadata> {
+    entry.metadata().or_else(|_| fs::symlink_metadata(entry.path()))
+}
+
 pub fn list_local_dir(path: &str) -> std::io::Result<DirListing> {
     let mut entries = Vec::new();
     let mut truncated = false;
@@ -98,15 +103,16 @@ pub fn list_local_dir(path: &str) -> std::io::Result<DirListing> {
         let Ok(entry) = entry else {
             continue;
         };
-        let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
+        // The listing already has the size and link kind. Statting the path
+        // again opens every file in a large folder.
+        let Ok(metadata) = dir_entry_metadata(&entry) else {
             continue;
         };
         if entries.len() >= DIR_ENTRY_LIMIT {
             truncated = true;
             break;
         }
-        entries.push(local_entry_from_path(path, metadata, None));
+        entries.push(local_entry_from_path(entry.path(), metadata, None));
     }
 
     sort_entries_by_folded_text(&mut entries, |entry| entry.name.as_str());
@@ -579,7 +585,16 @@ pub fn local_file_sha256(path: &str) -> std::io::Result<String> {
 
 fn touch_path(path: &Path, file_time: FileTime, recursive: bool) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    if local_path_is_link(path, &metadata) {
+    touch_with_metadata(path, &metadata, file_time, recursive)
+}
+
+fn touch_with_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    file_time: FileTime,
+    recursive: bool,
+) -> std::io::Result<()> {
+    if local_path_is_link(path, metadata) {
         return Ok(());
     }
     set_file_mtime(path, file_time)?;
@@ -589,7 +604,12 @@ fn touch_path(path: &Path, file_time: FileTime, recursive: bool) -> std::io::Res
                 Ok(entry) => entry,
                 Err(_) => continue,
             };
-            if touch_path(&entry.path(), file_time, true).is_err() {
+            let child = entry.path();
+            let child_metadata = match dir_entry_metadata(&entry) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if touch_with_metadata(&child, &child_metadata, file_time, true).is_err() {
                 continue;
             }
         }
@@ -603,7 +623,16 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 fn chmod_path(path: &Path, mode: u32, recursive: bool) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    if local_path_is_link(path, &metadata) {
+    chmod_with_metadata(path, &metadata, mode, recursive)
+}
+
+fn chmod_with_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    mode: u32,
+    recursive: bool,
+) -> std::io::Result<()> {
+    if local_path_is_link(path, metadata) {
         return Ok(());
     }
     set_local_permissions(path, mode)?;
@@ -613,7 +642,12 @@ fn chmod_path(path: &Path, mode: u32, recursive: bool) -> std::io::Result<()> {
                 Ok(entry) => entry,
                 Err(_) => continue,
             };
-            if chmod_path(&entry.path(), mode, true).is_err() {
+            let child = entry.path();
+            let child_metadata = match dir_entry_metadata(&entry) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if chmod_with_metadata(&child, &child_metadata, mode, true).is_err() {
                 continue;
             }
         }
@@ -623,15 +657,28 @@ fn chmod_path(path: &Path, mode: u32, recursive: bool) -> std::io::Result<()> {
 
 fn collect_local_path_stats(path: &Path, stats: &mut LocalPathStats) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() && !local_path_is_link(path, &metadata) {
+    collect_local_path_stats_with(path, &metadata, stats)
+}
+
+fn collect_local_path_stats_with(
+    path: &Path,
+    metadata: &fs::Metadata,
+    stats: &mut LocalPathStats,
+) -> std::io::Result<()> {
+    if metadata.is_dir() && !local_path_is_link(path, metadata) {
         stats.dir_count += 1;
         for entry in fs::read_dir(path)? {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => continue,
             };
+            let child = entry.path();
+            let child_metadata = match dir_entry_metadata(&entry) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
             // One locked or missing child should not hide the rest of the folder.
-            if collect_local_path_stats(&entry.path(), stats).is_err() {
+            if collect_local_path_stats_with(&child, &child_metadata, stats).is_err() {
                 continue;
             }
         }
@@ -668,7 +715,7 @@ fn search_local_recursive(
             }
         };
         let path = entry.path();
-        let metadata = match fs::symlink_metadata(&path) {
+        let metadata = match dir_entry_metadata(&entry) {
             Ok(metadata) => metadata,
             Err(_) => {
                 *incomplete = true;
@@ -1171,6 +1218,15 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> std::io::Result<()> {
 
 fn copy_dir_entries(source: &Path, target: &Path, fail_if_unreadable: bool) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
+    copy_dir_entries_with(source, &metadata, target, fail_if_unreadable)
+}
+
+fn copy_dir_entries_with(
+    source: &Path,
+    metadata: &fs::Metadata,
+    target: &Path,
+    fail_if_unreadable: bool,
+) -> std::io::Result<()> {
     fs::create_dir(target)?;
     let entries = match fs::read_dir(source) {
         Ok(entries) => entries,
@@ -1187,14 +1243,14 @@ fn copy_dir_entries(source: &Path, target: &Path, fail_if_unreadable: bool) -> s
         };
         let child_source = entry.path();
         let child_target = target.join(entry.file_name());
-        let child_metadata = match fs::symlink_metadata(&child_source) {
+        let child_metadata = match dir_entry_metadata(&entry) {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
         if local_path_is_link(&child_source, &child_metadata) {
             copy_local_symlink(&child_source, &child_target)?;
         } else if child_metadata.is_dir() {
-            copy_dir_entries(&child_source, &child_target, false)?;
+            copy_dir_entries_with(&child_source, &child_metadata, &child_target, false)?;
         } else if copy_nested_file(&child_source, &child_target)? {
             preserve_local_metadata(&child_target, &child_metadata)?;
         }
