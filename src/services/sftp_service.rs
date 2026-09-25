@@ -2,6 +2,7 @@ use crate::core::{
     session::SessionProfile,
     sftp::{
         dir_entry_metadata, local_path_is_link, path_contains_query, remote_child_path,
+        search_path_contains_query,
         remote_parent_path, sort_entries_by_folded_text, text_contains_query,
         DirListing,
         FileEntry, FileSearchResult,
@@ -166,9 +167,11 @@ impl SftpConnection {
         let mut output = Vec::new();
         let mut incomplete = false;
         let mut limited = false;
+        let root_path = Path::new(root);
         search_remote_recursive(
             &self.sftp,
-            Path::new(root),
+            root_path,
+            root_path,
             &query,
             max_results.clamp(1, 1000),
             &mut output,
@@ -634,6 +637,7 @@ fn list_with_sftp(sftp: &ssh2::Sftp, path: &str) -> Result<DirListing> {
 
 fn search_remote_recursive(
     sftp: &ssh2::Sftp,
+    search_root: &Path,
     root: &Path,
     query: &str,
     max_results: usize,
@@ -661,7 +665,9 @@ fn search_remote_recursive(
             .file_name()
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| remote_path_text(&path_buf));
-        let mut matched = text_contains_query(&name, query) || path_contains_query(&path_buf, query);
+        // The open folder is already chosen. Matching its own path would mark every file inside.
+        let mut matched = text_contains_query(&name, query)
+            || search_path_contains_query(search_root, &path_buf, query);
         let known_link = if is_symlink {
             let target = sftp.readlink(&path_buf).ok();
             if !matched {
@@ -699,6 +705,7 @@ fn search_remote_recursive(
         }
         if search_remote_recursive(
             sftp,
+            search_root,
             &directory,
             query,
             max_results,

@@ -135,8 +135,10 @@ pub fn search_local(
             limited,
         });
     }
+    let root_path = Path::new(root);
     search_local_recursive(
-        Path::new(root),
+        root_path,
+        root_path,
         &needle,
         max_results.clamp(1, 1000),
         &mut output,
@@ -690,6 +692,7 @@ fn collect_local_path_stats_with(
 }
 
 fn search_local_recursive(
+    search_root: &Path,
     root: &Path,
     query: &str,
     max_results: usize,
@@ -734,7 +737,9 @@ fn search_local_recursive(
             .file_name()
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let mut matched = text_contains_query(&name, query) || path_contains_query(&path, query);
+        // The open folder is already chosen. Matching its own path would mark every file inside.
+        let mut matched = text_contains_query(&name, query)
+            || search_path_contains_query(search_root, &path, query);
         if !matched {
             if let Some(Some(target)) = known_target.as_ref() {
                 matched = path_contains_query(target, query);
@@ -743,7 +748,7 @@ fn search_local_recursive(
         if matched {
             output.push(local_entry_from_path(path.clone(), metadata, known_target));
         }
-        if walk && search_local_recursive(&path, query, max_results, output, incomplete, limited).is_err() {
+        if walk && search_local_recursive(search_root, &path, query, max_results, output, incomplete, limited).is_err() {
             *incomplete = true;
         }
     }
@@ -777,6 +782,64 @@ fn needle_has_cased_letter(needle: &str) -> bool {
     needle
         .chars()
         .any(|ch| ch.is_uppercase() || ch.is_lowercase())
+}
+
+/// Match the path under the folder being searched.
+///
+/// The open folder's own name is not part of the result. Otherwise a search
+/// for that name marks every file inside it.
+pub(crate) fn search_path_contains_query(root: &Path, path: &Path, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    let Some(relative) = relative_search_path(root, path) else {
+        return false;
+    };
+    if relative.is_empty() {
+        return false;
+    }
+    path_contains_query(Path::new(&relative), query)
+}
+
+fn relative_search_path(root: &Path, path: &Path) -> Option<String> {
+    let root_parts = search_path_parts(root);
+    let path_parts = search_path_parts(path);
+    if path_parts.len() < root_parts.len() {
+        return None;
+    }
+    if !root_parts
+        .iter()
+        .zip(&path_parts)
+        .all(|(left, right)| search_part_eq(left, right))
+    {
+        return None;
+    }
+    Some(path_parts[root_parts.len()..].join("/"))
+}
+
+fn search_path_parts(path: &Path) -> Vec<String> {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(str::to_owned)
+        .collect()
+}
+
+fn search_part_eq(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    if !cfg!(windows) {
+        return false;
+    }
+    if left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+    if left.is_ascii() && right.is_ascii() {
+        return false;
+    }
+    left.to_lowercase() == right.to_lowercase()
 }
 
 /// Match a path without copying it first. Filename searches never need a
@@ -2074,6 +2137,78 @@ mod tests {
         assert!(error.to_string().contains("\u81ea\u5df1"));
         assert!(child.is_dir());
         assert!(tree.is_dir());
+    }
+
+    #[test]
+    fn search_path_ignores_the_folder_that_is_already_open() {
+        assert!(!search_path_contains_query(
+            Path::new("/var/log"),
+            Path::new("/var/log/other.txt"),
+            "var"
+        ));
+        assert!(!search_path_contains_query(
+            Path::new("/var/log"),
+            Path::new("/var/log/other.txt"),
+            "log"
+        ));
+        assert!(search_path_contains_query(
+            Path::new("/var/log"),
+            Path::new("/var/log/other.txt"),
+            "other"
+        ));
+        assert!(search_path_contains_query(
+            Path::new("/var/log"),
+            Path::new("/var/log/nginx/access.log"),
+            "nginx"
+        ));
+        assert!(!search_path_contains_query(
+            Path::new("/var/log"),
+            Path::new("/var/log-extra/access.log"),
+            "log"
+        ));
+        assert!(search_path_contains_query(
+            Path::new(r"C:\Logs"),
+            Path::new(r"C:\Logs\nested\file.txt"),
+            "nested"
+        ));
+    }
+
+    #[test]
+    fn search_skips_files_that_only_match_the_open_folder() {
+        let parent = std::env::temp_dir().join(format!(
+            "rustshell-search-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let root = parent.join("logs");
+        std::fs::create_dir_all(root.join("nested").join("logs")).unwrap();
+        std::fs::write(root.join("other.txt"), b"x").unwrap();
+        std::fs::write(root.join("logs.txt"), b"x").unwrap();
+        std::fs::write(root.join("nested").join("logs").join("file.txt"), b"x").unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let nested = self.0.join("logs").join("nested").join("logs");
+                let _ = std::fs::remove_file(nested.join("file.txt"));
+                let _ = std::fs::remove_dir(nested);
+                let _ = std::fs::remove_dir(self.0.join("logs").join("nested"));
+                let _ = std::fs::remove_file(self.0.join("logs").join("other.txt"));
+                let _ = std::fs::remove_file(self.0.join("logs").join("logs.txt"));
+                let _ = std::fs::remove_dir(self.0.join("logs"));
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(parent);
+
+        let found = search_local(&root.display().to_string(), "logs", 20).unwrap();
+        assert!(!found.incomplete);
+        assert!(!found.limited);
+        let mut names: Vec<&str> = found.entries.iter().map(|entry| entry.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["file.txt", "logs", "logs.txt"]);
     }
 
     #[test]
