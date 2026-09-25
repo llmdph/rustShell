@@ -6678,11 +6678,15 @@ function FilePane({
                 setPathDraft(path);
               }
             }}
-            onBlur={() => {
-              if (!pathDraft.trim()) setPathDraft(path);
+            onBlur={(event) => {
+              const nextFocus = event.relatedTarget;
+              if (nextFocus instanceof Element && nextFocus.closest("[data-path-jump]")) return;
+              setPathDraft(path);
             }}
           />
-          <IconButton title="跳转路径" icon={<MoveRight size={14} />} onClick={commitPath} disabled={!pathDraft.trim() || pathDraft === path} />
+          <span data-path-jump="" style={{ display: "contents" }}>
+            <IconButton title="跳转路径" icon={<MoveRight size={14} />} onClick={commitPath} disabled={!pathDraft.trim() || pathDraft === path} />
+          </span>
           <IconButton title="后退" icon={<ChevronLeft size={14} />} onClick={onBack} disabled={!canBack} />
           <IconButton title="前进" icon={<ChevronRight size={14} />} onClick={onForward} disabled={!canForward} />
           <IconButton title="主目录" icon={<Home size={14} />} onClick={onHome} />
