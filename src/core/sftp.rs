@@ -598,8 +598,8 @@ pub(crate) fn text_contains_query(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    if haystack.is_ascii() {
-        if !needle.is_ascii() {
+    if needle.is_ascii() {
+        if haystack.len() < needle.len() {
             return false;
         }
         let needle_bytes = needle.as_bytes();
@@ -607,6 +607,9 @@ pub(crate) fn text_contains_query(haystack: &str, needle: &str) -> bool {
             .as_bytes()
             .windows(needle_bytes.len())
             .any(|window| window.eq_ignore_ascii_case(needle_bytes));
+    }
+    if !needle.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+        return haystack.contains(needle);
     }
     haystack.to_lowercase().contains(needle)
 }
@@ -989,6 +992,7 @@ mod tests {
         assert!(text_contains_query("Hello.TXT", "hello"));
         assert!(text_contains_query("notes.txt", "TXT"));
         assert!(text_contains_query("\u{76ee}\u{5f55}/\u{62a5}\u{544a}.txt", "\u{62a5}\u{544a}"));
+        assert!(text_contains_query("\u{76ee}\u{5f55}/File.TXT", "txt"));
         assert!(!text_contains_query("notes.txt", "png"));
         assert!(!text_contains_query("notes.txt", "\u{62a5}\u{544a}"));
         assert!(path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), "notes"));
