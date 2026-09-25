@@ -304,6 +304,13 @@ impl TerminalModel {
         decode_terminal_stream(&mut self.output_decoder, &output)
     }
 
+    /// The replay string already contains this output. Drop it so the next
+    /// drain does not write the same bytes into the terminal again.
+    pub fn discard_replayed_output(&mut self) {
+        self.pending_output.clear();
+        self.output_decoder = terminal_encoding(&self.profile.charset).new_decoder();
+    }
+
     pub fn encode_input(&self, text: &str) -> Vec<u8> {
         encode_terminal_text(&self.profile.charset, text)
     }
@@ -675,5 +682,23 @@ mod tests {
             .send(TerminalEvent::Output("\u{4e2d}".as_bytes().to_vec()))
             .unwrap();
         assert_eq!(model.drain_output(), "\u{4e2d}");
+    }
+
+    #[test]
+    fn replay_does_not_emit_the_same_output_again() {
+        let (mut model, event_tx) = model_with_charset("UTF-8");
+        event_tx
+            .send(TerminalEvent::Output(b"ready".to_vec()))
+            .unwrap();
+        model.pump_events();
+        assert_eq!(model.screen_text(), "ready");
+        model.discard_replayed_output();
+        assert_eq!(model.drain_output(), "");
+
+        event_tx
+            .send(TerminalEvent::Output(" \u{4e2d}".as_bytes().to_vec()))
+            .unwrap();
+        assert_eq!(model.drain_output(), " \u{4e2d}");
+        assert_eq!(model.screen_text(), "ready \u{4e2d}");
     }
 }

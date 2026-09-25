@@ -759,7 +759,7 @@ async fn list_terminals(app: AppHandle) -> Result<Vec<TerminalView>, String> {
     blocking(move || {
         let state = app.state::<AppRuntime>();
     let mut terminals = lock(&state.terminals)?;
-    Ok(terminals.values_mut().map(snapshot_terminal).collect())
+    Ok(terminals.values_mut().map(replay_terminal).collect())
     }).await
 }
 
@@ -2242,7 +2242,7 @@ fn launch_terminal(
     let running = TerminalLauncher::spawn(profile.clone(), password, size, local_shell);
     let mut terminal = TerminalModel::new(profile, size);
     terminal.attach(running);
-    let view = snapshot_terminal(&mut terminal);
+    let view = replay_terminal(&mut terminal);
     lock(&state.terminals)?.insert(terminal.id, terminal);
     Ok(view)
 }
@@ -2254,6 +2254,12 @@ fn mark_profile_connected(profile_id: Uuid, state: &State<'_, AppRuntime>) -> Re
         state.store.save(&profiles).map_err(to_string)?;
     }
     Ok(())
+}
+
+fn replay_terminal(terminal: &mut TerminalModel) -> TerminalView {
+    let view = snapshot_terminal(terminal);
+    terminal.discard_replayed_output();
+    view
 }
 
 fn snapshot_terminal(terminal: &mut TerminalModel) -> TerminalView {
