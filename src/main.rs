@@ -735,29 +735,37 @@ async fn connect_quick(
 }
 
 #[tauri::command]
-fn list_terminals(state: State<'_, AppRuntime>) -> Result<Vec<TerminalView>, String> {
+async fn list_terminals(app: AppHandle) -> Result<Vec<TerminalView>, String> {
+    blocking(move || {
+        let state = app.state::<AppRuntime>();
     let mut terminals = lock(&state.terminals)?;
     Ok(terminals.values_mut().map(snapshot_terminal).collect())
+    }).await
 }
 
 #[tauri::command]
-fn terminal_snapshot(
+async fn terminal_snapshot(
     terminal_id: String,
-    state: State<'_, AppRuntime>,
+    app: AppHandle,
 ) -> Result<TerminalView, String> {
+    blocking(move || {
+        let state = app.state::<AppRuntime>();
     let id = parse_uuid(&terminal_id)?;
     let mut terminals = lock(&state.terminals)?;
     let terminal = terminals
         .get_mut(&id)
         .ok_or_else(|| "终端不存在或已关闭".to_owned())?;
     Ok(snapshot_terminal(terminal))
+    }).await
 }
 
 #[tauri::command]
-fn terminal_drain(
+async fn terminal_drain(
     terminal_id: String,
-    state: State<'_, AppRuntime>,
+    app: AppHandle,
 ) -> Result<TerminalDrain, String> {
+    blocking(move || {
+        let state = app.state::<AppRuntime>();
     let id = parse_uuid(&terminal_id)?;
     let mut terminals = lock(&state.terminals)?;
     let terminal = terminals
@@ -773,6 +781,7 @@ fn terminal_drain(
         host_key_issue: terminal.host_key_issue.clone(),
         current_directory: terminal.current_directory.clone(),
     })
+    }).await
 }
 
 #[tauri::command]
@@ -869,7 +878,9 @@ async fn clear_known_hosts() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn terminal_send(request: SendRequest, state: State<'_, AppRuntime>) -> Result<(), String> {
+async fn terminal_send(request: SendRequest, app: AppHandle) -> Result<(), String> {
+    blocking(move || {
+        let state = app.state::<AppRuntime>();
     let id = parse_uuid(&request.terminal_id)?;
     let mut terminals = lock(&state.terminals)?;
     let terminal = terminals
@@ -878,10 +889,13 @@ fn terminal_send(request: SendRequest, state: State<'_, AppRuntime>) -> Result<(
     let bytes = terminal.encode_input(&request.data);
     terminal.send(bytes);
     Ok(())
+    }).await
 }
 
 #[tauri::command]
-fn terminal_resize(request: ResizeRequest, state: State<'_, AppRuntime>) -> Result<(), String> {
+async fn terminal_resize(request: ResizeRequest, app: AppHandle) -> Result<(), String> {
+    blocking(move || {
+        let state = app.state::<AppRuntime>();
     let id = parse_uuid(&request.terminal_id)?;
     let mut terminals = lock(&state.terminals)?;
     let terminal = terminals
@@ -892,15 +906,19 @@ fn terminal_resize(request: ResizeRequest, state: State<'_, AppRuntime>) -> Resu
         rows: request.rows.clamp(12, 80),
     });
     Ok(())
+    }).await
 }
 
 #[tauri::command]
-fn close_terminal(terminal_id: String, state: State<'_, AppRuntime>) -> Result<(), String> {
+async fn close_terminal(terminal_id: String, app: AppHandle) -> Result<(), String> {
+    blocking(move || {
+        let state = app.state::<AppRuntime>();
     let id = parse_uuid(&terminal_id)?;
     if let Some(mut terminal) = lock(&state.terminals)?.remove(&id) {
         terminal.shutdown();
     }
     Ok(())
+    }).await
 }
 
 #[tauri::command]

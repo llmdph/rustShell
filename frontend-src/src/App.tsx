@@ -5688,6 +5688,8 @@ function XtermView({
   const lastHostSizeRef = useRef({ width: 0, height: 0 });
   const lastTermSizeRef = useRef({ cols: 0, rows: 0 });
   const onDrainRef = useRef(onDrain);
+  const activeRef = useRef(active);
+  activeRef.current = active;
 
   useEffect(() => {
     onDrainRef.current = onDrain;
@@ -5911,8 +5913,9 @@ function XtermView({
     let lastHostKey = terminal.hostKeyIssue?.fingerprint ?? "";
     let lastDirectory = terminal.currentDirectory ?? "";
 
+    let idleRounds = 0;
     const drainLoop = async () => {
-      let nextDelay = 12;
+      let nextDelay = 40;
       try {
         const drain = await api.terminalDrain(terminal.id);
         if (drain.output) {
@@ -5926,16 +5929,21 @@ function XtermView({
           nextError !== lastError ||
           nextHostKey !== lastHostKey ||
           nextDirectory !== lastDirectory;
-        if (drain.output) {
-          nextDelay = 0;
-        }
         if (metadataChanged) {
-          nextDelay = 0;
           lastStatus = drain.status;
           lastError = nextError;
           lastHostKey = nextHostKey;
           lastDirectory = nextDirectory;
           onDrainRef.current(drain);
+        }
+        if (drain.output || metadataChanged) {
+          idleRounds = 0;
+          nextDelay = activeRef.current ? 0 : 16;
+        } else {
+          idleRounds += 1;
+          const base = activeRef.current ? 30 : 80;
+          const cap = activeRef.current ? 120 : 400;
+          nextDelay = Math.min(cap, base * 2 ** Math.min(idleRounds - 1, 3));
         }
       } catch {
         stopped = true;

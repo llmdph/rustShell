@@ -8,7 +8,7 @@ use uuid::Uuid;
 const TERMINAL_REPLAY_CAP: usize = 1024 * 1024;
 const TERMINAL_PENDING_CAP: usize = 1024 * 1024;
 const TERMINAL_OSC_SCAN_CAP: usize = 8 * 1024;
-const MAX_EVENTS_PER_PUMP: usize = 64;
+const MAX_EVENTS_PER_PUMP: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSize {
