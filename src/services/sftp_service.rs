@@ -9,13 +9,14 @@ use sha2::{Digest, Sha256};
 use ssh2::{OpenFlags, OpenType};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::SystemTime,
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 #[cfg(unix)]
@@ -25,18 +26,111 @@ const REMOTE_TEXT_PREVIEW_LIMIT: u64 = 1024 * 1024;
 const REMOTE_DIR_ENTRY_LIMIT: usize = 10_000;
 
 pub struct SftpConnection {
-    _session: ssh2::Session,
+    session: ssh2::Session,
     sftp: ssh2::Sftp,
+}
+
+
+const EXEC_OUTPUT_LIMIT: usize = 256 * 1024;
+const EXEC_TIMEOUT: Duration = Duration::from_secs(12);
+
+fn read_command_output(session: &ssh2::Session, channel: &mut ssh2::Channel) -> Result<String> {
+    let _mode = ExecModeGuard::nonblocking(session);
+    let mut stdout = Vec::new();
+    let mut buf = [0_u8; 8 * 1024];
+    let started = Instant::now();
+    loop {
+        let mut waiting = true;
+        match channel.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => {
+                stdout.extend_from_slice(&buf[..n]);
+                waiting = false;
+            }
+            Err(error) if is_would_block(&error) => {}
+            Err(error) => return Err(error).context("failed to read command output"),
+        }
+        match channel.stderr().read(&mut buf) {
+            Ok(0) => {}
+            Ok(_) => waiting = false,
+            Err(error) if is_would_block(&error) => {}
+            Err(error) => return Err(error).context("failed to read command error output"),
+        }
+        if channel.eof() || stdout.len() >= EXEC_OUTPUT_LIMIT {
+            break;
+        }
+        if started.elapsed() > EXEC_TIMEOUT {
+            bail!("remote command timed out");
+        }
+        if waiting {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+struct ExecModeGuard<'a> {
+    session: &'a ssh2::Session,
+    was_blocking: bool,
+}
+
+impl<'a> ExecModeGuard<'a> {
+    fn nonblocking(session: &'a ssh2::Session) -> Self {
+        let was_blocking = session.is_blocking();
+        session.set_blocking(false);
+        Self {
+            session,
+            was_blocking,
+        }
+    }
+}
+
+impl Drop for ExecModeGuard<'_> {
+    fn drop(&mut self) {
+        self.session.set_blocking(self.was_blocking);
+    }
+}
+
+fn is_would_block(error: &io::Error) -> bool {
+    error.kind() == ErrorKind::WouldBlock
+        || error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<ssh2::Error>())
+            .is_some_and(|ssh_error| matches!(ssh_error.code(), ssh2::ErrorCode::Session(-37)))
 }
 
 impl SftpConnection {
     pub fn connect(profile: &SessionProfile, password: Option<&str>) -> Result<Self> {
         let session = connect(profile, password)?;
         let sftp = session.sftp().context("failed to start SFTP subsystem")?;
-        Ok(Self {
-            _session: session,
-            sftp,
-        })
+        Ok(Self { session, sftp })
+    }
+
+    /// The open SFTP channel, so transfer code can stream over this session
+    /// rather than opening one of its own.
+    pub fn sftp(&self) -> &ssh2::Sftp {
+        &self.sftp
+    }
+
+    /// Run a shell command over this connection's SSH session and return its
+    /// stdout. Opening another channel on an authenticated session costs one
+    /// round trip, versus a full TCP connect plus handshake plus auth for a
+    /// fresh session.
+    pub fn exec(&self, command: &str) -> Result<String> {
+        let mut channel = self
+            .session
+            .channel_session()
+            .context("failed to open SSH command channel")?;
+        channel.exec(command).context("failed to run command")?;
+
+        // Read stdout and stderr together. A blocking stdout read never drains
+        // stderr, so a noisy command fills the channel window and stalls the
+        // shared session until the pool gives up.
+        let output = read_command_output(&self.session, &mut channel);
+        self.session.set_blocking(true);
+        channel.close().ok();
+        channel.wait_close().ok();
+        output
     }
 
     pub fn home_dir(&self) -> Result<String> {
@@ -545,19 +639,38 @@ pub fn upload_file_with_progress_with_strategy<F>(
     remote_dir: &str,
     conflict: TransferConflictStrategy,
     cancel: Arc<AtomicBool>,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<String>
 where
     F: FnMut(u64, u64),
 {
     let session = connect(profile, password)?;
     let sftp = session.sftp().context("failed to start SFTP subsystem")?;
+    upload_with_sftp(&sftp, local_path, remote_dir, conflict, cancel, on_progress)
+}
+
+/// Upload over an already-open SFTP channel.
+///
+/// Split out from the connecting wrapper so a transfer queue can reuse one
+/// authenticated session instead of paying a TCP connect plus handshake plus
+/// auth per file.
+pub fn upload_with_sftp<F>(
+    sftp: &ssh2::Sftp,
+    local_path: &str,
+    remote_dir: &str,
+    conflict: TransferConflictStrategy,
+    cancel: Arc<AtomicBool>,
+    mut on_progress: F,
+) -> Result<String>
+where
+    F: FnMut(u64, u64),
+{
     let local_path = Path::new(local_path);
     let file_name = local_path
         .file_name()
         .ok_or_else(|| anyhow!("local file name is missing"))?
         .to_string_lossy();
-    let remote_path = resolve_remote_child_path(&sftp, remote_dir, &file_name, conflict)?;
+    let remote_path = resolve_remote_child_path(sftp, remote_dir, &file_name, conflict)?;
 
     let total = local_total_size(local_path)?;
     let root_metadata = fs::symlink_metadata(local_path).ok();
@@ -568,7 +681,7 @@ where
         .is_some_and(|metadata| metadata.file_type().is_symlink())
     {
         upload_symlink(
-            &sftp,
+            sftp,
             local_path,
             Path::new(&remote_path),
             total,
@@ -581,9 +694,9 @@ where
         .as_ref()
         .is_some_and(|metadata| metadata.is_dir())
     {
-        ensure_remote_dir(&sftp, Path::new(&remote_path))?;
+        ensure_remote_dir(sftp, Path::new(&remote_path))?;
         upload_dir_recursive(
-            &sftp,
+            sftp,
             local_path,
             &remote_path,
             total,
@@ -594,11 +707,11 @@ where
         )
         .context("failed to upload directory")?;
         if let Some(metadata) = root_metadata.as_ref() {
-            preserve_remote_metadata(&sftp, Path::new(&remote_path), metadata);
+            preserve_remote_metadata(sftp, Path::new(&remote_path), metadata);
         }
     } else {
         upload_single_file(
-            &sftp,
+            sftp,
             local_path,
             Path::new(&remote_path),
             total,
@@ -657,13 +770,28 @@ pub fn download_file_with_progress_with_strategy<F>(
     local_dir: &str,
     conflict: TransferConflictStrategy,
     cancel: Arc<AtomicBool>,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<PathBuf>
 where
     F: FnMut(u64, u64),
 {
     let session = connect(profile, password)?;
     let sftp = session.sftp().context("failed to start SFTP subsystem")?;
+    download_with_sftp(&sftp, remote_path, local_dir, conflict, cancel, on_progress)
+}
+
+/// Download over an already-open SFTP channel. See [`upload_with_sftp`].
+pub fn download_with_sftp<F>(
+    sftp: &ssh2::Sftp,
+    remote_path: &str,
+    local_dir: &str,
+    conflict: TransferConflictStrategy,
+    cancel: Arc<AtomicBool>,
+    mut on_progress: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(u64, u64),
+{
     let file_name = Path::new(remote_path)
         .file_name()
         .ok_or_else(|| anyhow!("remote file name is missing"))?;
@@ -673,12 +801,12 @@ where
     let stat = sftp
         .lstat(remote_path)
         .with_context(|| format!("failed to stat remote path {}", remote_path.display()))?;
-    let total = remote_total_size(&sftp, remote_path)?;
+    let total = remote_total_size(sftp, remote_path)?;
     let mut transferred = 0_u64;
     on_progress(transferred, total);
     if stat.file_type().is_symlink() {
         download_symlink(
-            &sftp,
+            sftp,
             remote_path,
             &local_path,
             total,
@@ -691,7 +819,7 @@ where
         fs::create_dir_all(&local_path)
             .with_context(|| format!("failed to create {}", local_path.display()))?;
         download_dir_recursive(
-            &sftp,
+            sftp,
             &remote_path_text,
             &local_path,
             total,
@@ -705,7 +833,7 @@ where
         preserve_local_times(&local_path, stat.atime, stat.mtime);
     } else {
         download_single_file(
-            &sftp,
+            sftp,
             remote_path,
             &local_path,
             total,
