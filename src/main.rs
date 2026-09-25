@@ -2133,6 +2133,7 @@ dir={dir}
 if [ ! -d "$dir" ]; then
   exit 2
 fi
+set +o pipefail 2>/dev/null || true
 find "$dir" -mindepth 1 -maxdepth 1 -exec sh -c '
 for path do
   name=${{path##*/}}
