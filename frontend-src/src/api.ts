@@ -167,6 +167,26 @@ function wait(ms: number) {
   return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 }
 
+// Typing sends one request per chunk. Two requests at once can pass each
+// other while the session is busy, so later characters arrive first.
+const terminalCommandTails = new Map<string, Promise<void>>();
+
+function enqueueTerminalCommand<T>(terminalId: string, run: () => Promise<T>): Promise<T> {
+  const previous = terminalCommandTails.get(terminalId) ?? Promise.resolve();
+  const result = previous.catch(() => undefined).then(run);
+  const tail = result.then(
+    () => undefined,
+    () => undefined
+  );
+  terminalCommandTails.set(terminalId, tail);
+  void tail.finally(() => {
+    if (terminalCommandTails.get(terminalId) === tail) {
+      terminalCommandTails.delete(terminalId);
+    }
+  });
+  return result;
+}
+
 export const api = {
   openFileManagerWindow: async (profileId?: string | null) => {
     const label = "file-manager";
@@ -236,9 +256,13 @@ export const api = {
   terminalDrain: (terminalId: string) => invoke<TerminalDrain>("terminal_drain", { terminalId }),
   duplicateTerminal: (terminalId: string) => invoke<TerminalView>("duplicate_terminal", { terminalId }),
   terminalSend: (terminalId: string, data: string) =>
-    invoke<void>("terminal_send", { request: { terminalId, data } }),
+    enqueueTerminalCommand(terminalId, () =>
+      invoke<void>("terminal_send", { request: { terminalId, data } })
+    ),
   terminalResize: (terminalId: string, cols: number, rows: number) =>
-    invoke<void>("terminal_resize", { request: { terminalId, cols, rows } }),
+    enqueueTerminalCommand(terminalId, () =>
+      invoke<void>("terminal_resize", { request: { terminalId, cols, rows } })
+    ),
   closeTerminal: (terminalId: string) => invoke<void>("close_terminal", { terminalId }),
   loadSettings: () => invoke<AppSettings>("load_settings"),
   saveSettings: (settings: AppSettings) => invoke<AppSettings>("save_settings", { settings }),
