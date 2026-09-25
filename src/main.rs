@@ -708,25 +708,42 @@ async fn connect_quick(
             ),
         };
         profile.protocol = protocol;
-        profile.port = request.port;
-        profile.remember_password = request.remember_password;
-        profile.auth = AuthProfile::Password;
-
-        {
+        if matches!(protocol, SessionProtocol::LocalShell) {
             let mut profiles = lock(&state.profiles)?;
+            if let Some(existing) = profiles
+                .iter()
+                .find(|item| matches!(item.protocol, SessionProtocol::LocalShell))
+            {
+                profile = existing.clone();
+            } else {
+                profiles.push(profile.clone());
+                state.store.save(&profiles).map_err(to_string)?;
+            }
+        } else {
+            profile.port = request.port;
+            profile.remember_password = request.remember_password;
+            profile.auth = AuthProfile::Password;
+            let mut profiles = lock(&state.profiles)?;
+            let mut should_save = false;
             if let Some(existing) = profiles.iter_mut().find(|item| {
-                item.host == profile.host
+                item.protocol == profile.protocol
+                    && item.host == profile.host
                     && item.port == profile.port
                     && item.username == profile.username
             }) {
-                profile.id = existing.id;
-                profile.created_at = existing.created_at;
-                profile.last_connected_at = existing.last_connected_at;
-                *existing = profile.clone();
+                // Reuse the saved session. Replacing it dropped key auth, charset, and group.
+                if request.remember_password && !existing.remember_password {
+                    existing.remember_password = true;
+                    should_save = true;
+                }
+                profile = existing.clone();
             } else {
                 profiles.push(profile.clone());
+                should_save = true;
             }
-            state.store.save(&profiles).map_err(to_string)?;
+            if should_save {
+                state.store.save(&profiles).map_err(to_string)?;
+            }
         }
 
         let password = resolve_password(&profile, request.password.as_deref(), &state)?;
