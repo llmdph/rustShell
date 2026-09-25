@@ -1797,8 +1797,30 @@ async fn open_file_manager_window(
 
     if let Some(window) = app.get_webview_window(label) {
         eprintln!("open_file_manager_window closing previous file-manager window");
-        window.close().map_err(to_string)?;
-        std::thread::sleep(std::time::Duration::from_millis(120));
+        // Close is asynchronous. Building a new window with the same label
+        // before the old one is gone fails or comes up blank.
+        window.close().ok();
+        let app_for_wait = app.clone();
+        let label_owned = label.to_owned();
+        blocking(move || {
+            for _ in 0..25 {
+                if app_for_wait.get_webview_window(&label_owned).is_none() {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            if let Some(stuck) = app_for_wait.get_webview_window(&label_owned) {
+                stuck.destroy().map_err(to_string)?;
+            }
+            for _ in 0..10 {
+                if app_for_wait.get_webview_window(&label_owned).is_none() {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            Err("文件管理器窗口仍在关闭".to_owned())
+        })
+        .await?;
     }
 
     eprintln!("open_file_manager_window building file-manager window");
