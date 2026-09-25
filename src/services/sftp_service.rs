@@ -1758,14 +1758,24 @@ fn collect_remote_path_stats(
     let stat = sftp
         .lstat(path)
         .with_context(|| format!("failed to stat remote path {}", path.display()))?;
+    collect_remote_path_stats_from_stat(sftp, path, stat, stats)
+}
 
+fn collect_remote_path_stats_from_stat(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    stat: ssh2::FileStat,
+    stats: &mut RemotePathStats,
+) -> Result<()> {
     if stat.is_dir() && !stat.file_type().is_symlink() {
         stats.dir_count += 1;
-        for (child, _) in sftp
-            .readdir(path)
-            .with_context(|| format!("failed to list {}", path.display()))?
-        {
-            collect_remote_path_stats(sftp, &child, stats)?;
+        let mut children = Vec::new();
+        visit_remote_entries(sftp, path, None, |child, child_stat| {
+            children.push((child, child_stat));
+            true
+        })?;
+        for (child, child_stat) in children {
+            collect_remote_path_stats_from_stat(sftp, &child, child_stat, stats)?;
         }
     } else {
         stats.file_count += 1;
