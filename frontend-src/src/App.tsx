@@ -9876,12 +9876,38 @@ function remoteRelativePath(basePath: string, path: string) {
 }
 
 function localRelativePath(basePath: string, path: string) {
-  const base = normalizeLocalComparablePath(basePath);
-  const target = normalizeLocalComparablePath(path);
-  if (!base || base === ".") return path;
-  if (target === base) return ".";
-  const prefix = base.endsWith("/") ? base : `${base}/`;
-  return target.startsWith(prefix) ? path.replace(/\\/g, "/").slice(prefix.length) : path;
+  const base = localPathParts(basePath);
+  const target = localPathParts(path);
+  if (base.folded.length === 0) return path;
+  if (samePathParts(base.folded, target.folded)) return ".";
+  if (!pathPartsStartWith(target.folded, base.folded)) return path;
+  // Compare whole names. Slicing with the lowercased prefix length drops or
+  // keeps the wrong characters when a letter grows as it is lowercased.
+  return target.original.slice(base.folded.length).join("/");
+}
+
+function localPathParts(path: string) {
+  const trimmed = path.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+  if (!trimmed || trimmed === ".") return { original: [] as string[], folded: [] as string[] };
+  const unc = trimmed.startsWith("//");
+  const raw = trimmed.split("/").filter((part) => part.length > 0);
+  const original = unc
+    ? raw.length > 0
+      ? [`//${raw[0]}`, ...raw.slice(1)]
+      : ["//"]
+    : trimmed.startsWith("/")
+      ? ["/", ...raw]
+      : raw;
+  return { original, folded: original.map((part) => part.toLowerCase()) };
+}
+
+function samePathParts(left: string[], right: string[]) {
+  return left.length === right.length && left.every((part, index) => part === right[index]);
+}
+
+function pathPartsStartWith(path: string[], prefix: string[]) {
+  if (prefix.length === 0 || path.length <= prefix.length) return false;
+  return prefix.every((part, index) => part === path[index]);
 }
 
 function normalizeLocalComparablePath(path: string) {
