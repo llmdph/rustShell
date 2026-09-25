@@ -337,6 +337,8 @@ export default function App() {
   const [selectionStatsLoading, setSelectionStatsLoading] = useState<FileSide | null>(null);
   const selectedLocalRef = useRef<FileEntry | null>(null);
   const selectedRemoteRef = useRef<FileEntry | null>(null);
+  const selectedLocalPathsRef = useRef<string[]>([]);
+  const selectedRemotePathsRef = useRef<string[]>([]);
   const pendingLocalPreferPathRef = useRef<string | null>(null);
   const pendingRemotePreferPathRef = useRef<string | null>(null);
   const localListGenerationRef = useRef(0);
@@ -1062,6 +1064,14 @@ export default function App() {
   }, [selectedRemote]);
 
   useEffect(() => {
+    selectedLocalPathsRef.current = selectedLocalPaths;
+  }, [selectedLocalPaths]);
+
+  useEffect(() => {
+    selectedRemotePathsRef.current = selectedRemotePaths;
+  }, [selectedRemotePaths]);
+
+  useEffect(() => {
     savePathBookmarks("local", localPathBookmarks);
   }, [localPathBookmarks]);
 
@@ -1148,11 +1158,11 @@ export default function App() {
         const result = await api.searchLocal(activeSearch.root, activeSearch.query, 300);
         if (generation !== localListGenerationRef.current) return;
         const files = result.entries;
-        const picked = pickSelection(files, undefined, selectedLocalRef.current);
+        const nextSelection = selectionAfterRefresh(files, undefined, selectedLocalRef.current, selectedLocalPathsRef.current);
         setLocalFiles(files);
         setLocalDirTruncated(false);
-        setSelectedLocal(picked);
-        setSelectedLocalPaths(picked ? [picked.path] : []);
+        setSelectedLocal(nextSelection.selected);
+        setSelectedLocalPaths(nextSelection.paths);
         setLocalSearch({
           root: activeSearch.root,
           query: activeSearch.query,
@@ -1175,11 +1185,11 @@ export default function App() {
       const listing = await api.listLocalDir(requestedPath);
       if (generation !== localListGenerationRef.current) return;
       const files = listing.entries;
-      const picked = pickSelection(files, preferredPath, selectedLocalRef.current);
+      const nextSelection = selectionAfterRefresh(files, preferredPath, selectedLocalRef.current, selectedLocalPathsRef.current);
       setLocalFiles(files);
       setLocalDirTruncated(listing.truncated);
-      setSelectedLocal(picked);
-      setSelectedLocalPaths(picked ? [picked.path] : []);
+      setSelectedLocal(nextSelection.selected);
+      setSelectedLocalPaths(nextSelection.paths);
       setLocalSearch(null);
       setStatus(`本地 ${requestedPath}`);
     } catch (error) {
@@ -1193,11 +1203,11 @@ export default function App() {
     const listing = await api.listRemoteDir(profile.id, path, password);
     if (generation !== remoteListGenerationRef.current) return;
     const files = listing.entries;
-    const picked = pickSelection(files, preferPath, selectedRemoteRef.current);
+    const nextSelection = selectionAfterRefresh(files, preferPath, selectedRemoteRef.current, selectedRemotePathsRef.current);
     setRemoteFiles(files);
     setRemoteDirTruncated(listing.truncated);
-    setSelectedRemote(picked);
-    setSelectedRemotePaths(picked ? [picked.path] : []);
+    setSelectedRemote(nextSelection.selected);
+    setSelectedRemotePaths(nextSelection.paths);
     setRemoteSearch(null);
     setStatus(`远程 ${profile.host}:${path}`);
   }, []);
@@ -1225,11 +1235,11 @@ export default function App() {
         );
         if (generation !== remoteListGenerationRef.current) return;
         const files = result.entries;
-        const picked = pickSelection(files, undefined, selectedRemoteRef.current);
+        const nextSelection = selectionAfterRefresh(files, undefined, selectedRemoteRef.current, selectedRemotePathsRef.current);
         setRemoteFiles(files);
         setRemoteDirTruncated(false);
-        setSelectedRemote(picked);
-        setSelectedRemotePaths(picked ? [picked.path] : []);
+        setSelectedRemote(nextSelection.selected);
+        setSelectedRemotePaths(nextSelection.paths);
         setRemoteSearch({
           root: activeSearch.root,
           query: activeSearch.query,
@@ -9305,6 +9315,28 @@ function pickSelection(files: FileEntry[], preferPath?: string, previous?: FileE
   const targetPath = preferPath || previous?.path;
   if (!targetPath) return null;
   return files.find((file) => file.path === targetPath) ?? null;
+}
+
+function selectionAfterRefresh(
+  files: FileEntry[],
+  preferPath: string | undefined,
+  previous: FileEntry | null,
+  selectedPaths: string[]
+) {
+  if (preferPath) {
+    const selected = files.find((file) => file.path === preferPath) ?? null;
+    return { selected, paths: selected ? [selected.path] : [] };
+  }
+  const available = new Set(files.map((file) => file.path));
+  const paths = selectedPaths.filter((path) => available.has(path));
+  const previousPath = previous?.path;
+  const selectedPath =
+    previousPath && available.has(previousPath) && (paths.length === 0 || paths.includes(previousPath))
+      ? previousPath
+      : paths[0];
+  if (!selectedPath) return { selected: null, paths: [] as string[] };
+  const selected = files.find((file) => file.path === selectedPath) ?? null;
+  return { selected, paths: paths.length > 0 ? paths : [selectedPath] };
 }
 
 function pushHistory(history: string[], path: string, front = false) {
