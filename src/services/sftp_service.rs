@@ -816,7 +816,7 @@ where
         .to_string_lossy();
     let remote_path = resolve_remote_child_path(sftp, remote_dir, &file_name, conflict)?;
 
-    let total = local_total_size(local_path)?;
+    let total = local_total_size(local_path, &cancel)?;
     let root_metadata = fs::symlink_metadata(local_path).ok();
     let mut transferred = 0_u64;
     on_progress(transferred, total);
@@ -945,7 +945,7 @@ where
     let stat = sftp
         .lstat(remote_path)
         .with_context(|| format!("failed to stat remote path {}", remote_path.display()))?;
-    let total = remote_total_size(sftp, remote_path)?;
+    let total = remote_total_size(sftp, remote_path, &cancel)?;
     let mut transferred = 0_u64;
     on_progress(transferred, total);
     if stat.file_type().is_symlink() {
@@ -1361,64 +1361,94 @@ fn download_dir_recursive<F>(
 where
     F: FnMut(u64, u64),
 {
-    for (remote_path, stat) in sftp
-        .readdir(Path::new(remote_dir))
-        .with_context(|| format!("failed to list {}", remote_dir))?
-    {
+    let mut directories = Vec::new();
+    let mut failure = None;
+    visit_remote_entries(sftp, Path::new(remote_dir), None, |remote_path, stat| {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Some(name) = remote_path.file_name() else {
+            failure = Some(anyhow!("remote file name is missing"));
+            return false;
+        };
+        let local_path = local_dir.join(name);
+        let result = if stat.file_type().is_symlink() {
+            match resolve_local_path(&local_path, conflict) {
+                Ok(local_path) => download_symlink(
+                    sftp,
+                    &remote_path,
+                    &local_path,
+                    total,
+                    transferred,
+                    conflict,
+                    on_progress,
+                ),
+                Err(error) => Err(error),
+            }
+        } else if stat.is_dir() {
+            directories.push((
+                remote_path_text(&remote_path),
+                local_path,
+                stat.perm,
+                stat.atime,
+                stat.mtime,
+            ));
+            Ok(())
+        } else {
+            match resolve_local_path(&local_path, conflict) {
+                Ok(local_path) => download_single_file(
+                    sftp,
+                    &remote_path,
+                    &local_path,
+                    total,
+                    transferred,
+                    cancel.clone(),
+                    conflict,
+                    on_progress,
+                ),
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = result {
+            failure = Some(error);
+            return false;
+        }
+        true
+    })?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if cancel.load(Ordering::Relaxed) {
+        bail!("transfer cancelled");
+    }
+
+    for (remote_child, local_path, perm, atime, mtime) in directories {
         if cancel.load(Ordering::Relaxed) {
             bail!("transfer cancelled");
         }
-        let local_path = local_dir.join(
-            remote_path
-                .file_name()
-                .ok_or_else(|| anyhow!("remote file name is missing"))?,
-        );
-        if stat.file_type().is_symlink() {
-            let local_path = resolve_local_path(&local_path, conflict)?;
-            download_symlink(
-                sftp,
-                &remote_path,
-                &local_path,
-                total,
-                transferred,
-                conflict,
-                on_progress,
-            )?;
-        } else if stat.is_dir() {
-            let local_path = resolve_local_path(&local_path, conflict)?;
-            fs::create_dir_all(&local_path)
-                .with_context(|| format!("failed to create {}", local_path.display()))?;
-            let remote_child = remote_path_text(&remote_path);
-            download_dir_recursive(
-                sftp,
-                &remote_child,
-                &local_path,
-                total,
-                transferred,
-                cancel.clone(),
-                conflict,
-                on_progress,
-            )?;
-            preserve_local_permissions(&local_path, stat.perm);
-            preserve_local_times(&local_path, stat.atime, stat.mtime);
-        } else {
-            let local_path = resolve_local_path(&local_path, conflict)?;
-            download_single_file(
-                sftp,
-                &remote_path,
-                &local_path,
-                total,
-                transferred,
-                cancel.clone(),
-                conflict,
-                on_progress,
-            )?;
-        }
+        let local_path = resolve_local_path(&local_path, conflict)?;
+        fs::create_dir_all(&local_path)
+            .with_context(|| format!("failed to create {}", local_path.display()))?;
+        download_dir_recursive(
+            sftp,
+            &remote_child,
+            &local_path,
+            total,
+            transferred,
+            cancel.clone(),
+            conflict,
+            on_progress,
+        )?;
+        preserve_local_permissions(&local_path, perm);
+        preserve_local_times(&local_path, atime, mtime);
     }
     Ok(())
 }
 
-fn local_total_size(path: &Path) -> Result<u64> {
+fn local_total_size(path: &Path, cancel: &AtomicBool) -> Result<u64> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("transfer cancelled");
+    }
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     if metadata.file_type().is_symlink() {
@@ -1433,7 +1463,7 @@ fn local_total_size(path: &Path) -> Result<u64> {
 
     let mut total = 0_u64;
     for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        total += local_total_size(&entry?.path())?;
+        total += local_total_size(&entry?.path(), cancel)?;
     }
     Ok(total)
 }
@@ -1444,7 +1474,10 @@ fn local_symlink_target_text(path: &Path) -> Result<String> {
         .map(|target| target.to_string_lossy().replace('\\', "/"))
 }
 
-fn remote_total_size(sftp: &ssh2::Sftp, path: &Path) -> Result<u64> {
+fn remote_total_size(sftp: &ssh2::Sftp, path: &Path, cancel: &AtomicBool) -> Result<u64> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("transfer cancelled");
+    }
     let stat = sftp
         .lstat(path)
         .with_context(|| format!("failed to stat remote path {}", path.display()))?;
@@ -1456,18 +1489,26 @@ fn remote_total_size(sftp: &ssh2::Sftp, path: &Path) -> Result<u64> {
     }
 
     let mut total = 0_u64;
-    for (child, child_stat) in sftp
-        .readdir(path)
-        .with_context(|| format!("failed to list {}", path.display()))?
-    {
+    let mut directories = Vec::new();
+    visit_remote_entries(sftp, path, None, |child, child_stat| {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
         if child_stat.file_type().is_symlink() {
-            continue;
+            return true;
         }
         if child_stat.is_dir() {
-            total += remote_total_size(sftp, &child)?;
+            directories.push(child);
         } else {
             total += child_stat.size.unwrap_or_default();
         }
+        true
+    })?;
+    if cancel.load(Ordering::Relaxed) {
+        bail!("transfer cancelled");
+    }
+    for child in directories {
+        total += remote_total_size(sftp, &child, cancel)?;
     }
     Ok(total)
 }
