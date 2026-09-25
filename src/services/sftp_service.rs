@@ -652,6 +652,9 @@ fn search_remote_recursive(
             *limited = true;
             return false;
         }
+        // A name without permissions looks like a file, so the search would
+        // never open that folder or match the target of a link.
+        let stat = resolve_remote_listing_stat(sftp, &path_buf, stat);
         let should_descend = stat.is_dir() && !stat.file_type().is_symlink();
         let is_symlink = stat.file_type().is_symlink();
         let name = path_buf
