@@ -24,6 +24,8 @@ use std::os::unix::fs::PermissionsExt;
 
 const REMOTE_TEXT_PREVIEW_LIMIT: u64 = 1024 * 1024;
 const REMOTE_DIR_ENTRY_LIMIT: usize = 10_000;
+const LIBSSH2_ERROR_FILE: i32 = -16;
+const LIBSSH2_ERROR_EAGAIN: i32 = -37;
 
 pub struct SftpConnection {
     session: ssh2::Session,
@@ -497,13 +499,51 @@ pub fn list_remote_dir(
     list_with_sftp(&sftp, path)
 }
 
-fn list_with_sftp(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<FileEntry>> {
-    let entries = sftp
-        .readdir(Path::new(path))
-        .with_context(|| format!("failed to list {}", path))?;
 
-    let mut output = Vec::with_capacity(entries.len().min(REMOTE_DIR_ENTRY_LIMIT));
-    for (path_buf, stat) in entries.into_iter().take(REMOTE_DIR_ENTRY_LIMIT) {
+fn read_remote_entries(
+    sftp: &ssh2::Sftp,
+    dirname: &Path,
+    limit: Option<usize>,
+) -> Result<Vec<(PathBuf, ssh2::FileStat)>> {
+    let mut dir = sftp
+        .opendir(dirname)
+        .with_context(|| format!("failed to list {}", dirname.display()))?;
+    let mut entries = Vec::new();
+    let parent = remote_path_text(dirname);
+    loop {
+        if limit.is_some_and(|limit| entries.len() >= limit) {
+            break;
+        }
+        match dir.readdir() {
+            Ok((filename, stat)) => {
+                let name = filename.to_string_lossy();
+                if name == "." || name == ".." {
+                    continue;
+                }
+                let joined = remote_child_path(&parent, &name);
+                entries.push((PathBuf::from(joined), stat));
+            }
+            Err(error) if is_libssh2_session_code(&error, LIBSSH2_ERROR_FILE) => break,
+            Err(error) if is_libssh2_session_code(&error, LIBSSH2_ERROR_EAGAIN) => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to list {}", dirname.display()));
+            }
+        }
+    }
+    Ok(entries)
+}
+
+fn is_libssh2_session_code(error: &ssh2::Error, code: i32) -> bool {
+    error.code() == ssh2::ErrorCode::Session(code)
+}
+
+fn list_with_sftp(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<FileEntry>> {
+    let entries = read_remote_entries(sftp, Path::new(path), Some(REMOTE_DIR_ENTRY_LIMIT))?;
+
+    let mut output = Vec::with_capacity(entries.len());
+    for (path_buf, stat) in entries {
         output.push(entry_from_stat(sftp, path_buf, stat));
     }
 
@@ -522,9 +562,7 @@ fn search_remote_recursive(
         return Ok(());
     }
 
-    let entries = sftp
-        .readdir(root)
-        .with_context(|| format!("failed to list {}", root.display()))?;
+    let entries = read_remote_entries(sftp, root, None)?;
     for (path_buf, stat) in entries {
         if output.len() >= max_results {
             break;
