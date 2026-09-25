@@ -277,9 +277,15 @@ impl SftpConnection {
     }
 
     pub fn move_path(&self, path: &str, target_path: &str) -> Result<String> {
-        let target = resolve_remote_move_target(&self.sftp, path, target_path)?;
+        let (target, case_only) = resolve_remote_move_target(&self.sftp, path, target_path)?;
         if target == path {
             bail!("remote target is the same as source");
+        }
+        // The server already has this name with different letters. A plain
+        // rename fails, and a folder would be moved inside itself.
+        if case_only {
+            rename_remote_case_only(&self.sftp, path, &target)?;
+            return Ok(target);
         }
         self.sftp
             .rename(Path::new(path), Path::new(&target), None)
@@ -2342,7 +2348,7 @@ fn resolve_remote_move_target(
     sftp: &ssh2::Sftp,
     source: &str,
     target_path: &str,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let target = target_path.trim().replace('\\', "/");
     if target.is_empty() {
         bail!("remote target path is empty");
@@ -2351,6 +2357,13 @@ fn resolve_remote_move_target(
     if let Ok(stat) = sftp.lstat(Path::new(&target)) {
         if stat.file_type().is_symlink() {
             bail!("remote target is a link");
+        }
+        if remote_paths_differ_only_by_case(source, &target) {
+            let source_name = remote_file_name(source);
+            let target_name = remote_file_name(&target);
+            if remote_name_change_is_case_only(sftp, source, &source_name, &target_name)? {
+                return Ok((target, true));
+            }
         }
         if stat.is_dir() {
             let source_name = Path::new(source)
@@ -2361,7 +2374,7 @@ fn resolve_remote_move_target(
             if remote_move_lands_inside(source, &destination) {
                 bail!("remote target is inside the source");
             }
-            return Ok(destination);
+            return Ok((destination, false));
         }
         bail!("remote target already exists: {}", target);
     }
@@ -2372,7 +2385,23 @@ fn resolve_remote_move_target(
     if remote_move_lands_inside(source, &target) {
         bail!("remote target is inside the source");
     }
-    Ok(target)
+    Ok((target, false))
+}
+
+fn remote_file_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn remote_paths_differ_only_by_case(source: &str, target: &str) -> bool {
+    let source_name = remote_file_name(source);
+    let target_name = remote_file_name(target);
+    !source_name.is_empty()
+        && source_name != target_name
+        && source_name.to_lowercase() == target_name.to_lowercase()
+        && remote_parent_path(source).to_lowercase() == remote_parent_path(target).to_lowercase()
 }
 
 fn remote_move_lands_inside(source: &str, destination: &str) -> bool {
@@ -3617,6 +3646,27 @@ mod remote_move_tests {
         assert!(!super::remote_move_lands_inside("/a/box", "/a/box2/box"));
         assert!(!super::remote_move_lands_inside("/a/file", "/b/file"));
         assert!(super::remote_move_lands_inside("/a/box", "/a/box/../box/child"));
+    }
+
+    #[test]
+    fn remote_move_can_change_only_letter_case() {
+        assert!(super::remote_paths_differ_only_by_case(
+            "/a/Readme.TXT",
+            "/a/readme.txt"
+        ));
+        assert!(super::remote_paths_differ_only_by_case("/a/Box", "/A/box"));
+        assert!(!super::remote_paths_differ_only_by_case(
+            "/a/Readme.TXT",
+            "/b/readme.txt"
+        ));
+        assert!(!super::remote_paths_differ_only_by_case(
+            "/a/Readme.TXT",
+            "/a/Readme.TXT"
+        ));
+        assert!(!super::remote_paths_differ_only_by_case(
+            "/a/Readme.TXT",
+            "/a/other.txt"
+        ));
     }
 }
 
