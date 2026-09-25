@@ -2494,17 +2494,33 @@ fn chmod_one(sftp: &ssh2::Sftp, path: &Path, mode: u32) -> Result<()> {
 }
 
 fn chmod_recursive(sftp: &ssh2::Sftp, path: &Path, mode: u32) -> Result<()> {
-    chmod_one(sftp, path, mode)?;
-    let stat = sftp
-        .lstat(path)
-        .with_context(|| format!("failed to stat remote path {}", path.display()))?;
+    chmod_recursive_inner(sftp, path, mode, true)
+}
+
+fn chmod_recursive_inner(sftp: &ssh2::Sftp, path: &Path, mode: u32, strict: bool) -> Result<()> {
+    if strict {
+        chmod_one(sftp, path, mode)?;
+    } else if chmod_one(sftp, path, mode).is_err() {
+        return Ok(());
+    }
+    let stat = match sftp.lstat(path) {
+        Ok(stat) => stat,
+        Err(error) if strict => {
+            return Err(error).with_context(|| format!("failed to stat remote path {}", path.display()));
+        }
+        Err(_) => return Ok(()),
+    };
     if !stat.is_dir() || stat.file_type().is_symlink() {
         return Ok(());
     }
 
-    let children = read_remote_entries(sftp, path, None)?;
+    let children = match read_remote_entries(sftp, path, None) {
+        Ok(children) => children,
+        Err(error) if strict => return Err(error),
+        Err(_) => return Ok(()),
+    };
     for (child, _) in children {
-        chmod_recursive(sftp, &child, mode)?;
+        chmod_recursive_inner(sftp, &child, mode, false)?;
     }
     Ok(())
 }
@@ -2536,17 +2552,39 @@ fn chown_recursive(
     uid: Option<u32>,
     gid: Option<u32>,
 ) -> Result<()> {
-    chown_one(sftp, path, uid, gid)?;
-    let stat = sftp
-        .lstat(path)
-        .with_context(|| format!("failed to stat remote path {}", path.display()))?;
+    chown_recursive_inner(sftp, path, uid, gid, true)
+}
+
+fn chown_recursive_inner(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    strict: bool,
+) -> Result<()> {
+    if strict {
+        chown_one(sftp, path, uid, gid)?;
+    } else if chown_one(sftp, path, uid, gid).is_err() {
+        return Ok(());
+    }
+    let stat = match sftp.lstat(path) {
+        Ok(stat) => stat,
+        Err(error) if strict => {
+            return Err(error).with_context(|| format!("failed to stat remote path {}", path.display()));
+        }
+        Err(_) => return Ok(()),
+    };
     if !stat.is_dir() || stat.file_type().is_symlink() {
         return Ok(());
     }
 
-    let children = read_remote_entries(sftp, path, None)?;
+    let children = match read_remote_entries(sftp, path, None) {
+        Ok(children) => children,
+        Err(error) if strict => return Err(error),
+        Err(_) => return Ok(()),
+    };
     for (child, _) in children {
-        chown_recursive(sftp, &child, uid, gid)?;
+        chown_recursive_inner(sftp, &child, uid, gid, false)?;
     }
     Ok(())
 }
@@ -2586,17 +2624,33 @@ fn touch_one(sftp: &ssh2::Sftp, path: &Path, mtime: u64) -> Result<()> {
 }
 
 fn touch_recursive(sftp: &ssh2::Sftp, path: &Path, mtime: u64) -> Result<()> {
-    touch_one(sftp, path, mtime)?;
-    let stat = sftp
-        .lstat(path)
-        .with_context(|| format!("failed to stat remote path {}", path.display()))?;
+    touch_recursive_inner(sftp, path, mtime, true)
+}
+
+fn touch_recursive_inner(sftp: &ssh2::Sftp, path: &Path, mtime: u64, strict: bool) -> Result<()> {
+    if strict {
+        touch_one(sftp, path, mtime)?;
+    } else if touch_one(sftp, path, mtime).is_err() {
+        return Ok(());
+    }
+    let stat = match sftp.lstat(path) {
+        Ok(stat) => stat,
+        Err(error) if strict => {
+            return Err(error).with_context(|| format!("failed to stat remote path {}", path.display()));
+        }
+        Err(_) => return Ok(()),
+    };
     if !stat.is_dir() || stat.file_type().is_symlink() {
         return Ok(());
     }
 
-    let children = read_remote_entries(sftp, path, None)?;
+    let children = match read_remote_entries(sftp, path, None) {
+        Ok(children) => children,
+        Err(error) if strict => return Err(error),
+        Err(_) => return Ok(()),
+    };
     for (child, _) in children {
-        touch_recursive(sftp, &child, mtime)?;
+        touch_recursive_inner(sftp, &child, mtime, false)?;
     }
     Ok(())
 }
