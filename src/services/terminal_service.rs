@@ -365,33 +365,26 @@ fn run_ssh_shell(
 
     let mut buffer = [0_u8; 16 * 1024];
     loop {
-        while let Ok(command) = command_rx.try_recv() {
-            match command {
-                TerminalCommand::Write(bytes) => {
-                    write_ssh_all(&mut channel, &bytes)?;
-                }
-                TerminalCommand::Resize(next_size) => {
-                    channel
-                        .request_pty_size(next_size.cols as u32, next_size.rows as u32, None, None)
-                        .context("failed to resize SSH PTY")?;
-                }
-                TerminalCommand::Shutdown => {
-                    channel.close().ok();
-                    return Ok(());
-                }
-            }
+        if dispatch_ssh_commands(&command_rx, &mut channel)? {
+            return Ok(());
         }
 
         match channel.read(&mut buffer) {
             Ok(0) if channel.eof() => break,
-            Ok(0) => thread::sleep(Duration::from_millis(1)),
-            Ok(n) => {
+            Ok(n) if n > 0 => {
                 event_tx
                     .send(TerminalEvent::Output(buffer[..n].to_vec()))
                     .ok();
             }
+            Ok(0) => {
+                if wait_ssh_command(&command_rx, &mut channel)? {
+                    return Ok(());
+                }
+            }
             Err(error) if is_would_block(&error) => {
-                thread::sleep(Duration::from_millis(1));
+                if wait_ssh_command(&command_rx, &mut channel)? {
+                    return Ok(());
+                }
             }
             Err(error) => return Err(error).context("failed to read SSH channel"),
         }
@@ -404,12 +397,60 @@ fn run_ssh_shell(
     Ok(())
 }
 
+
+fn dispatch_ssh_commands(
+    command_rx: &Receiver<TerminalCommand>,
+    channel: &mut ssh2::Channel,
+) -> Result<bool> {
+    while let Ok(command) = command_rx.try_recv() {
+        if apply_ssh_command(channel, command)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Block until the user types or a short idle slice elapses.
+///
+/// The SSH session is non-blocking, so polling the socket every millisecond
+/// keeps a core awake for every open connection. Waiting on the command
+/// channel instead still wakes immediately for keystrokes.
+fn wait_ssh_command(
+    command_rx: &Receiver<TerminalCommand>,
+    channel: &mut ssh2::Channel,
+) -> Result<bool> {
+    match command_rx.recv_timeout(Duration::from_millis(20)) {
+        Ok(command) => apply_ssh_command(channel, command),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(false),
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Ok(true),
+    }
+}
+
+fn apply_ssh_command(channel: &mut ssh2::Channel, command: TerminalCommand) -> Result<bool> {
+    match command {
+        TerminalCommand::Write(bytes) => {
+            write_ssh_all(channel, &bytes)?;
+            Ok(false)
+        }
+        TerminalCommand::Resize(next_size) => {
+            channel
+                .request_pty_size(next_size.cols as u32, next_size.rows as u32, None, None)
+                .context("failed to resize SSH PTY")?;
+            Ok(false)
+        }
+        TerminalCommand::Shutdown => {
+            channel.close().ok();
+            Ok(true)
+        }
+    }
+}
+
 fn write_ssh_all(channel: &mut ssh2::Channel, mut bytes: &[u8]) -> Result<()> {
     while !bytes.is_empty() {
         match channel.write(bytes) {
-            Ok(0) => thread::sleep(Duration::from_millis(1)),
+            Ok(0) => thread::sleep(Duration::from_millis(10)),
             Ok(n) => bytes = &bytes[n..],
-            Err(error) if is_would_block(&error) => thread::sleep(Duration::from_millis(1)),
+            Err(error) if is_would_block(&error) => thread::sleep(Duration::from_millis(10)),
             Err(error) => return Err(error).context("failed to write SSH channel"),
         }
     }
