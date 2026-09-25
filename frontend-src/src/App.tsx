@@ -6892,6 +6892,25 @@ function AppSelect<T extends string>({
 const FILE_ROW_HEIGHT = 26;
 const FILE_ROW_OVERSCAN = 10;
 
+function revealFileRow(node: HTMLElement, index: number, mode: "nearest" | "center") {
+  const rowTop = FILE_ROW_HEIGHT * (index + 1);
+  const rowBottom = rowTop + FILE_ROW_HEIGHT;
+  const header = FILE_ROW_HEIGHT;
+  const viewTop = node.scrollTop + header;
+  const viewBottom = node.scrollTop + node.clientHeight;
+  if (rowTop >= viewTop && rowBottom <= viewBottom) return;
+  if (mode === "nearest") {
+    if (rowTop < viewTop) {
+      node.scrollTop = Math.max(0, rowTop - header);
+      return;
+    }
+    const alignBottom = Math.max(0, rowBottom - node.clientHeight);
+    node.scrollTop = rowTop < alignBottom + header ? Math.max(0, rowTop - header) : alignBottom;
+    return;
+  }
+  node.scrollTop = Math.max(0, rowTop - Math.max(0, (node.clientHeight - FILE_ROW_HEIGHT) / 2));
+}
+
 function FileList({
   files,
   scrollKey,
@@ -6968,6 +6987,7 @@ function FileList({
   }, [scrollKey]);
 
   const revealedSelectionRef = useRef("");
+  const revealModeRef = useRef<"nearest" | "center">("center");
   const selectedPath = selected?.path ?? "";
   useEffect(() => {
     if (!selectedPath) {
@@ -6979,11 +6999,10 @@ function FileList({
     if (index < 0) return;
     const node = listRef.current;
     if (!node) return;
+    const mode = revealModeRef.current;
+    revealModeRef.current = "center";
     revealedSelectionRef.current = selectedPath;
-    const rowTop = FILE_ROW_HEIGHT * (index + 1);
-    const rowBottom = rowTop + FILE_ROW_HEIGHT;
-    if (rowTop >= node.scrollTop && rowBottom <= node.scrollTop + node.clientHeight) return;
-    node.scrollTop = Math.max(0, rowTop - Math.max(0, (node.clientHeight - FILE_ROW_HEIGHT) / 2));
+    revealFileRow(node, index, mode);
     updateRange();
   }, [files, selectedPath, updateRange]);
 
@@ -7021,6 +7040,7 @@ function FileList({
                   : Math.max(0, from - page);
       const file = files[nextIndex];
       if (!file || (file.path === selected?.path && !event.shiftKey)) return;
+      if (file.path !== selected?.path) revealModeRef.current = "nearest";
       onSelect(file, { shiftKey: event.shiftKey, ctrlKey: false, metaKey: false });
     };
 
