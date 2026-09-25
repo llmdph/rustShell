@@ -131,6 +131,7 @@ type AppModalConfirmState = {
 };
 type AppModalState = AppModalPromptState | AppModalConfirmState;
 type FileSide = "local" | "remote";
+type FileSelectModifiers = { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean };
 type TextPreviewPosition = "head" | "tail";
 type FileSortKey = "name" | "permissions" | "owner" | "size" | "modifiedAt";
 type FileSort = { key: FileSortKey; direction: "asc" | "desc" };
@@ -703,7 +704,7 @@ export default function App() {
   const selectFile = (
     side: FileSide,
     file: FileEntry,
-    event: MouseEvent<HTMLButtonElement>,
+    event: FileSelectModifiers,
     files: FileEntry[]
   ) => {
     const setPrimary = side === "local" ? setSelectedLocal : setSelectedRemote;
@@ -6480,7 +6481,7 @@ function FilePane({
   bookmarks: PathBookmark[];
   onPath: (path: string) => void;
   onFilter: (filter: string) => void;
-  onSelect: (file: FileEntry, event: MouseEvent<HTMLButtonElement>) => void;
+  onSelect: (file: FileEntry, event: FileSelectModifiers) => void;
   onDragStart: (file: FileEntry, event: DragEvent<HTMLButtonElement>) => void;
   onDragEnd: () => void;
   onDragOver: (event: DragEvent<HTMLDivElement>) => void;
@@ -6910,7 +6911,7 @@ function FileList({
   selected: FileEntry | null;
   selectedPaths: string[];
   sort: FileSort;
-  onSelect: (file: FileEntry, event: MouseEvent<HTMLButtonElement>) => void;
+  onSelect: (file: FileEntry, event: FileSelectModifiers) => void;
   onSort: (key: FileSortKey) => void;
   onOpen: (file: FileEntry) => void;
   onDragStart: (file: FileEntry, event: DragEvent<HTMLButtonElement>) => void;
@@ -6989,6 +6990,44 @@ function FileList({
     if (event.key === "Escape") {
       event.preventDefault();
       onClearSelection();
+      return;
+    }
+    const moveSelection = (key: "ArrowDown" | "ArrowUp" | "Home" | "End" | "PageDown" | "PageUp") => {
+      if (files.length === 0) return;
+      const currentIndex = selected ? files.findIndex((file) => file.path === selected.path) : -1;
+      const page = Math.max(1, Math.floor((listRef.current?.clientHeight ?? FILE_ROW_HEIGHT * 8) / FILE_ROW_HEIGHT) - 1);
+      const from = currentIndex < 0 ? 0 : currentIndex;
+      const nextIndex =
+        key === "Home"
+          ? 0
+          : key === "End"
+            ? files.length - 1
+            : key === "ArrowDown"
+              ? currentIndex < 0
+                ? 0
+                : Math.min(files.length - 1, currentIndex + 1)
+              : key === "ArrowUp"
+                ? currentIndex < 0
+                  ? files.length - 1
+                  : Math.max(0, currentIndex - 1)
+                : key === "PageDown"
+                  ? Math.min(files.length - 1, from + page)
+                  : Math.max(0, from - page);
+      const file = files[nextIndex];
+      if (!file || (file.path === selected?.path && !event.shiftKey)) return;
+      onSelect(file, { shiftKey: event.shiftKey, ctrlKey: false, metaKey: false });
+    };
+
+    if (
+      event.key === "ArrowDown" ||
+      event.key === "ArrowUp" ||
+      event.key === "Home" ||
+      event.key === "End" ||
+      event.key === "PageDown" ||
+      event.key === "PageUp"
+    ) {
+      event.preventDefault();
+      moveSelection(event.key);
       return;
     }
     if (event.key === "Backspace") {
