@@ -461,18 +461,69 @@ fn align_terminal_cut(data: &[u8], drop_at: usize, charset: &str) -> usize {
         return skip_utf8_continuation(data, drop_at);
     }
     if is_gbk_charset(charset) {
-        let four_byte = is_gb18030_charset(charset);
-        let mut index = 0;
-        while index < drop_at && index < data.len() {
-            let step = cjk_char_len(&data[index..], four_byte);
-            if step == 0 {
-                break;
-            }
-            index += step;
-        }
-        return index.min(data.len());
+        return align_cjk_cut(data, drop_at, is_gb18030_charset(charset));
     }
     drop_at
+}
+
+/// Find the cut without walking from the first byte.
+///
+/// Replay history is about 1MB, and a busy GBK session trims it on every
+/// extra chunk. The buffer start is already on a character boundary, and so
+/// is any byte this encoding cannot consume in the middle of a character.
+/// Scanning back to that byte, then forward only across the last line, keeps
+/// the same cut as a full walk.
+fn align_cjk_cut(data: &[u8], drop_at: usize, four_byte: bool) -> usize {
+    let mut index = drop_at.min(data.len());
+    loop {
+        if cjk_cut_is_boundary(data, index, four_byte) {
+            break;
+        }
+        if index == 0 {
+            break;
+        }
+        index -= 1;
+    }
+    while index < drop_at && index < data.len() {
+        let step = cjk_char_len(&data[index..], four_byte);
+        if step == 0 {
+            break;
+        }
+        index += step;
+    }
+    index.min(data.len())
+}
+
+fn cjk_cut_is_boundary(data: &[u8], index: usize, four_byte: bool) -> bool {
+    if index == 0 {
+        return true;
+    }
+    if !cjk_sync_byte(data[index], four_byte) {
+        return false;
+    }
+    // A four-byte read swallows this byte when the two bytes before it are a
+    // lead plus a digit. If that pair is not a real character start, this byte
+    // can still be a boundary, so do not trust it; keep walking back. The
+    // forward scan below then matches a scan from the start of the buffer.
+    if four_byte && index >= 2 {
+        let lead = data[index - 2];
+        let second = data[index - 1];
+        if (0x81..=0xFE).contains(&lead) && (0x30..=0x39).contains(&second) {
+            return false;
+        }
+    }
+    true
+}
+
+fn cjk_sync_byte(byte: u8, four_byte: bool) -> bool {
+    if byte == 0x7F || byte == 0xFF {
+        return true;
+    }
+    if four_byte {
+        byte < 0x30 || (0x3A..=0x3F).contains(&byte)
+    } else {
+        byte < 0x40
+    }
 }
 
 fn is_utf8_charset(charset: &str) -> bool {
@@ -684,6 +735,42 @@ mod tests {
             .send(TerminalEvent::Output("\u{4e2d}".as_bytes().to_vec()))
             .unwrap();
         assert_eq!(model.drain_output(), "\u{4e2d}");
+    }
+
+    fn linear_cjk_cut(data: &[u8], drop_at: usize, four_byte: bool) -> usize {
+        if drop_at >= data.len() {
+            return data.len();
+        }
+        let mut index = 0;
+        while index < drop_at && index < data.len() {
+            let step = cjk_char_len(&data[index..], four_byte);
+            if step == 0 {
+                break;
+            }
+            index += step;
+        }
+        index.min(data.len())
+    }
+
+    #[test]
+    fn gbk_trim_matches_a_full_scan_but_starts_at_the_nearest_boundary() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ab\n");
+        data.extend_from_slice(&[0x81, 0x40, 0x20, 0x81, 0x30, b'\n', 0x81, 0x30, b'Z']);
+        data.extend_from_slice(&[0xD6, 0xD0, b'\n']);
+        data.extend_from_slice(&[0x81, 0x30, 0x81, 0x30, 0x41, 0x0A, 0x42]);
+        for drop_at in 0..=data.len() {
+            assert_eq!(
+                align_terminal_cut(&data, drop_at, "GBK"),
+                linear_cjk_cut(&data, drop_at, false),
+                "gbk {drop_at}"
+            );
+            assert_eq!(
+                align_terminal_cut(&data, drop_at, "GB18030"),
+                linear_cjk_cut(&data, drop_at, true),
+                "gb18030 {drop_at}"
+            );
+        }
     }
 
     #[test]
