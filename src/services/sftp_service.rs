@@ -1182,6 +1182,7 @@ where
             &mut transferred,
             cancel,
             conflict,
+            None,
             &mut on_progress,
         )
         .context("failed to download file")?;
@@ -1676,6 +1677,18 @@ where
     Ok(())
 }
 
+fn reuse_or_open_remote(
+    sftp: &ssh2::Sftp,
+    remote_path: &Path,
+    opened: Option<ssh2::File>,
+) -> Result<ssh2::File> {
+    if let Some(file) = opened {
+        return Ok(file);
+    }
+    sftp.open(remote_path)
+        .with_context(|| format!("failed to open remote file {}", remote_path.display()))
+}
+
 fn download_single_file<F>(
     sftp: &ssh2::Sftp,
     remote_path: &Path,
@@ -1684,6 +1697,7 @@ fn download_single_file<F>(
     transferred: &mut u64,
     cancel: Arc<AtomicBool>,
     conflict: TransferConflictStrategy,
+    mut opened: Option<ssh2::File>,
     on_progress: &mut F,
 ) -> Result<()>
 where
@@ -1710,9 +1724,7 @@ where
                 .len();
             match choose_resume(Some(local_size), stat.size) {
                 ResumeChoice::Append(offset) => {
-                    let mut remote = sftp.open(remote_path).with_context(|| {
-                        format!("failed to open remote file {}", remote_path.display())
-                    })?;
+                    let mut remote = reuse_or_open_remote(sftp, remote_path, opened.take())?;
                     remote.seek(SeekFrom::Start(offset)).with_context(|| {
                         format!("failed to seek remote file {}", remote_path.display())
                     })?;
@@ -1740,18 +1752,14 @@ where
                     bail!("{}", resume_size_unknown_message(local_path));
                 }
                 ResumeChoice::Restart => {
-                    let remote = sftp.open(remote_path).with_context(|| {
-                        format!("failed to open remote file {}", remote_path.display())
-                    })?;
+                    let remote = reuse_or_open_remote(sftp, remote_path, opened.take())?;
                     let local = File::create(local_path)
                         .with_context(|| format!("failed to create {}", local_path.display()))?;
                     (remote, local)
                 }
             }
         } else {
-            let remote = sftp.open(remote_path).with_context(|| {
-                format!("failed to open remote file {}", remote_path.display())
-            })?;
+            let remote = reuse_or_open_remote(sftp, remote_path, opened.take())?;
             let local = File::create(local_path)
                 .with_context(|| format!("failed to create {}", local_path.display()))?;
             (remote, local)
@@ -1861,27 +1869,7 @@ where
         if cancel.load(Ordering::Relaxed) {
             bail!("transfer cancelled");
         }
-        if !is_symlink {
-            match sftp.open(&remote_path) {
-                Ok(file) => drop(file),
-                Err(error) if sftp_item_is_unavailable(&error) => {
-                    let size = sftp
-                        .lstat(&remote_path)
-                        .ok()
-                        .and_then(|stat| stat.size)
-                        .unwrap_or(0);
-                    note_skipped_bytes(transferred, total, size, on_progress);
-                    continue;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to open remote file {}", remote_path.display())
-                    });
-                }
-            }
-        }
-        let local_path =
-            local_child_for_conflict(&local_path, conflict, &mut listed_names)?;
+        let local_path = local_child_for_conflict(&local_path, conflict, &mut listed_names)?;
         if is_symlink {
             download_symlink(
                 sftp,
@@ -1892,7 +1880,10 @@ where
                 conflict,
                 on_progress,
             )?;
-        } else {
+            continue;
+        }
+        // An existing file that will be left alone does not need to be opened.
+        if matches!(conflict, TransferConflictStrategy::Skip) && local_path_exists(&local_path) {
             download_single_file(
                 sftp,
                 &remote_path,
@@ -1901,9 +1892,41 @@ where
                 transferred,
                 cancel.clone(),
                 conflict,
+                None,
                 on_progress,
             )?;
+            continue;
         }
+        // The handle is reused for the copy. Opening it again would be another
+        // round trip for every file in the folder.
+        let opened = match sftp.open(&remote_path) {
+            Ok(file) => file,
+            Err(error) if sftp_item_is_unavailable(&error) => {
+                let size = sftp
+                    .lstat(&remote_path)
+                    .ok()
+                    .and_then(|stat| stat.size)
+                    .unwrap_or(0);
+                note_skipped_bytes(transferred, total, size, on_progress);
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to open remote file {}", remote_path.display())
+                });
+            }
+        };
+        download_single_file(
+            sftp,
+            &remote_path,
+            &local_path,
+            total,
+            transferred,
+            cancel.clone(),
+            conflict,
+            Some(opened),
+            on_progress,
+        )?;
     }
 
     for (remote_child, local_path, perm, atime, mtime) in directories {
