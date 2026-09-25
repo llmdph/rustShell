@@ -20,6 +20,9 @@ use std::{
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const HANDSHAKE_TIMEOUT_MS: u32 = 8_000;
+/// Later reads and writes can wait longer than the handshake. Eight seconds is
+/// short enough to fail a slow transfer.
+const SESSION_IO_TIMEOUT_MS: u32 = 120_000;
 
 /// Failure modes the UI reacts to individually.
 #[derive(Debug)]
@@ -75,6 +78,7 @@ pub fn establish(
     verify_host_key(&session, &profile.host, profile.port)?;
     authenticate(&session, profile, password)?;
 
+    session.set_timeout(SESSION_IO_TIMEOUT_MS);
     session.set_keepalive(true, 30);
     Ok(session)
 }
