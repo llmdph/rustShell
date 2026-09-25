@@ -5932,10 +5932,12 @@ function XtermView({
     let lastDirectory = terminal.currentDirectory ?? "";
 
     let idleRounds = 0;
+    let failures = 0;
     const drainLoop = async () => {
       let nextDelay = 40;
       try {
         const drain = await api.terminalDrain(terminal.id);
+        failures = 0;
         if (drain.output) {
           termRef.current?.write(drain.output);
         }
@@ -5956,15 +5958,22 @@ function XtermView({
         }
         if (drain.output || metadataChanged) {
           idleRounds = 0;
-          nextDelay = activeRef.current ? 0 : 16;
+          nextDelay = activeRef.current ? 12 : 28;
         } else {
           idleRounds += 1;
           const base = activeRef.current ? 30 : 80;
           const cap = activeRef.current ? 120 : 400;
           nextDelay = Math.min(cap, base * 2 ** Math.min(idleRounds - 1, 3));
         }
-      } catch {
-        stopped = true;
+      } catch (error) {
+        const message = String(error);
+        failures += 1;
+        const gone = message.includes("不存在") || message.includes("已关闭");
+        if (gone || failures >= 8) {
+          stopped = true;
+        } else {
+          nextDelay = Math.min(1600, 200 * failures);
+        }
       }
       if (!stopped) {
         timer = window.setTimeout(drainLoop, nextDelay);
