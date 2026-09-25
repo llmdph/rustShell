@@ -311,11 +311,21 @@ pub fn local_move(path: &str, target_path: &str) -> std::io::Result<String> {
             ));
         }
         if metadata.is_dir() {
+            // The same folder with a different letter case is a rename, not a move into itself.
+            if local_move_is_case_only(&source, &target) {
+                rename_local_case_only(&source, &target)?;
+                return Ok(target.display().to_string());
+            }
             let file_name = source.file_name().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "无法确定文件名")
             })?;
             target = target.join(file_name);
         }
+    }
+    // Windows reports the new letter case as an existing file. That is this file.
+    if local_move_is_case_only(&source, &target) {
+        rename_local_case_only(&source, &target)?;
+        return Ok(target.display().to_string());
     }
     if local_move_lands_inside(&source, &target) {
         return Err(std::io::Error::new(
@@ -1116,6 +1126,18 @@ fn local_rename_is_case_only(source: &Path, target: &Path) -> bool {
     }
 }
 
+fn local_move_is_case_only(source: &Path, target: &Path) -> bool {
+    if !local_rename_is_case_only(source, target) {
+        return false;
+    }
+    match (source.parent(), target.parent()) {
+        (Some(source_parent), Some(target_parent)) => {
+            normalize_local_move_path(source_parent) == normalize_local_move_path(target_parent)
+        }
+        _ => false,
+    }
+}
+
 fn rename_local_case_only(source: &Path, target: &Path) -> std::io::Result<()> {
     let parent = source.parent().unwrap_or(Path::new("."));
     let nanos = SystemTime::now()
@@ -1598,6 +1620,121 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["readme.txt".to_owned()]);
         assert_eq!(std::fs::read(root.join("readme.txt")).unwrap(), b"keep");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_move_changes_only_letter_case() {
+        assert!(local_move_is_case_only(
+            Path::new(r"C:\a\Readme.TXT"),
+            Path::new(r"C:\a\readme.txt")
+        ));
+        assert!(local_move_is_case_only(
+            Path::new(r"C:\a\Box"),
+            Path::new(r"c:\A\box")
+        ));
+        assert!(!local_move_is_case_only(
+            Path::new(r"C:\a\Readme.TXT"),
+            Path::new(r"C:\b\readme.txt")
+        ));
+        assert!(!local_move_is_case_only(
+            Path::new(r"C:\a\Readme.TXT"),
+            Path::new(r"C:\a\Readme.TXT")
+        ));
+
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-move-case-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let file = root.join("Readme.TXT");
+        std::fs::write(&file, b"keep").unwrap();
+        let moved = local_move(
+            &file.display().to_string(),
+            &root.join("readme.txt").display().to_string(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&moved).unwrap(), b"keep");
+        let names: Vec<_> = list_local_dir(&root.display().to_string())
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, vec!["readme.txt".to_owned()]);
+
+        let folder = root.join("Notes");
+        std::fs::create_dir(&folder).unwrap();
+        local_move(
+            &folder.display().to_string(),
+            &root.join("notes").display().to_string(),
+        )
+        .unwrap();
+        let listed = list_local_dir(&root.display().to_string()).unwrap();
+        let notes = listed
+            .entries
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case("notes"))
+            .unwrap();
+        assert_eq!(notes.name, "notes");
+        assert!(notes.is_dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_move_keeps_a_different_file_whose_name_differs_only_by_case() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-move-case-conflict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let left = root.join("left");
+        let right = root.join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        let source = left.join("Readme.TXT");
+        std::fs::write(&source, b"left").unwrap();
+        std::fs::write(right.join("readme.txt"), b"right").unwrap();
+
+        let error = local_move(
+            &source.display().to_string(),
+            &right.join("readme.txt").display().to_string(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&source).unwrap(), b"left");
+        assert_eq!(std::fs::read(right.join("readme.txt")).unwrap(), b"right");
+
+        let error = local_move(
+            &source.display().to_string(),
+            &right.display().to_string(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&source).unwrap(), b"left");
+        assert_eq!(std::fs::read(right.join("readme.txt")).unwrap(), b"right");
     }
 
     #[cfg(windows)]
