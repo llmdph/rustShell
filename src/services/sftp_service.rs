@@ -3486,7 +3486,9 @@ fn preserve_remote_permissions(sftp: &ssh2::Sftp, path: &Path, mode: Option<u32>
 
 fn preserve_remote_owner(sftp: &ssh2::Sftp, path: &Path, uid: Option<u32>, gid: Option<u32>) {
     if uid.is_some() || gid.is_some() {
-        let _ = chown_one(sftp, path, uid, gid);
+        // The copy already skipped links. Another stat would repeat that check
+        // for every file in the folder.
+        let _ = chown_one_stat(sftp, path, uid, gid);
     }
 }
 
