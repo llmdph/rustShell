@@ -980,6 +980,16 @@ pub(crate) fn local_path_is_link(path: &Path, metadata: &fs::Metadata) -> bool {
     fs::read_link(path).is_ok()
 }
 
+/// True when showing a path in the system folder should select it.
+/// A link is selected even when it points at a folder, so a junction or a
+/// broken shortcut is not replaced by the directory it names.
+pub(crate) fn local_reveal_selects_item(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => local_path_is_link(path, &metadata) || !metadata.is_dir(),
+        Err(_) => true,
+    }
+}
+
 #[cfg(windows)]
 fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -1082,6 +1092,42 @@ mod tests {
         assert_eq!(remote_parent_path("/a"), "/");
         assert_eq!(remote_parent_path("/"), "/");
         assert_eq!(remote_parent_path("rel"), ".");
+    }
+
+    #[test]
+    fn reveal_selects_a_link_instead_of_the_folder_it_points_at() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-reveal-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let link = self.0.join("link");
+                let _ = std::fs::remove_file(&link);
+                let _ = std::fs::remove_dir(&link);
+                let _ = std::fs::remove_file(self.0.join("note.txt"));
+                let _ = std::fs::remove_dir_all(self.0.join("target"));
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let note = root.join("note.txt");
+        std::fs::write(&note, b"note").unwrap();
+        let link = root.join("link");
+        make_directory_link(&target, &link);
+
+        assert!(local_reveal_selects_item(&note));
+        assert!(!local_reveal_selects_item(&target));
+        assert!(local_reveal_selects_item(&link));
+        assert!(local_reveal_selects_item(&root.join("missing.txt")));
     }
 
     #[cfg(windows)]

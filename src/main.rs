@@ -15,6 +15,7 @@ use crate::{
             local_file_sha256 as local_file_sha256_impl, local_home as read_local_home,
             local_mkdir as create_local_dir_impl, local_move as move_local_path_impl,
             local_parent as read_local_parent, local_path_stats as local_path_stats_impl,
+            local_reveal_selects_item,
             local_read_text_file as read_local_file_impl,
             local_read_text_file_tail as read_local_file_tail_impl,
             local_remove as remove_local_path_impl, local_rename as rename_local_path_impl,
@@ -2655,29 +2656,32 @@ fn lock_poison_ok<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn open_local_path_impl(path: &str, reveal: bool) -> std::io::Result<()> {
     let target = Path::new(path);
-    let containing_target = if reveal && target.is_file() {
-        target.parent().unwrap_or(target)
+    // Select links and files. Opening a directory link would follow it and
+    // hide a junction or a shortcut whose target is missing.
+    let select_item = reveal && local_reveal_selects_item(target);
+    let folder = if select_item {
+        target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(target)
     } else {
         target
     };
 
     #[cfg(windows)]
     {
-        if reveal && target.is_file() {
+        if select_item {
             let mut command = Command::new("explorer.exe");
             // One argument. A comma in the file name must not split the path.
             command.arg(format!("/select,\"{}\"", target.display()));
             spawn_gui_command(command)?;
+        } else if reveal {
+            let mut command = Command::new("explorer.exe");
+            command.arg(folder);
+            spawn_gui_command(command)?;
         } else {
-            let command = if reveal {
-                let mut command = Command::new("explorer.exe");
-                command.arg(containing_target);
-                command
-            } else {
-                let mut command = Command::new("rundll32.exe");
-                command.arg("url.dll,FileProtocolHandler").arg(target);
-                command
-            };
+            let mut command = Command::new("rundll32.exe");
+            command.arg("url.dll,FileProtocolHandler").arg(target);
             spawn_gui_command(command)?;
         }
     }
@@ -2685,10 +2689,10 @@ fn open_local_path_impl(path: &str, reveal: bool) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let mut command = Command::new("open");
-        if reveal && target.is_file() {
+        if select_item {
             command.arg("-R").arg(target);
         } else {
-            command.arg(containing_target);
+            command.arg(folder);
         }
         spawn_gui_command(command)?;
     }
@@ -2696,7 +2700,7 @@ fn open_local_path_impl(path: &str, reveal: bool) -> std::io::Result<()> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let mut command = Command::new("xdg-open");
-        command.arg(containing_target);
+        command.arg(if select_item { folder } else { target });
         spawn_gui_command(command)?;
     }
 
