@@ -2420,35 +2420,66 @@ fn copy_remote_path(
     target: &Path,
     is_dir_hint: bool,
 ) -> Result<()> {
+    copy_remote_path_inner(sftp, source, target, is_dir_hint, true)
+}
+
+fn copy_remote_path_inner(
+    sftp: &ssh2::Sftp,
+    source: &Path,
+    target: &Path,
+    is_dir_hint: bool,
+    strict: bool,
+) -> Result<()> {
     if sftp.lstat(target).is_ok() {
         bail!("remote target already exists: {}", target.display());
     }
 
-    let stat = sftp
-        .lstat(source)
-        .with_context(|| format!("failed to stat remote path {}", source.display()))?;
+    let stat = match sftp.lstat(source) {
+        Ok(stat) => stat,
+        Err(error) if strict => {
+            return Err(error)
+                .with_context(|| format!("failed to stat remote path {}", source.display()));
+        }
+        Err(_) => return Ok(()),
+    };
 
     if stat.file_type().is_symlink() {
-        let link_target = sftp
-            .readlink(source)
-            .with_context(|| format!("failed to read symlink {}", source.display()))?;
-        return sftp
-            .symlink(&link_target, target)
-            .with_context(|| format!("failed to copy symlink to {}", target.display()));
+        let link_target = match sftp.readlink(source) {
+            Ok(link_target) => link_target,
+            Err(error) if strict => {
+                return Err(error)
+                    .with_context(|| format!("failed to read symlink {}", source.display()));
+            }
+            Err(_) => return Ok(()),
+        };
+        return match sftp.symlink(&link_target, target) {
+            Ok(()) => Ok(()),
+            Err(error) if strict => Err(error)
+                .with_context(|| format!("failed to copy symlink to {}", target.display())),
+            Err(_) => Ok(()),
+        };
     }
 
     if stat.is_dir() || is_dir_hint {
         let mode = (stat.perm.unwrap_or(0o755) & 0o7777) as i32;
         sftp.mkdir(target, mode)
             .with_context(|| format!("failed to create remote directory {}", target.display()))?;
-        let children = read_remote_entries(sftp, source, None)?;
+        let children = match read_remote_entries(sftp, source, None) {
+            Ok(children) => children,
+            Err(error) if strict => return Err(error),
+            Err(_) => {
+                preserve_remote_owner(sftp, target, stat.uid, stat.gid);
+                preserve_remote_permissions(sftp, target, stat.perm);
+                let _ = set_remote_times(sftp, target, stat.atime, stat.mtime);
+                return Ok(());
+            }
+        };
         for (child, _) in children {
-            let name = child
-                .file_name()
-                .ok_or_else(|| anyhow!("remote file name is missing"))?;
-            let child_target =
-                remote_child_path(&remote_path_text(target), &name.to_string_lossy());
-            copy_remote_path(sftp, &child, Path::new(&child_target), false)?;
+            let Some(name) = child.file_name() else {
+                continue;
+            };
+            let child_target = remote_child_path(&remote_path_text(target), &name.to_string_lossy());
+            copy_remote_path_inner(sftp, &child, Path::new(&child_target), false, false)?;
         }
         preserve_remote_owner(sftp, target, stat.uid, stat.gid);
         preserve_remote_permissions(sftp, target, stat.perm);
@@ -2456,9 +2487,14 @@ fn copy_remote_path(
         return Ok(());
     }
 
-    let mut input = sftp
-        .open(source)
-        .with_context(|| format!("failed to open remote file {}", source.display()))?;
+    let mut input = match sftp.open(source) {
+        Ok(input) => input,
+        Err(error) if strict => {
+            return Err(error)
+                .with_context(|| format!("failed to open remote file {}", source.display()));
+        }
+        Err(_) => return Ok(()),
+    };
     let mut output = sftp
         .create(target)
         .with_context(|| format!("failed to create remote file {}", target.display()))?;
