@@ -6478,20 +6478,14 @@ function SessionTree({
 
 
 function dragPointElement(position: { x: number; y: number }): HTMLElement | null {
+  // The drop event reports physical pixels. elementFromPoint expects CSS pixels,
+  // so a scaled display would otherwise hit a pane farther down and to the right.
   const ratio = window.devicePixelRatio || 1;
-  const candidates = [
-    { x: position.x, y: position.y },
-    { x: position.x / ratio, y: position.y / ratio }
-  ];
-  let fallback: HTMLElement | null = null;
-  for (const point of candidates) {
-    if (point.x < 0 || point.y < 0 || point.x > window.innerWidth || point.y > window.innerHeight) continue;
-    const element = document.elementFromPoint(point.x, point.y);
-    if (!(element instanceof HTMLElement)) continue;
-    if (!fallback) fallback = element;
-    if (element.closest("[data-file-pane-side]")) return element;
-  }
-  return fallback;
+  const x = position.x / ratio;
+  const y = position.y / ratio;
+  if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) return null;
+  const element = document.elementFromPoint(x, y);
+  return element instanceof HTMLElement ? element : null;
 }
 
 function filePaneSideFromElement(element: HTMLElement | null): FileSide | null {
