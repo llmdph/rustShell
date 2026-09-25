@@ -966,6 +966,7 @@ where
     let root_metadata = fs::symlink_metadata(local_path).ok();
     let mut transferred = 0_u64;
     on_progress(transferred, total);
+    ensure_upload_directory(sftp, remote_dir)?;
     if root_metadata
         .as_ref()
         .is_some_and(|metadata| local_path_is_link(local_path, metadata))
@@ -1099,6 +1100,9 @@ where
     let total = remote_total_size(sftp, remote_path, &cancel)?;
     let mut transferred = 0_u64;
     on_progress(transferred, total);
+    if !local_dir.is_empty() && local_dir != "." {
+        ensure_local_dir(Path::new(local_dir))?;
+    }
     if stat.file_type().is_symlink() {
         download_symlink(
             sftp,
@@ -2278,6 +2282,40 @@ fn split_file_name(name: &str) -> (String, String) {
         Some(index) if index > 0 => (name[..index].to_owned(), name[index..].to_owned()),
         _ => (name.to_owned(), String::new()),
     }
+}
+
+fn ensure_upload_directory(sftp: &ssh2::Sftp, remote_dir: &str) -> Result<()> {
+    let dir = remote_dir.trim().replace('\\', "/");
+    if dir.is_empty() || dir == "." {
+        return Ok(());
+    }
+    match sftp.lstat(Path::new(&dir)) {
+        Ok(stat) if stat.is_dir() && !stat.file_type().is_symlink() => return Ok(()),
+        Ok(_) => bail!("remote path exists and is not a directory: {}", dir),
+        Err(_) => {}
+    }
+
+    let absolute = dir.starts_with('/');
+    let mut current = String::new();
+    for part in dir.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            bail!("remote upload directory is invalid: {}", dir);
+        }
+        current = if current.is_empty() || current == "/" {
+            if absolute {
+                format!("/{part}")
+            } else {
+                part.to_owned()
+            }
+        } else {
+            format!("{current}/{part}")
+        };
+        ensure_remote_dir(sftp, Path::new(&current))?;
+    }
+    Ok(())
 }
 
 fn ensure_remote_dir(sftp: &ssh2::Sftp, path: &Path) -> Result<()> {

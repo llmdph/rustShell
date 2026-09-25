@@ -3777,15 +3777,16 @@ export default function App() {
       title,
       items: entries.map((entry) => {
         const mark = marks.get(entry.path);
+        const relativeName = transferRelativeName(direction === "upload" ? "local" : "remote", direction === "upload" ? localPath : remotePath, entry);
         return {
           entry,
           action: mark?.kind === "different" ? "overwrite" : "create",
-          name: entry.name,
+          name: relativeName,
           source: entry.path,
           target:
             direction === "upload"
-              ? joinRemotePath(remotePath || ".", entry.name)
-              : joinLocalPath(localPath || ".", entry.name),
+              ? joinRemotePath(remotePath || ".", relativeName)
+              : joinLocalPath(localPath || ".", relativeName),
           detail: mark?.detail ?? compareKindLabel(mark?.kind ?? "different")
         };
       })
@@ -9903,6 +9904,20 @@ function localParentPath(path: string) {
 
 function parentPathForSide(side: FileSide, path: string) {
   return side === "remote" ? remoteParentPath(path) : localParentPath(path);
+}
+
+function transferRelativeName(side: FileSide, root: string, entry: FileEntry) {
+  const relative = relativePathForSide(side, root, entry.path).replace(/\\/g, "/");
+  if (
+    !relative ||
+    relative === "." ||
+    relative.startsWith("/") ||
+    relative.split("/").includes("..") ||
+    /^[A-Za-z]:/.test(relative)
+  ) {
+    return entry.name;
+  }
+  return relative;
 }
 
 function relativePathForSide(side: FileSide, basePath: string, path: string) {
