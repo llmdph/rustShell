@@ -1149,6 +1149,24 @@ where
         .with(&context.profile, context.password.as_deref(), action)
 }
 
+fn pooled_sftp_text<T, F>(
+    profile_id: &str,
+    password: Option<&str>,
+    state: &State<'_, AppRuntime>,
+    mut action: F,
+) -> Result<T, String>
+where
+    F: FnMut(&str, &mut sftp_service::SftpConnection) -> anyhow::Result<T>,
+{
+    let context = sftp_context(profile_id, password, state, false)?;
+    let charset = context.profile.charset.clone();
+    context.pool.with(
+        &context.profile,
+        context.password.as_deref(),
+        |connection| action(&charset, connection),
+    )
+}
+
 #[tauri::command]
 async fn list_remote_dir(request: SftpRequest, app: AppHandle) -> Result<DirListing, String> {
     blocking(move || {
@@ -1513,12 +1531,11 @@ async fn read_remote_file(
 ) -> Result<sftp_service::RemoteTextFile, String> {
     blocking(move || {
         let state = app.state::<AppRuntime>();
-        pooled_sftp(
+        pooled_sftp_text(
             &request.profile_id,
             request.password.as_deref(),
             &state,
-            false,
-            |connection| connection.read_text_file(&request.path, &context.profile.charset),
+            |charset, connection| connection.read_text_file(&request.path, charset),
         )
     })
     .await
@@ -1531,12 +1548,11 @@ async fn read_remote_file_tail(
 ) -> Result<sftp_service::RemoteTextFile, String> {
     blocking(move || {
         let state = app.state::<AppRuntime>();
-        pooled_sftp(
+        pooled_sftp_text(
             &request.profile_id,
             request.password.as_deref(),
             &state,
-            false,
-            |connection| connection.read_text_file_tail(&request.path, &context.profile.charset),
+            |charset, connection| connection.read_text_file_tail(&request.path, charset),
         )
     })
     .await
@@ -1546,12 +1562,11 @@ async fn read_remote_file_tail(
 async fn write_remote_file(request: RemoteWriteFileRequest, app: AppHandle) -> Result<(), String> {
     blocking(move || {
         let state = app.state::<AppRuntime>();
-        pooled_sftp(
+        pooled_sftp_text(
             &request.profile_id,
             request.password.as_deref(),
             &state,
-            false,
-            |connection| connection.write_text_file(&request.path, &request.content, &context.profile.charset),
+            |charset, connection| connection.write_text_file(&request.path, &request.content, charset),
         )
     })
     .await
