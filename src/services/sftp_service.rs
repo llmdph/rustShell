@@ -13,6 +13,7 @@ use filetime::{set_file_times, FileTime};
 use sha2::{Digest, Sha256};
 use ssh2::{OpenFlags, OpenType};
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -2004,14 +2005,39 @@ fn resolve_remote_child_path(
     }
 
     let (stem, suffix) = split_file_name(name);
-    for index in 1..10_000 {
-        let next_name = format!("{} ({}){}", stem, index, suffix);
-        let next_path = remote_child_path(parent, &next_name);
-        if !remote_path_exists(sftp, Path::new(&next_path)) {
-            return Ok(next_path);
+    let first = numbered_copy_name(&stem, &suffix, 1);
+    let first_path = remote_child_path(parent, &first);
+    if !remote_path_exists(sftp, Path::new(&first_path)) {
+        return Ok(first_path);
+    }
+
+    // Later numbers can run into the hundreds. One directory listing is cheaper
+    // than asking the server about every number.
+    if let Some(names) = remote_directory_names(sftp, parent) {
+        if let Some(next_name) = next_free_numbered_name(&stem, &suffix, &names, 2) {
+            return Ok(remote_child_path(parent, &next_name));
+        }
+    } else {
+        for index in 2..10_000 {
+            let next_name = numbered_copy_name(&stem, &suffix, index);
+            let next_path = remote_child_path(parent, &next_name);
+            if !remote_path_exists(sftp, Path::new(&next_path)) {
+                return Ok(next_path);
+            }
         }
     }
     bail!("failed to allocate unique remote path for {}", candidate)
+}
+
+fn remote_directory_names(sftp: &ssh2::Sftp, parent: &str) -> Option<HashSet<String>> {
+    let mut names = HashSet::new();
+    let listed = visit_remote_entries(sftp, Path::new(parent), None, |path_buf, _stat| {
+        if let Some(name) = path_buf.file_name() {
+            names.insert(name.to_string_lossy().into_owned());
+        }
+        true
+    });
+    listed.ok().map(|_| names)
 }
 
 fn remote_path_exists(sftp: &ssh2::Sftp, path: &Path) -> bool {
@@ -2115,16 +2141,48 @@ fn resolve_local_path(path: &Path, conflict: TransferConflictStrategy) -> Result
         .ok_or_else(|| anyhow!("local file name is missing"))?
         .to_string_lossy();
     let (stem, suffix) = split_file_name(&file_name);
-    for index in 1..10_000 {
-        let candidate = parent.join(format!("{} ({}){}", stem, index, suffix));
-        if !local_path_exists(&candidate) {
-            return Ok(candidate);
+    let first = numbered_copy_name(&stem, &suffix, 1);
+    let first_path = parent.join(&first);
+    if !local_path_exists(&first_path) {
+        return Ok(first_path);
+    }
+
+    if let Some(names) = local_directory_names(parent) {
+        if let Some(next_name) = next_free_numbered_name(&stem, &suffix, &names, 2) {
+            return Ok(parent.join(next_name));
+        }
+    } else {
+        for index in 2..10_000 {
+            let candidate = parent.join(numbered_copy_name(&stem, &suffix, index));
+            if !local_path_exists(&candidate) {
+                return Ok(candidate);
+            }
         }
     }
     bail!(
         "failed to allocate unique local path for {}",
         path.display()
     )
+}
+
+fn local_directory_names(parent: &Path) -> Option<HashSet<String>> {
+    let entries = fs::read_dir(parent).ok()?;
+    let mut names = HashSet::new();
+    for entry in entries.flatten() {
+        names.insert(fold_local_file_name(&entry.file_name().to_string_lossy()));
+    }
+    Some(names)
+}
+
+fn fold_local_file_name(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        name.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        name.to_owned()
+    }
 }
 
 fn local_path_exists(path: &Path) -> bool {
@@ -2326,6 +2384,27 @@ fn preferred_transfer_name(requested: Option<&str>) -> Result<Option<String>> {
         bail!("transfer name is invalid");
     }
     Ok(Some(name.to_owned()))
+}
+
+
+fn numbered_copy_name(stem: &str, suffix: &str, index: u32) -> String {
+    format!("{stem} ({index}){suffix}")
+}
+
+fn next_free_numbered_name(
+    stem: &str,
+    suffix: &str,
+    occupied: &HashSet<String>,
+    start: u32,
+) -> Option<String> {
+    for index in start..10_000 {
+        let name = numbered_copy_name(stem, suffix, index);
+        let key = fold_local_file_name(&name);
+        if !occupied.contains(&key) && !occupied.contains(&name) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 fn split_file_name(name: &str) -> (String, String) {
@@ -3320,5 +3399,73 @@ mod case_rename_tests {
         assert!(!only_case_variant_is_source("Readme.TXT", "other.txt", &["other.txt"]));
         assert!(!only_case_variant_is_source("Readme.TXT", "Readme.TXT", &["Readme.TXT"]));
         assert!(!only_case_variant_is_source("Readme.TXT", "readme.txt", &[]));
+    }
+}
+
+#[cfg(test)]
+mod numbered_copy_tests {
+    use super::{next_free_numbered_name, resolve_local_path, TransferConflictStrategy};
+    use std::collections::HashSet;
+
+    #[test]
+    fn the_first_free_number_is_used() {
+        let mut occupied = HashSet::new();
+        occupied.insert("report (1).txt".to_owned());
+        occupied.insert("report (3).txt".to_owned());
+        assert_eq!(
+            next_free_numbered_name("report", ".txt", &occupied, 1).as_deref(),
+            Some("report (2).txt")
+        );
+        occupied.insert("report (2).txt".to_owned());
+        assert_eq!(
+            next_free_numbered_name("report", ".txt", &occupied, 1).as_deref(),
+            Some("report (4).txt")
+        );
+    }
+
+    #[test]
+    fn an_existing_copy_keeps_its_bytes_and_the_new_name_is_free() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-rename-copy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        std::fs::write(root.join("report.txt"), b"original").unwrap();
+        std::fs::write(root.join("report (1).txt"), b"first").unwrap();
+        std::fs::write(root.join("report (2).txt"), b"second").unwrap();
+        let resolved = resolve_local_path(
+            &root.join("report.txt"),
+            TransferConflictStrategy::Rename,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.file_name().and_then(|name| name.to_str()),
+            Some("report (3).txt")
+        );
+        assert_eq!(std::fs::read(root.join("report (1).txt")).unwrap(), b"first");
+        assert_eq!(std::fs::read(root.join("report (2).txt")).unwrap(), b"second");
+
+        std::fs::remove_file(root.join("report (1).txt")).unwrap();
+        let resolved = resolve_local_path(
+            &root.join("report.txt"),
+            TransferConflictStrategy::Rename,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.file_name().and_then(|name| name.to_str()),
+            Some("report (1).txt")
+        );
     }
 }
