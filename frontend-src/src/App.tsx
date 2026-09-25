@@ -3089,7 +3089,6 @@ export default function App() {
     if (!propertiesTarget) return;
     const targets = propertiesTargets.length ? propertiesTargets : [propertiesTarget];
     const editableTargets = targets.filter((target) => target.fileType !== "symlink");
-    const multiple = targets.length > 1;
     const uid = parseOptionalOwnerId(propertiesUid);
     const gid = parseOptionalOwnerId(propertiesGid);
     if (propertiesSide === "remote" && (uid === undefined || gid === undefined)) {
@@ -3106,8 +3105,8 @@ export default function App() {
       pushToast("error", "修改时间格式不正确");
       return;
     }
-    const originalMode = propertiesTarget.permissions ?? null;
-    const shouldChmod = mode !== null && (multiple || mode !== originalMode);
+    const loadedModeText = commonEntryValue(targets, (target) => formatMode(target.permissions));
+    const shouldChmod = mode !== null && propertiesMode.trim() !== loadedModeText.trim();
     const targetModes = shouldChmod
       ? editableTargets.map((target) => ({
           target,
@@ -3121,11 +3120,11 @@ export default function App() {
     const targetModeByPath = new Map(targetModes.map((item) => [item.target.path, item.mode as number]));
     const loadedMtimeText = commonEntryValue(targets, (target) => formatDateTimeLocal(target.modifiedAt));
     const shouldTouch = mtime != null && mtime !== loadedMtimeText;
+    const loadedUid = commonEntryValue(targets, (target) => (target.uid == null ? "" : String(target.uid)));
+    const loadedGid = commonEntryValue(targets, (target) => (target.gid == null ? "" : String(target.gid)));
     const shouldChown =
       propertiesSide === "remote" &&
-      (multiple
-        ? uid !== null || gid !== null
-        : (uid !== null && uid !== (propertiesTarget.uid ?? null)) || (gid !== null && gid !== (propertiesTarget.gid ?? null)));
+      ((uid !== null && propertiesUid.trim() !== loadedUid) || (gid !== null && propertiesGid.trim() !== loadedGid));
     if (!shouldChmod && !shouldChown && !shouldTouch) {
       pushToast("error", "没有需要应用的属性变更");
       return;
