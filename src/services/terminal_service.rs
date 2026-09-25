@@ -365,29 +365,41 @@ fn run_ssh_shell(
 
     let mut buffer = [0_u8; 16 * 1024];
     let mut pending_input = PendingSshInput::default();
+    // One chunk the window has not taken yet. Waiting inside send would leave
+    // keystrokes sitting here until the screen catches up.
+    let mut waiting_output: Option<Vec<u8>> = None;
     loop {
         if take_ssh_commands(&command_rx, &mut channel, &mut pending_input)? {
             return Ok(());
         }
 
         let wrote = flush_ssh_input(&mut channel, &mut pending_input)?;
-        let read = match channel.read(&mut buffer) {
-            Ok(0) if channel.eof() => break,
-            Ok(n) if n > 0 => {
-                if event_tx
-                    .send(TerminalEvent::Output(buffer[..n].to_vec()))
-                    .is_err()
-                {
-                    return Ok(());
-                }
-                true
+        if waiting_output.is_none() {
+            match channel.read(&mut buffer) {
+                Ok(0) if channel.eof() => break,
+                Ok(n) if n > 0 => waiting_output = Some(buffer[..n].to_vec()),
+                Ok(_) => {}
+                Err(error) if is_would_block(&error) => {}
+                Err(error) => return Err(error).context("failed to read SSH channel"),
             }
-            Ok(_) => false,
-            Err(error) if is_would_block(&error) => false,
-            Err(error) => return Err(error).context("failed to read SSH channel"),
-        };
+        }
 
-        if !wrote && !read && wait_ssh_command(&command_rx, &mut channel, &mut pending_input)? {
+        let mut sent_output = false;
+        if let Some(bytes) = waiting_output.take() {
+            match event_tx.try_send(TerminalEvent::Output(bytes)) {
+                Ok(()) => sent_output = true,
+                Err(crossbeam_channel::TrySendError::Full(TerminalEvent::Output(bytes))) => {
+                    waiting_output = Some(bytes);
+                }
+                Err(crossbeam_channel::TrySendError::Full(_))
+                | Err(crossbeam_channel::TrySendError::Disconnected(_)) => return Ok(()),
+            }
+        }
+
+        let output_is_waiting = waiting_output.is_some();
+        if (output_is_waiting || (!wrote && !sent_output))
+            && wait_ssh_command(&command_rx, &mut channel, &mut pending_input)?
+        {
             return Ok(());
         }
     }
