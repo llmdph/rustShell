@@ -5741,6 +5741,8 @@ function XtermView({
   const onDrainRef = useRef(onDrain);
   const activeRef = useRef(active);
   activeRef.current = active;
+  const copyOnSelectRef = useRef(settings.copyOnSelect);
+  copyOnSelectRef.current = settings.copyOnSelect;
 
   useEffect(() => {
     onDrainRef.current = onDrain;
@@ -5837,6 +5839,17 @@ function XtermView({
     const handleViewportScroll = () => updateTerminalScrollbar(true);
     viewport?.addEventListener("scroll", handleViewportScroll, { passive: true });
     const scrollDisposable = term.onScroll(() => updateTerminalScrollbar(true));
+    let copyTimer = 0;
+    const selectionDisposable = term.onSelectionChange(() => {
+      window.clearTimeout(copyTimer);
+      if (!copyOnSelectRef.current) return;
+      copyTimer = window.setTimeout(() => {
+        if (disposed || !copyOnSelectRef.current) return;
+        const selection = term.getSelection();
+        if (!selection) return;
+        navigator.clipboard.writeText(selection).catch(() => undefined);
+      }, 40);
+    });
 
     const flushInput = () => {
       sendScheduledRef.current = false;
@@ -5902,6 +5915,8 @@ function XtermView({
     return () => {
       disposed = true;
       viewport?.removeEventListener("scroll", handleViewportScroll);
+      window.clearTimeout(copyTimer);
+      selectionDisposable.dispose();
       scrollDisposable.dispose();
       observer.disconnect();
       if (terminalScrollbarHideRef.current !== null) {
