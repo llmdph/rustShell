@@ -220,6 +220,17 @@ impl TerminalModel {
 
     pub fn pump_events(&mut self) {
         for _ in 0..MAX_EVENTS_PER_PUMP {
+            // One update only draws a piece of what is already queued. Taking
+            // every waiting chunk as well throws away text the screen has not
+            // shown yet, so later updates skip ahead.
+            if self
+                .pending_output
+                .len()
+                .saturating_add(TERMINAL_DRAIN_CHUNK)
+                > TERMINAL_PENDING_CAP
+            {
+                break;
+            }
             let next_event = self
                 .event_rx
                 .as_ref()
@@ -880,5 +891,31 @@ mod tests {
         }
         assert_eq!(collected, bytes);
         assert!(rounds > 1);
+    }
+
+    #[test]
+    fn queued_output_is_shown_before_it_is_discarded() {
+        let (mut model, event_tx) = model_with_charset("UTF-8");
+        let chunk = vec![b'x'; 16 * 1024];
+        let count = TERMINAL_PENDING_CAP / chunk.len() + 8;
+        for _ in 0..count {
+            event_tx
+                .send(TerminalEvent::Output(chunk.clone()))
+                .unwrap();
+        }
+
+        let mut got = 0usize;
+        let mut rounds = 0usize;
+        loop {
+            let (next, _) = model.pump_pending_output();
+            if next.is_empty() {
+                break;
+            }
+            assert!(next.iter().all(|byte| *byte == b'x'));
+            got += next.len();
+            rounds += 1;
+            assert!(rounds < count + 8, "drain did not finish");
+        }
+        assert_eq!(got, count * chunk.len());
     }
 }
