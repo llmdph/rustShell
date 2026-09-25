@@ -9431,9 +9431,11 @@ function resolveSymlinkTargetPath(side: FileSide, entry: FileEntry) {
   const target = entry.linkTarget?.trim() ?? "";
   if (!target) return "";
   if (side === "remote") {
-    return target.startsWith("/") ? target : joinRemotePath(remoteParentPath(entry.path), target);
+    const joined = target.startsWith("/") ? target : joinRemotePath(remoteParentPath(entry.path), target);
+    return normalizeRemotePath(joined);
   }
-  return isLocalAbsolutePath(target) ? target : joinLocalPath(localParentPath(entry.path), target);
+  const joined = isLocalAbsolutePath(target) ? target : joinLocalPath(localParentPath(entry.path), target);
+  return normalizeLocalPath(joined);
 }
 
 function joinRemotePath(parent: string, child: string) {
@@ -9446,6 +9448,47 @@ function joinLocalPath(parent: string, child: string) {
   if (!parent || parent === ".") return child;
   const separator = parent.includes("\\") && !parent.includes("/") ? "\\" : "/";
   return `${parent.replace(/[\\/]+$/g, "")}${separator}${child.replace(/^[\\/]+/g, "")}`;
+}
+
+function normalizeRemotePath(path: string) {
+  const absolute = path.startsWith("/");
+  const parts: string[] = [];
+  for (const part of path.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  if (absolute) return parts.length === 0 ? "/" : `/${parts.join("/")}`;
+  return parts.join("/") || ".";
+}
+
+function normalizeLocalPath(path: string) {
+  const unc = path.startsWith("\\\\") || path.startsWith("//");
+  const drive = path.match(/^[A-Za-z]:/);
+  const separator = path.includes("\\") ? "\\" : "/";
+  const body = drive ? path.slice(drive[0].length) : unc ? path.slice(2) : path;
+  const absolute = unc || Boolean(drive) || body.startsWith("/") || body.startsWith("\\");
+  const parts: string[] = [];
+  for (const part of body.split(/[\\/]+/)) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length > 0 && parts[parts.length - 1] !== "..") parts.pop();
+      else if (!absolute) parts.push("..");
+      continue;
+    }
+    parts.push(part);
+  }
+  const joined = parts.join(separator);
+  if (unc) {
+    const prefix = path.startsWith("\\\\") ? "\\\\" : "//";
+    return `${prefix}${joined}`;
+  }
+  if (drive) return `${drive[0]}${separator}${joined}`;
+  if (absolute) return `${separator}${joined}` || separator;
+  return joined || ".";
 }
 
 function isLocalAbsolutePath(path: string) {
