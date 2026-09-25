@@ -580,8 +580,14 @@ fn collect_local_path_stats(path: &Path, stats: &mut LocalPathStats) -> std::io:
     if metadata.is_dir() && !local_path_is_link(path, &metadata) {
         stats.dir_count += 1;
         for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            collect_local_path_stats(&entry.path(), stats)?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            // One locked or missing child should not hide the rest of the folder.
+            if collect_local_path_stats(&entry.path(), stats).is_err() {
+                continue;
+            }
         }
     } else {
         stats.file_count += 1;
@@ -1306,5 +1312,57 @@ mod tests {
         {
             assert!(local_move_lands_inside(Path::new(r"C:\a\Box"), Path::new(r"c:\a\box\Child")));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn folder_stats_skip_an_unreadable_child() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-stats-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let user = std::env::var("USERNAME").unwrap_or_default();
+                let _ = std::process::Command::new("icacls")
+                    .arg(self.0.join("locked"))
+                    .arg("/grant")
+                    .arg(format!("{user}:(OI)(CI)F"))
+                    .status();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        std::fs::write(root.join("ok.txt"), b"hello").unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("secret.txt"), b"secret-data").unwrap();
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        let deny_user = format!("{user}:(RX)");
+        let commands: [&[&str]; 3] = [
+            &["/inheritance:r"],
+            &["/deny", deny_user.as_str()],
+            &["/deny", "*S-1-1-0:(RX)"],
+        ];
+        for args in commands {
+            let status = std::process::Command::new("icacls")
+                .arg(&locked)
+                .args(args)
+                .status()
+                .expect("icacls");
+            assert!(status.success(), "icacls failed");
+        }
+
+        let stats = local_path_stats(&root.display().to_string()).unwrap();
+        assert_eq!(stats.total_size, 5);
+        assert_eq!(stats.file_count, 1);
+        assert_eq!(stats.dir_count, 2);
+        assert!(local_path_stats(&locked.display().to_string()).is_err());
     }
 }
