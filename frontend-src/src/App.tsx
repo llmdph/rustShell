@@ -532,13 +532,21 @@ export default function App() {
 
   const profileSecretValue = (profile: Profile) =>
     profile.password || profileSecretDrafts[profile.id] || profileSecrets[profile.id] || "";
+  const sortedLocalFiles = useMemo(
+    () => sortFiles(visibleFiles(localFiles, showLocalHidden, ""), localSort),
+    [localFiles, localSort, showLocalHidden]
+  );
+  const sortedRemoteFiles = useMemo(
+    () => sortFiles(visibleFiles(remoteFiles, showRemoteHidden, ""), remoteSort),
+    [remoteFiles, remoteSort, showRemoteHidden]
+  );
   const baseVisibleLocalFiles = useMemo(
-    () => sortFiles(visibleFiles(localFiles, showLocalHidden, localFilter), localSort),
-    [localFiles, localFilter, localSort, showLocalHidden]
+    () => visibleFiles(sortedLocalFiles, true, localFilter),
+    [localFilter, sortedLocalFiles]
   );
   const baseVisibleRemoteFiles = useMemo(
-    () => sortFiles(visibleFiles(remoteFiles, showRemoteHidden, remoteFilter), remoteSort),
-    [remoteFiles, remoteFilter, remoteSort, showRemoteHidden]
+    () => visibleFiles(sortedRemoteFiles, true, remoteFilter),
+    [remoteFilter, sortedRemoteFiles]
   );
   const directoryCompare = useMemo(
     () =>
@@ -9231,6 +9239,7 @@ function bookmarkLabel(path: string) {
 
 function visibleFiles(files: FileEntry[], showHidden: boolean, filter: string) {
   const needle = filter.trim().toLowerCase();
+  if (showHidden && !needle) return files;
   return files.filter((file) => {
     if (!showHidden && isHiddenFile(file)) return false;
     if (!needle) return true;
@@ -9505,8 +9514,14 @@ function isHiddenFile(file: FileEntry) {
   return file.name.startsWith(".") && file.name !== "." && file.name !== "..";
 }
 
+const fileSearchTextCache = new WeakMap<FileEntry, string>();
+
 function fileSearchText(file: FileEntry) {
-  return `${file.name}\n${file.path}\n${file.linkTarget ?? ""}`.toLowerCase();
+  const cached = fileSearchTextCache.get(file);
+  if (cached !== undefined) return cached;
+  const text = `${file.name}\n${file.path}\n${file.linkTarget ?? ""}`.toLowerCase();
+  fileSearchTextCache.set(file, text);
+  return text;
 }
 
 function nextFileSort(current: FileSort, key: FileSortKey): FileSort {
@@ -9543,8 +9558,10 @@ function compareFileValue(
   return (modifiedAt?.get(left.path) ?? 0) - (modifiedAt?.get(right.path) ?? 0);
 }
 
+const fileNameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
 function compareText(left: string, right: string) {
-  return left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
+  return fileNameCollator.compare(left, right);
 }
 
 function duplicateName(name: string) {
