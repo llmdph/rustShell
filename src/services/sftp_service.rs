@@ -2280,8 +2280,13 @@ where
             )?;
             continue;
         }
-        // An existing file that will be left alone does not need to be opened.
+        // The listing already has the size. Asking again, once per file, makes
+        // a folder of existing files take as long as copying them.
         if matches!(conflict, TransferConflictStrategy::Skip) && local_path_exists(&local_path) {
+            if let Some(size) = stat.size {
+                note_skipped_bytes(transferred, total, size, on_progress);
+                continue;
+            }
             download_single_file(
                 sftp,
                 &remote_path,
