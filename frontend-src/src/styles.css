@@ -360,15 +360,15 @@ button:disabled {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  height: 34px;
+  height: 40px;
   min-width: 0;
-  padding: 0 4px 0 10px;
-  gap: 8px;
+  padding: 0 0 0 12px;
+  gap: 12px;
 }
 
 .titlebar .app-menu-bar {
-  width: 100%;
-  justify-content: center;
+  width: auto;
+  justify-content: flex-start;
 }
 
 .chrome .toolbar {
@@ -412,9 +412,16 @@ button:disabled {
   margin-left: auto;
 }
 
-.chrome .window-controls button {
-  width: 34px;
-  height: 26px;
+.titlebar .window-controls {
+  align-self: stretch;
+  height: 100%;
+  gap: 0;
+}
+
+.titlebar .window-controls button {
+  width: 46px;
+  height: 100%;
+  border-radius: 0;
 }
 
 .window-controls {
