@@ -1183,6 +1183,7 @@ where
             cancel,
             conflict,
             None,
+            None,
             &mut on_progress,
         )
         .context("failed to download file")?;
@@ -1677,6 +1678,14 @@ where
     Ok(())
 }
 
+fn trusted_listing_stat(stat: ssh2::FileStat) -> Option<ssh2::FileStat> {
+    if stat.size.is_some() && stat.perm.is_some() && stat.mtime.is_some() {
+        Some(stat)
+    } else {
+        None
+    }
+}
+
 fn reuse_or_open_remote(
     sftp: &ssh2::Sftp,
     remote_path: &Path,
@@ -1698,24 +1707,30 @@ fn download_single_file<F>(
     cancel: Arc<AtomicBool>,
     conflict: TransferConflictStrategy,
     mut opened: Option<ssh2::File>,
+    known: Option<ssh2::FileStat>,
     on_progress: &mut F,
 ) -> Result<()>
 where
     F: FnMut(u64, u64),
 {
+    let known = known.and_then(trusted_listing_stat);
     if matches!(conflict, TransferConflictStrategy::Skip) && local_path_exists(local_path) {
-        let size = sftp
-            .stat(remote_path)
-            .ok()
-            .and_then(|stat| stat.size)
-            .unwrap_or_default();
+        let size = known.and_then(|stat| stat.size).unwrap_or_else(|| {
+            sftp.stat(remote_path)
+                .ok()
+                .and_then(|stat| stat.size)
+                .unwrap_or_default()
+        });
         *transferred += size;
         on_progress(*transferred, total);
         return Ok(());
     }
-    let stat = sftp
-        .stat(remote_path)
-        .with_context(|| format!("failed to stat remote file {}", remote_path.display()))?;
+    let stat = if let Some(stat) = known {
+        stat
+    } else {
+        sftp.stat(remote_path)
+            .with_context(|| format!("failed to stat remote file {}", remote_path.display()))?
+    };
     replace_local_link_for_write(local_path, conflict)?;
     let (mut remote, mut local) =
         if matches!(conflict, TransferConflictStrategy::Resume) && local_path.exists() {
@@ -1836,7 +1851,7 @@ where
         };
         let local_path = local_dir.join(name);
         if stat.file_type().is_symlink() {
-            files.push((remote_path, local_path, true));
+            files.push((remote_path, local_path, true, stat));
         } else if stat.is_dir() {
             directories.push((
                 remote_path_text(&remote_path),
@@ -1846,7 +1861,7 @@ where
                 stat.mtime,
             ));
         } else {
-            files.push((remote_path, local_path, false));
+            files.push((remote_path, local_path, false, stat));
         }
         true
     });
@@ -1865,7 +1880,7 @@ where
 
     let mut listed_names = None;
 
-    for (remote_path, local_path, is_symlink) in files {
+    for (remote_path, local_path, is_symlink, stat) in files {
         if cancel.load(Ordering::Relaxed) {
             bail!("transfer cancelled");
         }
@@ -1893,6 +1908,7 @@ where
                 cancel.clone(),
                 conflict,
                 None,
+                trusted_listing_stat(stat),
                 on_progress,
             )?;
             continue;
@@ -1902,11 +1918,12 @@ where
         let opened = match sftp.open(&remote_path) {
             Ok(file) => file,
             Err(error) if sftp_item_is_unavailable(&error) => {
-                let size = sftp
-                    .lstat(&remote_path)
-                    .ok()
-                    .and_then(|stat| stat.size)
-                    .unwrap_or(0);
+                let size = trusted_listing_stat(stat).and_then(|stat| stat.size).unwrap_or_else(|| {
+                    sftp.lstat(&remote_path)
+                        .ok()
+                        .and_then(|stat| stat.size)
+                        .unwrap_or(0)
+                });
                 note_skipped_bytes(transferred, total, size, on_progress);
                 continue;
             }
@@ -1925,6 +1942,7 @@ where
             cancel.clone(),
             conflict,
             Some(opened),
+            trusted_listing_stat(stat),
             on_progress,
         )?;
     }
