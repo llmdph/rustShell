@@ -1027,6 +1027,26 @@ fn connect(profile: &SessionProfile, password: Option<&str>) -> Result<ssh2::Ses
     ssh::establish(profile, password).map_err(|error| anyhow!(error.to_string()))
 }
 
+
+fn copy_until_eof<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<()> {
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let mut offset = 0;
+        while offset < read {
+            let wrote = writer.write(&buffer[offset..read])?;
+            if wrote == 0 {
+                bail!("复制中断，没有写入新的数据");
+            }
+            offset += wrote;
+        }
+    }
+    Ok(())
+}
+
 fn copy_with_progress<R, W, F>(
     reader: &mut R,
     writer: &mut W,
@@ -1955,7 +1975,7 @@ fn copy_remote_path(
     let mut output = sftp
         .create(target)
         .with_context(|| format!("failed to create remote file {}", target.display()))?;
-    std::io::copy(&mut input, &mut output)
+    copy_until_eof(&mut input, &mut output)
         .with_context(|| format!("failed to copy remote file {}", source.display()))?;
     output.flush().ok();
     preserve_remote_owner(sftp, target, stat.uid, stat.gid);
