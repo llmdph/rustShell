@@ -1112,6 +1112,60 @@ where
     Ok(())
 }
 
+
+enum ResumeChoice {
+    Append(u64),
+    Complete,
+    Restart,
+    TargetLarger { target: u64, source: u64 },
+    SizeUnknown,
+}
+
+fn choose_resume(target_size: Option<u64>, source_size: Option<u64>) -> ResumeChoice {
+    if matches!(target_size, Some(0) | None) && source_size.is_none() {
+        return ResumeChoice::Restart;
+    }
+    let Some(source_size) = source_size else {
+        return ResumeChoice::SizeUnknown;
+    };
+    match target_size {
+        Some(target) if target > source_size => ResumeChoice::TargetLarger {
+            target,
+            source: source_size,
+        },
+        Some(target) if target > 0 && target < source_size => ResumeChoice::Append(target),
+        Some(target) if target == source_size && source_size > 0 => ResumeChoice::Complete,
+        _ => ResumeChoice::Restart,
+    }
+}
+
+fn resume_target_larger_message(
+    path: &Path,
+    target: u64,
+    source: u64,
+    target_is_local: bool,
+) -> String {
+    if target_is_local {
+        format!(
+            "无法续传 {}：本地文件比远程文件更大（本地 {} 字节，远程 {} 字节）。如需替换，请改用覆盖",
+            path.display(),
+            target,
+            source
+        )
+    } else {
+        format!(
+            "无法续传 {}：远程文件比本地文件更大（远程 {} 字节，本地 {} 字节）。如需替换，请改用覆盖",
+            path.display(),
+            target,
+            source
+        )
+    }
+}
+
+fn resume_size_unknown_message(path: &Path) -> String {
+    format!("无法续传 {}：无法确认远程文件大小，已保留现有文件。如需替换，请改用覆盖", path.display())
+}
+
 fn upload_single_file<F>(
     sftp: &ssh2::Sftp,
     local_path: &Path,
@@ -1135,42 +1189,55 @@ where
 
     let mut local = File::open(local_path)
         .with_context(|| format!("failed to open {}", local_path.display()))?;
-    let mut remote;
-    if matches!(conflict, TransferConflictStrategy::Resume) {
-        let remote_size = sftp
-            .stat(remote_path)
-            .ok()
-            .and_then(|stat| stat.size)
-            .unwrap_or_default();
-        if remote_size > 0 && remote_size < metadata.len() {
-            local
-                .seek(SeekFrom::Start(remote_size))
-                .with_context(|| format!("failed to seek {}", local_path.display()))?;
-            remote = sftp
-                .open_mode(remote_path, OpenFlags::WRITE, 0o644, OpenType::File)
-                .with_context(|| {
-                    format!("failed to resume remote file {}", remote_path.display())
-                })?;
-            remote
-                .seek(SeekFrom::Start(remote_size))
-                .with_context(|| format!("failed to seek remote file {}", remote_path.display()))?;
-            *transferred += remote_size;
-            on_progress(*transferred, total);
-        } else if remote_size == metadata.len() && metadata.len() > 0 {
-            *transferred += metadata.len();
-            on_progress(*transferred, total);
-            preserve_remote_metadata(sftp, remote_path, &metadata);
-            return Ok(());
+    let mut remote = if matches!(conflict, TransferConflictStrategy::Resume) {
+        if let Ok(stat) = sftp.stat(remote_path) {
+            match choose_resume(stat.size, Some(metadata.len())) {
+                ResumeChoice::Append(remote_size) => {
+                    local
+                        .seek(SeekFrom::Start(remote_size))
+                        .with_context(|| format!("failed to seek {}", local_path.display()))?;
+                    let mut remote = sftp
+                        .open_mode(remote_path, OpenFlags::WRITE, 0o644, OpenType::File)
+                        .with_context(|| {
+                            format!("failed to resume remote file {}", remote_path.display())
+                        })?;
+                    remote
+                        .seek(SeekFrom::Start(remote_size))
+                        .with_context(|| {
+                            format!("failed to seek remote file {}", remote_path.display())
+                        })?;
+                    *transferred += remote_size;
+                    on_progress(*transferred, total);
+                    remote
+                }
+                ResumeChoice::Complete => {
+                    *transferred += metadata.len();
+                    on_progress(*transferred, total);
+                    preserve_remote_metadata(sftp, remote_path, &metadata);
+                    return Ok(());
+                }
+                ResumeChoice::TargetLarger { target, source } => {
+                    bail!(
+                        "{}",
+                        resume_target_larger_message(remote_path, target, source, false)
+                    );
+                }
+                ResumeChoice::SizeUnknown => {
+                    bail!("{}", resume_size_unknown_message(remote_path));
+                }
+                ResumeChoice::Restart => sftp.create(remote_path).with_context(|| {
+                    format!("failed to create remote file {}", remote_path.display())
+                })?,
+            }
         } else {
-            remote = sftp.create(remote_path).with_context(|| {
+            sftp.create(remote_path).with_context(|| {
                 format!("failed to create remote file {}", remote_path.display())
-            })?;
+            })?
         }
     } else {
-        remote = sftp
-            .create(remote_path)
-            .with_context(|| format!("failed to create remote file {}", remote_path.display()))?;
-    }
+        sftp.create(remote_path)
+            .with_context(|| format!("failed to create remote file {}", remote_path.display()))?
+    };
     copy_with_progress_accum(
         &mut local,
         &mut remote,
@@ -1278,39 +1345,59 @@ where
     let stat = sftp
         .stat(remote_path)
         .with_context(|| format!("failed to stat remote file {}", remote_path.display()))?;
-    let remote_size = stat.size.unwrap_or_default();
-    let mut remote = sftp
-        .open(remote_path)
-        .with_context(|| format!("failed to open remote file {}", remote_path.display()))?;
-    let mut local;
-    if matches!(conflict, TransferConflictStrategy::Resume) && local_path.exists() {
-        let local_size = fs::metadata(local_path)
-            .with_context(|| format!("failed to stat {}", local_path.display()))?
-            .len();
-        if local_size > 0 && local_size < remote_size {
-            remote
-                .seek(SeekFrom::Start(local_size))
-                .with_context(|| format!("failed to seek remote file {}", remote_path.display()))?;
-            local = OpenOptions::new()
-                .append(true)
-                .open(local_path)
-                .with_context(|| format!("failed to resume {}", local_path.display()))?;
-            *transferred += local_size;
-            on_progress(*transferred, total);
-        } else if local_size == remote_size && remote_size > 0 {
-            *transferred += remote_size;
-            on_progress(*transferred, total);
-            preserve_local_permissions(local_path, stat.perm);
-            preserve_local_times(local_path, stat.atime, stat.mtime);
-            return Ok(());
+    let (mut remote, mut local) =
+        if matches!(conflict, TransferConflictStrategy::Resume) && local_path.exists() {
+            let local_size = fs::metadata(local_path)
+                .with_context(|| format!("failed to stat {}", local_path.display()))?
+                .len();
+            match choose_resume(Some(local_size), stat.size) {
+                ResumeChoice::Append(offset) => {
+                    let mut remote = sftp.open(remote_path).with_context(|| {
+                        format!("failed to open remote file {}", remote_path.display())
+                    })?;
+                    remote.seek(SeekFrom::Start(offset)).with_context(|| {
+                        format!("failed to seek remote file {}", remote_path.display())
+                    })?;
+                    *transferred += offset;
+                    on_progress(*transferred, total);
+                    let local = OpenOptions::new().append(true).open(local_path).with_context(
+                        || format!("failed to resume {}", local_path.display()),
+                    )?;
+                    (remote, local)
+                }
+                ResumeChoice::Complete => {
+                    *transferred += local_size;
+                    on_progress(*transferred, total);
+                    preserve_local_permissions(local_path, stat.perm);
+                    preserve_local_times(local_path, stat.atime, stat.mtime);
+                    return Ok(());
+                }
+                ResumeChoice::TargetLarger { target, source } => {
+                    bail!(
+                        "{}",
+                        resume_target_larger_message(local_path, target, source, true)
+                    );
+                }
+                ResumeChoice::SizeUnknown => {
+                    bail!("{}", resume_size_unknown_message(local_path));
+                }
+                ResumeChoice::Restart => {
+                    let remote = sftp.open(remote_path).with_context(|| {
+                        format!("failed to open remote file {}", remote_path.display())
+                    })?;
+                    let local = File::create(local_path)
+                        .with_context(|| format!("failed to create {}", local_path.display()))?;
+                    (remote, local)
+                }
+            }
         } else {
-            local = File::create(local_path)
+            let remote = sftp.open(remote_path).with_context(|| {
+                format!("failed to open remote file {}", remote_path.display())
+            })?;
+            let local = File::create(local_path)
                 .with_context(|| format!("failed to create {}", local_path.display()))?;
-        }
-    } else {
-        local = File::create(local_path)
-            .with_context(|| format!("failed to create {}", local_path.display()))?;
-    }
+            (remote, local)
+        };
     copy_with_progress_accum(
         &mut remote,
         &mut local,
@@ -2053,4 +2140,58 @@ fn validate_remote_relative_dir_path(path: &str) -> Result<Vec<&str>> {
         segments.push(segment);
     }
     Ok(segments)
+}
+
+#[cfg(test)]
+mod resume_choice_tests {
+    use super::{choose_resume, ResumeChoice};
+
+    #[test]
+    fn appends_when_existing_file_is_shorter() {
+        assert!(matches!(
+            choose_resume(Some(4), Some(10)),
+            ResumeChoice::Append(4)
+        ));
+    }
+
+    #[test]
+    fn skips_when_sizes_match() {
+        assert!(matches!(
+            choose_resume(Some(10), Some(10)),
+            ResumeChoice::Complete
+        ));
+    }
+
+    #[test]
+    fn restarts_when_there_is_nothing_to_keep() {
+        assert!(matches!(
+            choose_resume(Some(0), Some(10)),
+            ResumeChoice::Restart
+        ));
+        assert!(matches!(choose_resume(None, Some(10)), ResumeChoice::Restart));
+        assert!(matches!(choose_resume(Some(0), None), ResumeChoice::Restart));
+        assert!(matches!(
+            choose_resume(Some(0), Some(0)),
+            ResumeChoice::Restart
+        ));
+    }
+
+    #[test]
+    fn refuses_when_existing_file_is_larger() {
+        assert!(matches!(
+            choose_resume(Some(11), Some(10)),
+            ResumeChoice::TargetLarger {
+                target: 11,
+                source: 10
+            }
+        ));
+    }
+
+    #[test]
+    fn refuses_when_source_size_is_unknown_and_target_has_data() {
+        assert!(matches!(
+            choose_resume(Some(8), None),
+            ResumeChoice::SizeUnknown
+        ));
+    }
 }
