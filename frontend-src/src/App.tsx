@@ -8574,14 +8574,23 @@ function formatLastConnected(value?: string | null) {
 function shouldPromptForPassword(profile: Profile, message: string) {
   if (isLocalProtocol(profile.protocol)) return false;
   const normalized = message.toLowerCase();
-  return (
+  if (
     message.includes("需要输入密码") ||
+    message.includes("需要输入密钥口令") ||
     message.includes("认证失败") ||
     message.includes("拒绝认证") ||
-    message.includes("密码") ||
+    message.includes("密钥口令") ||
     normalized.includes("authentication") ||
-    normalized.includes("auth") ||
-    normalized.includes("permission denied") ||
+    normalized.includes("passphrase") ||
+    normalized.includes("password")
+  ) {
+    return true;
+  }
+  // A remote file can be permission-denied without the login itself failing.
+  if (!normalized.includes("permission denied")) return false;
+  return (
+    normalized.includes("publickey") ||
+    normalized.includes("keyboard-interactive") ||
     normalized.includes("password")
   );
 }
