@@ -40,7 +40,7 @@ impl std::fmt::Display for ConnectFailure {
                 write!(f, "主机密钥已变更,连接被阻止: {}", issue.fingerprint)
             }
             Self::HostKey(issue) => write!(f, "主机密钥未信任: {}", issue.fingerprint),
-            Self::PasswordRequired => write!(f, "需要输入密码"),
+            Self::PasswordRequired => write!(f, "需要输入密钥口令或密码"),
             Self::AuthRejected(message) => write!(f, "认证失败: {}", message),
             Self::Other(error) => write!(f, "{:#}", error),
         }
@@ -59,6 +59,12 @@ pub fn establish(
     profile: &SessionProfile,
     password: Option<&str>,
 ) -> Result<Session, ConnectFailure> {
+    // Ask for a password or key passphrase before opening a socket. The
+    // handshake is wasted work when we already know auth cannot succeed.
+    if secret_required_before_connect(profile, password) {
+        return Err(ConnectFailure::PasswordRequired);
+    }
+
     let tcp = connect_tcp(&profile.host, profile.port)?;
 
     let mut session = Session::new().context("无法创建 SSH 会话")?;
@@ -254,6 +260,9 @@ fn authenticate(
             if !key_path.exists() {
                 return Err(ConnectFailure::Other(anyhow!("密钥文件不存在: {}", path)));
             }
+            if password.is_none() && private_key_appears_encrypted(key_path) {
+                return Err(ConnectFailure::PasswordRequired);
+            }
             let public_key_path = public_key_path_for(key_path);
             let result = session.userauth_pubkey_file(
                 &profile.username,
@@ -262,14 +271,20 @@ fn authenticate(
                 password,
             );
             if let Err(error) = result {
-                // Retrying with a passphrase is the common fix for encrypted keys.
-                if password.is_none() {
+                let detail = error.to_string();
+                if password.is_none() && looks_like_passphrase_required(&detail) {
+                    return Err(ConnectFailure::PasswordRequired);
+                }
+                if password.is_some() && looks_like_passphrase_required(&detail) {
                     return Err(ConnectFailure::AuthRejected(format!(
-                        "密钥认证失败，可能需要输入密钥口令，或服务器未配置对应公钥: {}",
-                        error
+                        "密钥口令不正确，需要重新输入密码: {}",
+                        detail
                     )));
                 }
-                return Err(ConnectFailure::AuthRejected(error.to_string()));
+                return Err(ConnectFailure::AuthRejected(format!(
+                    "密钥认证失败，请确认密钥文件与服务器 authorized_keys: {}",
+                    detail
+                )));
             }
         }
         AuthProfile::Agent => {
@@ -287,6 +302,130 @@ fn authenticate(
         return Err(ConnectFailure::AuthRejected("服务器拒绝认证".to_owned()));
     }
     Ok(())
+}
+
+fn secret_required_before_connect(profile: &SessionProfile, password: Option<&str>) -> bool {
+    if password.is_some_and(|value| !value.is_empty()) {
+        return false;
+    }
+    match &profile.auth {
+        AuthProfile::Password => true,
+        AuthProfile::KeyFile { path } => private_key_appears_encrypted(Path::new(path)),
+        // Agent can succeed with no typed secret; only fall back after it fails.
+        AuthProfile::Agent => false,
+    }
+}
+
+fn private_key_appears_encrypted(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    private_key_bytes_encrypted(&bytes)
+}
+
+/// OpenSSH new-format keys keep the cipher name inside the base64 payload, so a
+/// text search for "aes256-ctr" or "encrypted" misses them and also
+/// false-positives on comments. Parse the header instead.
+fn private_key_bytes_encrypted(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("-----begin encrypted private key-----")
+        || lower.contains("proc-type: 4,encrypted")
+    {
+        return true;
+    }
+    if lower.contains("putty-user-key-file") {
+        return putty_key_encrypted(text);
+    }
+    if lower.contains("-----begin openssh private key-----") {
+        return openssh_private_key_encrypted(text);
+    }
+    false
+}
+
+fn putty_key_encrypted(text: &str) -> bool {
+    for line in text.lines() {
+        let lower = line.trim().to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("encryption:") {
+            return value.trim() != "none";
+        }
+    }
+    false
+}
+
+fn openssh_private_key_encrypted(text: &str) -> bool {
+    let Some(body) = openssh_armored_body(text) else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(body.as_bytes()) else {
+        return false;
+    };
+    const MAGIC: &[u8] = b"openssh-key-v1\0";
+    if !decoded.starts_with(MAGIC) {
+        return false;
+    }
+    let mut rest = &decoded[MAGIC.len()..];
+    match read_ssh_string(&mut rest) {
+        Some(cipher) => cipher != b"none",
+        None => false,
+    }
+}
+
+fn openssh_armored_body(text: &str) -> Option<String> {
+    let mut collecting = false;
+    let mut body = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("-----begin openssh private key-----") {
+            collecting = true;
+            continue;
+        }
+        if lower.starts_with("-----end ") {
+            break;
+        }
+        if collecting && !line.is_empty() {
+            body.push_str(line);
+        }
+    }
+    if body.is_empty() {
+        None
+    } else {
+        Some(body)
+    }
+}
+
+fn read_ssh_string<'a>(data: &mut &'a [u8]) -> Option<&'a [u8]> {
+    if data.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes(data[..4].try_into().ok()?) as usize;
+    *data = &data[4..];
+    if data.len() < len {
+        return None;
+    }
+    let (head, tail) = data.split_at(len);
+    *data = tail;
+    Some(head)
+}
+
+
+fn looks_like_passphrase_required(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "passphrase",
+        "password protected",
+        "bad decrypt",
+        "wrong passphrase",
+        "incorrect passphrase",
+        "key is encrypted",
+        "encrypted key",
+        "unable to decrypt",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn public_key_path_for(private_key_path: &Path) -> Option<std::path::PathBuf> {
@@ -326,4 +465,48 @@ fn authenticate_password(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod private_key_detection {
+    use super::private_key_bytes_encrypted;
+    use base64::Engine;
+
+    fn openssh_key(cipher: &str) -> Vec<u8> {
+        fn push_string(buf: &mut Vec<u8>, value: &[u8]) {
+            buf.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            buf.extend_from_slice(value);
+        }
+        let mut raw = b"openssh-key-v1\0".to_vec();
+        push_string(&mut raw, cipher.as_bytes());
+        push_string(&mut raw, b"none");
+        push_string(&mut raw, b"");
+        raw.extend_from_slice(&0u32.to_be_bytes());
+        let body = base64::engine::general_purpose::STANDARD.encode(raw);
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END OPENSSH PRIVATE KEY-----\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn detects_encrypted_openssh_and_pem_keys() {
+        assert!(private_key_bytes_encrypted(&openssh_key("aes256-ctr")));
+        assert!(!private_key_bytes_encrypted(&openssh_key("none")));
+        assert!(private_key_bytes_encrypted(
+            b"-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n-----END RSA PRIVATE KEY-----\n"
+        ));
+        assert!(private_key_bytes_encrypted(
+            b"-----BEGIN ENCRYPTED PRIVATE KEY-----\n-----END ENCRYPTED PRIVATE KEY-----\n"
+        ));
+        assert!(!private_key_bytes_encrypted(
+            b"-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n"
+        ));
+        assert!(private_key_bytes_encrypted(
+            b"PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: aes256-cbc\n"
+        ));
+        assert!(!private_key_bytes_encrypted(
+            b"PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\n"
+        ));
+    }
 }

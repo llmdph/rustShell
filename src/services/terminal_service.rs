@@ -337,7 +337,7 @@ fn run_ssh_shell(
         }
         Err(ConnectFailure::PasswordRequired) => {
             event_tx
-                .send(TerminalEvent::AuthFailed("需要输入密码".to_owned()))
+                .send(TerminalEvent::AuthFailed(ConnectFailure::PasswordRequired.to_string()))
                 .ok();
             return Ok(());
         }
