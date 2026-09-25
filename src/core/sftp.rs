@@ -764,12 +764,15 @@ fn separator_folded_contains(haystack: &str, needle: &str) -> bool {
 }
 
 fn folded_chars_match(
-    mut haystack: impl Iterator<Item = char>,
+    haystack: impl Iterator<Item = char>,
     needle: impl Iterator<Item = char>,
 ) -> bool {
-    for expected in needle {
+    // Lowercase can be longer than the original character. Comparing only the
+    // first letter makes a lowered search miss the capital it came from.
+    let mut haystack = haystack.flat_map(FoldedChars::new);
+    for expected in needle.flat_map(FoldedChars::new) {
         match haystack.next() {
-            Some(actual) if fold_path_char(actual) == fold_path_char(expected) => {}
+            Some(actual) if actual == expected => {}
             _ => return false,
         }
     }
@@ -784,11 +787,49 @@ fn fold_ascii_path_byte(byte: u8) -> u8 {
     }
 }
 
-fn fold_path_char(ch: char) -> char {
-    if ch == '\\' {
-        '/'
-    } else {
-        ch.to_lowercase().next().unwrap_or(ch)
+struct FoldedChars {
+    chars: [char; 3],
+    index: u8,
+    len: u8,
+}
+
+impl FoldedChars {
+    fn new(ch: char) -> Self {
+        let mut folded = Self {
+            chars: ['\0'; 3],
+            index: 0,
+            len: 0,
+        };
+        if ch == '\\' {
+            folded.chars[0] = '/';
+            folded.len = 1;
+            return folded;
+        }
+        for lower in ch.to_lowercase() {
+            if folded.len as usize >= folded.chars.len() {
+                break;
+            }
+            folded.chars[folded.len as usize] = lower;
+            folded.len += 1;
+        }
+        if folded.len == 0 {
+            folded.chars[0] = ch;
+            folded.len = 1;
+        }
+        folded
+    }
+}
+
+impl Iterator for FoldedChars {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        if self.index >= self.len {
+            return None;
+        }
+        let ch = self.chars[self.index as usize];
+        self.index += 1;
+        Some(ch)
     }
 }
 
@@ -1587,6 +1628,16 @@ mod tests {
             "\u{76ee}\u{5f55}\\\u{62a5}\u{544a}"
         ));
         assert!(!path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), "png"));
+        // Search lowercases the query first. U+0130 lowercases to two characters.
+        assert!(path_contains_query(
+            Path::new("\u{130}/rapor.txt"),
+            "i\u{0307}/rapor"
+        ));
+        assert!(path_contains_query(
+            Path::new("\u{130}\\rapor.txt"),
+            "\u{130}/rapor"
+        ));
+        assert!(!path_contains_query(Path::new("i/rapor.txt"), "i\u{0307}/rapor"));
     }
 
     #[test]
