@@ -262,6 +262,9 @@ function editorFileMetadata(file: TextFile): TextFile {
   return { ...file, content: "" };
 }
 
+// This text is not shown. Keeping it in state redrew the whole window.
+function setStatus(_message: string) {}
+
 export default function App() {
   const fileWindowParams = useMemo(() => {
     const params = new URLSearchParams(window.location.search);
@@ -292,7 +295,6 @@ export default function App() {
   const [secretProfileId, setSecretProfileId] = useState<string | null>(null);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [knownHostsText, setKnownHostsText] = useState("");
-  const [status, setStatus] = useState("就绪");
   const [hostSearch, setHostSearch] = useState("");
   const [sessionSearch, setSessionSearch] = useState("");
   const [leftPanelWidth, setLeftPanelWidth] = useState(defaultLeftPanelWidth);
