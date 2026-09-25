@@ -6957,6 +6957,26 @@ function FileList({
     setRange({ start: 0, end: 40 });
   }, [listIdentity]);
 
+  const revealedSelectionRef = useRef("");
+  const selectedPath = selected?.path ?? "";
+  useEffect(() => {
+    if (!selectedPath) {
+      revealedSelectionRef.current = "";
+      return;
+    }
+    if (revealedSelectionRef.current === selectedPath) return;
+    const index = files.findIndex((file) => file.path === selectedPath);
+    if (index < 0) return;
+    const node = listRef.current;
+    if (!node) return;
+    revealedSelectionRef.current = selectedPath;
+    const rowTop = FILE_ROW_HEIGHT * (index + 1);
+    const rowBottom = rowTop + FILE_ROW_HEIGHT;
+    if (rowTop >= node.scrollTop && rowBottom <= node.scrollTop + node.clientHeight) return;
+    node.scrollTop = Math.max(0, rowTop - Math.max(0, (node.clientHeight - FILE_ROW_HEIGHT) / 2));
+    updateRange();
+  }, [files, selectedPath, updateRange]);
+
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
       event.preventDefault();
