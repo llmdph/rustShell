@@ -41,7 +41,7 @@ use std::{
         Arc, Mutex, MutexGuard,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tauri::{
     menu::MenuBuilder,
@@ -470,6 +470,8 @@ struct TransferState {
     transferred: u64,
     total: u64,
     speed_bps: u64,
+    speed_base: u64,
+    speed_warmup_until: Option<Instant>,
     eta_seconds: Option<u64>,
     attempts: u32,
     started_at: Instant,
@@ -1598,6 +1600,8 @@ fn start_transfer_with_attempts(
         transferred: 0,
         total: 0,
         speed_bps: 0,
+        speed_base: 0,
+        speed_warmup_until: None,
         eta_seconds: None,
         attempts: attempts.max(1),
         started_at: Instant::now(),
@@ -1654,6 +1658,10 @@ fn start_transfer_with_attempts(
                     let mut guard = lock_poison_ok(&transfer_state);
                     guard.started_at = Instant::now();
                     guard.transferred = 0;
+                    guard.speed_bps = 0;
+                    guard.speed_base = 0;
+                    guard.speed_warmup_until = None;
+                    guard.eta_seconds = None;
                 }
                 match worker_direction {
                     TransferDirection::Upload => sftp_service::upload_with_sftp(
@@ -2536,12 +2544,26 @@ fn record_transfer_history(task: &TransferTask) {
 }
 
 fn update_transfer_progress(state: &Arc<Mutex<TransferState>>, transferred: u64, total: u64) {
+    const SPEED_WARMUP: Duration = Duration::from_millis(300);
     let mut guard = lock_poison_ok(state);
     guard.transferred = transferred;
     guard.total = total;
-    let elapsed = guard.started_at.elapsed().as_secs_f64();
+    let now = Instant::now();
+    let warmup_until = *guard
+        .speed_warmup_until
+        .get_or_insert_with(|| now + SPEED_WARMUP);
+    if now < warmup_until {
+        // A resumed file reports its existing bytes immediately. Keep that out
+        // of the speed, or the first sample looks impossibly fast.
+        guard.speed_base = transferred;
+        guard.speed_bps = 0;
+        guard.eta_seconds = None;
+        return;
+    }
+    let elapsed = now.duration_since(warmup_until).as_secs_f64();
+    let fresh = transferred.saturating_sub(guard.speed_base);
     if elapsed > 0.0 {
-        guard.speed_bps = (transferred as f64 / elapsed) as u64;
+        guard.speed_bps = (fresh as f64 / elapsed) as u64;
         guard.eta_seconds = if guard.speed_bps > 0 && total > transferred {
             Some((total - transferred).div_ceil(guard.speed_bps))
         } else {
