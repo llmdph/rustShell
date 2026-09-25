@@ -3486,7 +3486,9 @@ export default function App() {
         localListGenerationRef.current += 1;
         setLocalFiles(listing.entries);
         setLocalDirTruncated(listing.truncated);
+        localSearchRef.current = null;
         setLocalSearch(null);
+        setLocalFilter("");
         clearLocalSelection();
         setStatus(`本地 ${next}`);
         if (next !== localPath) skipNextLocalListRef.current = true;
@@ -3499,7 +3501,9 @@ export default function App() {
       remoteListGenerationRef.current += 1;
       setRemoteFiles(listing.entries);
       setRemoteDirTruncated(listing.truncated);
+      remoteSearchRef.current = null;
       setRemoteSearch(null);
+      setRemoteFilter("");
       clearRemoteSelection();
       setStatus(`远程 ${activeProfile.host}:${next}`);
       if (next !== remotePath) skipNextRemoteListRef.current = true;
@@ -3508,9 +3512,23 @@ export default function App() {
       if (side === "remote" && requestActiveProfileSecretIfNeeded(error)) return;
       const parentPath = parentPathForSide(side, next);
       if (side === "local") {
-        navigateLocalPath(parentPath, next);
+        localSearchRef.current = null;
+        setLocalSearch(null);
+        setLocalFilter("");
+        if (normalizeLocalComparablePath(parentPath) === normalizeLocalComparablePath(localPath)) {
+          await refreshLocalFiles(next);
+        } else {
+          navigateLocalPath(parentPath, next);
+        }
       } else {
-        navigateRemotePath(parentPath, next);
+        remoteSearchRef.current = null;
+        setRemoteSearch(null);
+        setRemoteFilter("");
+        if (normalizeRemotePath(parentPath) === normalizeRemotePath(remotePath)) {
+          await refreshRemoteFiles(next);
+        } else {
+          navigateRemotePath(parentPath, next);
+        }
       }
       pushToast("info", "已定位到链接目标所在目录");
     }
