@@ -543,13 +543,17 @@ export default function App() {
 
   const profileSecretValue = (profile: Profile) =>
     profile.password || profileSecretDrafts[profile.id] || profileSecrets[profile.id] || "";
+  // A search asked for these names. The hidden-file switch only applies to the
+  // open folder, otherwise a match is counted and then left out of the list.
+  const localSearchOpen = localSearch !== null;
+  const remoteSearchOpen = remoteSearch !== null;
   const sortedLocalFiles = useMemo(
-    () => sortFiles(visibleFiles(localFiles, showLocalHidden, ""), localSort),
-    [localFiles, localSort, showLocalHidden]
+    () => sortFiles(visibleFiles(localFiles, showLocalHidden || localSearchOpen, ""), localSort),
+    [localFiles, localSearchOpen, localSort, showLocalHidden]
   );
   const sortedRemoteFiles = useMemo(
-    () => sortFiles(visibleFiles(remoteFiles, showRemoteHidden, ""), remoteSort),
-    [remoteFiles, remoteSort, showRemoteHidden]
+    () => sortFiles(visibleFiles(remoteFiles, showRemoteHidden || remoteSearchOpen, ""), remoteSort),
+    [remoteFiles, remoteSearchOpen, remoteSort, showRemoteHidden]
   );
   const baseVisibleLocalFiles = useMemo(
     () => visibleFiles(sortedLocalFiles, true, localFilter),
@@ -583,8 +587,16 @@ export default function App() {
     directoryCompare.summary.different +
     directoryCompare.summary.onlyLocal +
     directoryCompare.summary.onlyRemote;
-  const baseVisibleSelectedLocal = visibleSelection(selectedLocal, showLocalHidden, localFilter);
-  const baseVisibleSelectedRemote = visibleSelection(selectedRemote, showRemoteHidden, remoteFilter);
+  const baseVisibleSelectedLocal = visibleSelection(
+    selectedLocal,
+    showLocalHidden || localSearchOpen,
+    localFilter
+  );
+  const baseVisibleSelectedRemote = visibleSelection(
+    selectedRemote,
+    showRemoteHidden || remoteSearchOpen,
+    remoteFilter
+  );
   const visibleSelectedLocal = selectionVisibleInFiles(baseVisibleSelectedLocal, visibleLocalFiles);
   const visibleSelectedRemote = selectionVisibleInFiles(baseVisibleSelectedRemote, visibleRemoteFiles);
   const visibleSelectedLocalEntries = useMemo(
