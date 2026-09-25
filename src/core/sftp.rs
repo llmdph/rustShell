@@ -601,16 +601,17 @@ fn local_entry_from_path(path_buf: PathBuf, metadata: fs::Metadata) -> FileEntry
         .modified()
         .map(DateTime::<Utc>::from)
         .unwrap_or_else(|_| DateTime::<Utc>::from(SystemTime::UNIX_EPOCH));
+    // Junctions are reparse points, not symlinks, but they still point elsewhere.
     let is_symlink = metadata.file_type().is_symlink();
-    let link_target = if is_symlink {
-        fs::read_link(&path_buf)
-            .ok()
-            .map(|target| target.display().to_string())
+    let read_target = if is_symlink || is_reparse_point(&metadata) {
+        fs::read_link(&path_buf).ok()
     } else {
         None
     };
-    let is_dir = metadata.is_dir() && !is_symlink;
-    let file_type = if is_symlink {
+    let is_link = is_symlink || read_target.is_some();
+    let link_target = read_target.map(|target| target.display().to_string());
+    let is_dir = metadata.is_dir() && !is_link;
+    let file_type = if is_link {
         "symlink"
     } else if is_dir {
         "directory"
@@ -970,6 +971,51 @@ mod tests {
             std::fs::read(&created).unwrap(),
             b""
         );
+    }
+
+
+    #[test]
+    fn directory_link_is_listed_as_a_link() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-list-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let link = self.0.join("listed").join("link");
+                let _ = std::fs::remove_file(&link);
+                let _ = std::fs::remove_dir(&link);
+                let _ = std::fs::remove_file(self.0.join("outside").join("secret.txt"));
+                let _ = std::fs::remove_dir(self.0.join("outside"));
+                let _ = std::fs::remove_dir(self.0.join("listed"));
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        let listed = root.join("listed");
+        std::fs::create_dir(&listed).unwrap();
+        let link = listed.join("link");
+        make_directory_link(&outside, &link);
+
+        let listing = list_local_dir(&listed.display().to_string()).unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "link");
+        assert_eq!(listing.entries[0].file_type, "symlink");
+        assert!(!listing.entries[0].is_dir);
+        let target = listing.entries[0].link_target.clone().unwrap_or_default();
+        assert!(target.contains("outside"), "{target}");
+
+        let found = search_local(&listed.display().to_string(), "secret", 10).unwrap();
+        assert!(found.entries.is_empty());
     }
 
     #[test]
