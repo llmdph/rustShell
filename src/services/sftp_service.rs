@@ -1025,6 +1025,7 @@ where
             total,
             &mut transferred,
             conflict,
+            None,
             &mut on_progress,
         )
         .context("failed to upload symlink")?;
@@ -1447,12 +1448,17 @@ fn upload_symlink<F>(
     total: u64,
     transferred: &mut u64,
     conflict: TransferConflictStrategy,
+    known_exists: Option<bool>,
     on_progress: &mut F,
 ) -> Result<()>
 where
     F: FnMut(u64, u64),
 {
-    if sftp.lstat(remote_path).is_ok() {
+    let exists = match known_exists {
+        Some(exists) => exists,
+        None => sftp.lstat(remote_path).is_ok(),
+    };
+    if exists {
         if matches!(
             conflict,
             TransferConflictStrategy::Skip | TransferConflictStrategy::Resume
@@ -1578,13 +1584,17 @@ where
     let metadata = fs::metadata(local_path)
         .with_context(|| format!("failed to stat {}", local_path.display()))?;
     // A folder upload already checked this and does not open a file it will skip.
-    if opened.is_none()
-        && matches!(conflict, TransferConflictStrategy::Skip)
-        && sftp.lstat(remote_path).is_ok()
-    {
-        *transferred += metadata.len();
-        on_progress(*transferred, total);
-        return Ok(());
+    if opened.is_none() && matches!(conflict, TransferConflictStrategy::Skip) {
+        let exists = match &known_remote {
+            RemoteStatCache::Missing => false,
+            RemoteStatCache::Found(_) => true,
+            RemoteStatCache::Unknown => sftp.lstat(remote_path).is_ok(),
+        };
+        if exists {
+            *transferred += metadata.len();
+            on_progress(*transferred, total);
+            return Ok(());
+        }
     }
 
     // One lookup decides resume. A finished file can return before it is opened.
@@ -1626,9 +1636,17 @@ where
         None => File::open(local_path)
             .with_context(|| format!("failed to open {}", local_path.display()))?,
     };
-    // Resume already refused a link. Checking again would ask about every file.
+    // Resume already refused a link. A folder listing answers this for the
+    // other files, so only an unknown name asks the server again.
     if !matches!(conflict, TransferConflictStrategy::Resume) {
-        replace_remote_link_for_write(sftp, remote_path, conflict)?;
+        match &known_remote {
+            RemoteStatCache::Missing => {}
+            RemoteStatCache::Found(stat) if !stat.file_type().is_symlink() => {}
+            RemoteStatCache::Found(_) => apply_known_remote_link(sftp, remote_path, conflict)?,
+            RemoteStatCache::Unknown => {
+                replace_remote_link_for_write(sftp, remote_path, conflict)?;
+            }
+        }
     }
     let mut remote = if let Some(remote_size) = resume_append_at {
         local
@@ -1663,6 +1681,124 @@ where
     Ok(())
 }
 
+
+#[derive(Clone, Copy)]
+enum ListedRemote<'a> {
+    Unknown,
+    Missing,
+    Found(&'a ssh2::FileStat),
+}
+
+impl ListedRemote<'_> {
+    fn known_exists(self) -> Option<bool> {
+        match self {
+            Self::Unknown => None,
+            Self::Missing => Some(false),
+            Self::Found(_) => Some(true),
+        }
+    }
+}
+
+enum FoldedName {
+    One(String),
+    Many,
+}
+
+#[derive(Default)]
+struct RemoteUploadListing {
+    by_name: HashMap<String, ssh2::FileStat>,
+    by_folded: HashMap<String, FoldedName>,
+}
+
+impl RemoteUploadListing {
+    fn remember(&mut self, name: String, stat: ssh2::FileStat) {
+        let folded = name.to_lowercase();
+        let same_name = matches!(
+            self.by_folded.get(&folded),
+            Some(FoldedName::One(existing)) if existing == &name
+        );
+        let missing = !self.by_folded.contains_key(&folded);
+        if missing {
+            self.by_folded
+                .insert(folded, FoldedName::One(name.clone()));
+        } else if !same_name {
+            self.by_folded.insert(folded, FoldedName::Many);
+        }
+        self.by_name.insert(name, stat);
+    }
+
+    fn get(&self, name: &str) -> ListedRemote<'_> {
+        if let Some(stat) = self.by_name.get(name) {
+            return listed_stat(stat);
+        }
+        let original = match self.by_folded.get(&name.to_lowercase()) {
+            Some(FoldedName::One(original)) => original.clone(),
+            // Two files differ only by letter case. Ask the server which path
+            // this exact name is, instead of writing over the wrong one.
+            Some(FoldedName::Many) => return ListedRemote::Unknown,
+            None => return ListedRemote::Missing,
+        };
+        match self.by_name.get(&original) {
+            Some(stat) => listed_stat(stat),
+            None => ListedRemote::Unknown,
+        }
+    }
+}
+
+fn listed_stat(stat: &ssh2::FileStat) -> ListedRemote<'_> {
+    if stat.perm.is_some() {
+        ListedRemote::Found(stat)
+    } else {
+        ListedRemote::Unknown
+    }
+}
+
+fn listed_remote<'a>(
+    listing: Option<&'a RemoteUploadListing>,
+    remote_path: &str,
+) -> ListedRemote<'a> {
+    match listing {
+        Some(listing) => listing.get(remote_basename(remote_path)),
+        None => ListedRemote::Unknown,
+    }
+}
+
+fn remote_basename(path: &str) -> &str {
+    path.rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+}
+
+fn remote_upload_listing(
+    sftp: &ssh2::Sftp,
+    remote_dir: &str,
+    cancel: &AtomicBool,
+) -> Result<Option<RemoteUploadListing>> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("transfer cancelled");
+    }
+    let mut listing = RemoteUploadListing::default();
+    let mut cancelled = false;
+    let visited = visit_remote_entries(sftp, Path::new(remote_dir), None, |path, stat| {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            return false;
+        }
+        if let Some(name) = path.file_name() {
+            listing.remember(name.to_string_lossy().into_owned(), stat);
+        }
+        true
+    });
+    if cancelled || cancel.load(Ordering::Relaxed) {
+        bail!("transfer cancelled");
+    }
+    match visited {
+        Ok(_) => Ok(Some(listing)),
+        // Keep the old per-file checks when this directory cannot be listed.
+        Err(_) => Ok(None),
+    }
+}
+
 fn upload_dir_recursive<F>(
     sftp: &ssh2::Sftp,
     local_dir: &Path,
@@ -1685,10 +1821,35 @@ where
         Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
         Err(_) => return Ok(()),
     };
+    let mut local_entries = Vec::new();
+    for entry in entries {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("transfer cancelled");
+        }
+        local_entries.push(entry);
+    }
+    // An empty folder has nothing to compare with the server.
+    if local_entries.is_empty() {
+        return Ok(());
+    }
+    // One listing answers existence and link type for every child. Resume
+    // still checks each file immediately: a size from this listing would be
+    // stale by the time a later file is appended.
+    let remote_names = if matches!(conflict, TransferConflictStrategy::Resume) {
+        None
+    } else {
+        remote_upload_listing(sftp, remote_dir, &cancel)?
+    };
     // Read this folder's names once, and only after a file actually needs a
     // numbered copy. Later files reuse that list instead of reading it again.
-    let mut listed_names = None;
-    for entry in entries {
+    let mut listed_names = remote_names.as_ref().map(|listing| {
+        listing
+            .by_name
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>()
+    });
+    for entry in local_entries {
         if cancel.load(Ordering::Relaxed) {
             bail!("transfer cancelled");
         }
@@ -1717,6 +1878,7 @@ where
                 total,
                 transferred,
                 conflict,
+                listed_remote(remote_names.as_ref(), &remote_path).known_exists(),
                 on_progress,
             )?;
         } else if metadata.is_dir() {
@@ -1727,7 +1889,12 @@ where
                 conflict,
                 &mut listed_names,
             )?;
-            if !open_remote_upload_dir(sftp, Path::new(&remote_path), conflict)? {
+            if !open_listed_remote_dir(
+                sftp,
+                Path::new(&remote_path),
+                conflict,
+                listed_remote(remote_names.as_ref(), &remote_path),
+            )? {
                 add_skipped_local_tree(&local_path, transferred, total, &cancel, on_progress)?;
                 continue;
             }
@@ -1751,44 +1918,59 @@ where
                 conflict,
                 &mut listed_names,
             )?;
+            let listed = listed_remote(remote_names.as_ref(), &remote_path);
             // An existing file that will be left alone does not need to be opened.
-            if matches!(conflict, TransferConflictStrategy::Skip)
-                && remote_path_exists(sftp, Path::new(&remote_path))
-            {
-                *transferred += metadata.len();
-                on_progress(*transferred, total);
-                continue;
+            if matches!(conflict, TransferConflictStrategy::Skip) {
+                let exists = match listed {
+                    ListedRemote::Found(_) => true,
+                    ListedRemote::Missing => false,
+                    ListedRemote::Unknown => {
+                        remote_path_exists(sftp, Path::new(&remote_path))
+                    }
+                };
+                if exists {
+                    *transferred += metadata.len();
+                    on_progress(*transferred, total);
+                    continue;
+                }
             }
             // Resume can see a finished file from one lookup. Opening it first
-            // locks every completed file in the folder.
+            // locks every completed file in the folder. Other conflicts reuse
+            // the listing instead of asking about this name again.
             let known_remote = if matches!(conflict, TransferConflictStrategy::Resume) {
                 remote_resume_cache(sftp, Path::new(&remote_path))?
             } else {
-                RemoteStatCache::Unknown
+                match listed {
+                    ListedRemote::Found(stat) => RemoteStatCache::Found(stat.clone()),
+                    ListedRemote::Missing => RemoteStatCache::Missing,
+                    ListedRemote::Unknown => RemoteStatCache::Unknown,
+                }
             };
-            if let RemoteStatCache::Found(stat) = &known_remote {
-                match choose_resume(stat.size, Some(metadata.len())) {
-                    ResumeChoice::Complete => {
-                        *transferred += metadata.len();
-                        on_progress(*transferred, total);
-                        preserve_remote_metadata(sftp, Path::new(&remote_path), &metadata);
-                        continue;
+            if matches!(conflict, TransferConflictStrategy::Resume) {
+                if let RemoteStatCache::Found(stat) = &known_remote {
+                    match choose_resume(stat.size, Some(metadata.len())) {
+                        ResumeChoice::Complete => {
+                            *transferred += metadata.len();
+                            on_progress(*transferred, total);
+                            preserve_remote_metadata(sftp, Path::new(&remote_path), &metadata);
+                            continue;
+                        }
+                        ResumeChoice::TargetLarger { target, source } => {
+                            bail!(
+                                "{}",
+                                resume_target_larger_message(
+                                    Path::new(&remote_path),
+                                    target,
+                                    source,
+                                    false
+                                )
+                            );
+                        }
+                        ResumeChoice::SizeUnknown => {
+                            bail!("{}", resume_size_unknown_message(Path::new(&remote_path)));
+                        }
+                        ResumeChoice::Append(_) | ResumeChoice::Restart => {}
                     }
-                    ResumeChoice::TargetLarger { target, source } => {
-                        bail!(
-                            "{}",
-                            resume_target_larger_message(
-                                Path::new(&remote_path),
-                                target,
-                                source,
-                                false
-                            )
-                        );
-                    }
-                    ResumeChoice::SizeUnknown => {
-                        bail!("{}", resume_size_unknown_message(Path::new(&remote_path)));
-                    }
-                    ResumeChoice::Append(_) | ResumeChoice::Restart => {}
                 }
             }
             // Keep this handle for the copy. A second open can fail on a busy
@@ -2700,6 +2882,52 @@ fn remote_path_is_link(sftp: &ssh2::Sftp, path: &Path) -> bool {
     sftp.lstat(path)
         .ok()
         .is_some_and(|stat| stat.file_type().is_symlink())
+}
+
+fn apply_known_remote_link(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    conflict: TransferConflictStrategy,
+) -> Result<()> {
+    match directory_link_action(conflict) {
+        DirectoryLinkAction::Replace => sftp
+            .unlink(path)
+            .with_context(|| format!("failed to replace remote link {}", path.display())),
+        DirectoryLinkAction::Skip | DirectoryLinkAction::Refuse => bail!(REMOTE_LINK_KEPT),
+    }
+}
+
+fn open_listed_remote_dir(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    conflict: TransferConflictStrategy,
+    listed: ListedRemote<'_>,
+) -> Result<bool> {
+    match listed {
+        ListedRemote::Unknown => open_remote_upload_dir(sftp, path, conflict),
+        ListedRemote::Found(stat) if stat.file_type().is_symlink() => {
+            if matches!(directory_link_action(conflict), DirectoryLinkAction::Skip) {
+                return Ok(false);
+            }
+            apply_known_remote_link(sftp, path, conflict)?;
+            ensure_remote_dir(sftp, path)?;
+            Ok(true)
+        }
+        ListedRemote::Found(stat) if stat.is_dir() => Ok(true),
+        ListedRemote::Found(_) => {
+            bail!(
+                "remote path exists and is not a directory: {}",
+                path.display()
+            )
+        }
+        ListedRemote::Missing => match sftp.mkdir(path, 0o755) {
+            Ok(()) => Ok(true),
+            Err(_) => {
+                ensure_remote_dir(sftp, path)?;
+                Ok(true)
+            }
+        },
+    }
 }
 
 fn open_remote_upload_dir(
@@ -3728,6 +3956,8 @@ mod text_boundary_tests {
 
 #[cfg(test)]
 mod remote_move_tests {
+    use super::{ListedRemote, RemoteUploadListing};
+
     #[test]
     fn remote_move_does_not_land_inside_the_source() {
         assert!(super::remote_move_lands_inside("/a/box", "/a/box/child/box"));
@@ -3735,6 +3965,35 @@ mod remote_move_tests {
         assert!(!super::remote_move_lands_inside("/a/box", "/a/box2/box"));
         assert!(!super::remote_move_lands_inside("/a/file", "/b/file"));
         assert!(super::remote_move_lands_inside("/a/box", "/a/box/../box/child"));
+    }
+
+    #[test]
+    fn upload_listing_finds_one_different_case_and_a_missing_name() {
+        let mut listing = RemoteUploadListing::default();
+        listing.remember("Foo.txt".to_owned(), upload_listing_stat());
+        assert!(matches!(listing.get("Foo.txt"), ListedRemote::Found(_)));
+        assert!(matches!(listing.get("foo.txt"), ListedRemote::Found(_)));
+        assert!(matches!(listing.get("other.txt"), ListedRemote::Missing));
+    }
+
+    #[test]
+    fn upload_listing_asks_again_when_two_names_differ_only_by_case() {
+        let mut listing = RemoteUploadListing::default();
+        listing.remember("Foo.txt".to_owned(), upload_listing_stat());
+        listing.remember("foo.txt".to_owned(), upload_listing_stat());
+        assert!(matches!(listing.get("foo.txt"), ListedRemote::Found(_)));
+        assert!(matches!(listing.get("FOO.txt"), ListedRemote::Unknown));
+    }
+
+    fn upload_listing_stat() -> ssh2::FileStat {
+        ssh2::FileStat {
+            size: Some(1),
+            uid: None,
+            gid: None,
+            perm: Some(0o100644),
+            atime: None,
+            mtime: None,
+        }
     }
 
     #[test]
