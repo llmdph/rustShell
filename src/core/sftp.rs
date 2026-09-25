@@ -13,7 +13,6 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 const LOCAL_TEXT_PREVIEW_LIMIT: u64 = 1024 * 1024;
-const LOCAL_TEXT_CHARSET_PROBE: u64 = 64 * 1024;
 pub const DIR_ENTRY_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -835,31 +834,42 @@ fn charset_label_for_code_page(code_page: u32) -> &'static str {
 }
 
 fn local_text_encoding(path: &Path) -> std::io::Result<&'static encoding_rs::Encoding> {
-    let mut file = fs::File::open(path)?;
-    let mut bytes = Vec::new();
-    std::io::Read::by_ref(&mut file)
-        .take(LOCAL_TEXT_CHARSET_PROBE + 1)
-        .read_to_end(&mut bytes)?;
-    let truncated = bytes.len() as u64 > LOCAL_TEXT_CHARSET_PROBE;
-    if truncated {
-        bytes.truncate(LOCAL_TEXT_CHARSET_PROBE as usize);
-    }
-    if local_bytes_are_utf8(&bytes, truncated) {
+    if local_file_is_utf8(path)? {
         Ok(encoding_rs::UTF_8)
     } else {
         Ok(local_fallback_charset())
     }
 }
 
-fn local_bytes_are_utf8(bytes: &[u8], trim_suffix: bool) -> bool {
-    if !trim_suffix {
-        return std::str::from_utf8(bytes).is_ok();
+fn local_file_is_utf8(path: &Path) -> std::io::Result<bool> {
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut pending = [0_u8; 3];
+    let mut pending_len = 0_usize;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(pending_len == 0);
+        }
+        let mut chunk = [0_u8; 8 * 1024 + 3];
+        chunk[..pending_len].copy_from_slice(&pending[..pending_len]);
+        chunk[pending_len..pending_len + read].copy_from_slice(&buffer[..read]);
+        let end = pending_len + read;
+        match std::str::from_utf8(&chunk[..end]) {
+            Ok(_) => pending_len = 0,
+            Err(error) => {
+                if error.error_len().is_some() {
+                    return Ok(false);
+                }
+                let rest = &chunk[error.valid_up_to()..end];
+                if rest.len() > pending.len() {
+                    return Ok(false);
+                }
+                pending[..rest.len()].copy_from_slice(rest);
+                pending_len = rest.len();
+            }
+        }
     }
-    // Only a cut sample may end on a partial character. Trimming a complete
-    // file can make a non-UTF-8 tail look like UTF-8.
-    let mut sample = bytes.to_vec();
-    trim_partial_utf8_suffix(&mut sample);
-    std::str::from_utf8(&sample).is_ok()
 }
 
 fn local_text_from_bytes(bytes: &[u8], trim_prefix: bool, trim_suffix: bool) -> String {
@@ -1287,6 +1297,39 @@ mod tests {
     }
 
     #[test]
+    fn local_text_encoding_reads_past_the_first_chunk() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-local-charset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let path = root.join("sample.txt");
+
+        let mut utf8 = Vec::new();
+        while utf8.len() < 9_000 {
+            utf8.extend_from_slice("\u{4e2d}".as_bytes());
+        }
+        std::fs::write(&path, &utf8).unwrap();
+        assert!(local_file_is_utf8(&path).unwrap());
+
+        let mut bytes = vec![b'a'; 9_000];
+        bytes.push(0xFF);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(!local_file_is_utf8(&path).unwrap());
+    }
+
+    #[test]
     fn local_text_round_trip_keeps_utf8_and_the_system_encoding() {
         let root = std::env::temp_dir().join(format!(
             "rustshell-local-text-{}-{}",
@@ -1318,7 +1361,7 @@ mod tests {
             "\u{4e2d}\u{6587}!".as_bytes()
         );
 
-        let probe = LOCAL_TEXT_CHARSET_PROBE as usize;
+        let probe = 64 * 1024;
         let mut raw = Vec::new();
         while raw.len() <= probe + 4 {
             raw.extend_from_slice("\u{4e2d}".as_bytes());
@@ -1352,6 +1395,23 @@ mod tests {
         let (expected, _, expected_unmappable) = encoding.encode("\u{4e2d}\u{6587}\u{4e2d}");
         assert!(!expected_unmappable);
         assert_eq!(std::fs::read(&legacy_path).unwrap(), expected.as_ref());
+
+        let mut prefixed = vec![b'A'; 64 * 1024 + 32];
+        prefixed.extend_from_slice(&encoded);
+        assert!(std::str::from_utf8(&prefixed).is_err());
+        let late_path = root.join("late-legacy.txt");
+        std::fs::write(&late_path, &prefixed).unwrap();
+        let late = late_path.display().to_string();
+        let read = local_read_text_file(&late).unwrap();
+        assert!(read.content.starts_with("AAAA"));
+        assert!(read.content.ends_with("\u{4e2d}\u{6587}"));
+        let rewritten = format!("{}\u{4e2d}", read.content);
+        local_write_text_file(&late, &rewritten).unwrap();
+        let (late_expected, _, late_unmappable) = encoding.encode(&rewritten);
+        assert!(!late_unmappable);
+        let saved = std::fs::read(&late_path).unwrap();
+        assert_eq!(saved, late_expected.as_ref());
+        assert_ne!(saved, rewritten.as_bytes());
 
         let (_emoji, _, emoji_unmappable) = encoding.encode("\u{1f600}");
         if emoji_unmappable {
