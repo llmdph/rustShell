@@ -1591,6 +1591,9 @@ where
         Err(_) if cancel.load(Ordering::Relaxed) => bail!("transfer cancelled"),
         Err(_) => return Ok(()),
     };
+    // Read this folder's names once, and only after a file actually needs a
+    // numbered copy. Later files reuse that list instead of reading it again.
+    let mut listed_names = None;
     for entry in entries {
         if cancel.load(Ordering::Relaxed) {
             bail!("transfer cancelled");
@@ -1606,7 +1609,13 @@ where
             Err(_) => continue,
         };
         if local_path_is_link(&local_path, &metadata) {
-            let remote_path = resolve_remote_child_path(sftp, remote_dir, &remote_name, conflict)?;
+            let remote_path = remote_child_for_conflict(
+                sftp,
+                remote_dir,
+                &remote_name,
+                conflict,
+                &mut listed_names,
+            )?;
             upload_symlink(
                 sftp,
                 &local_path,
@@ -1617,7 +1626,13 @@ where
                 on_progress,
             )?;
         } else if metadata.is_dir() {
-            let remote_path = resolve_remote_child_path(sftp, remote_dir, &remote_name, conflict)?;
+            let remote_path = remote_child_for_conflict(
+                sftp,
+                remote_dir,
+                &remote_name,
+                conflict,
+                &mut listed_names,
+            )?;
             if !open_remote_upload_dir(sftp, Path::new(&remote_path), conflict)? {
                 add_skipped_local_tree(&local_path, transferred, total, &cancel, on_progress)?;
                 continue;
@@ -1639,7 +1654,13 @@ where
                 note_skipped_bytes(transferred, total, metadata.len(), on_progress);
                 continue;
             }
-            let remote_path = resolve_remote_child_path(sftp, remote_dir, &remote_name, conflict)?;
+            let remote_path = remote_child_for_conflict(
+                sftp,
+                remote_dir,
+                &remote_name,
+                conflict,
+                &mut listed_names,
+            )?;
             upload_single_file(
                 sftp,
                 &local_path,
@@ -1834,22 +1855,13 @@ where
         bail!("transfer cancelled");
     }
 
+    let mut listed_names = None;
+
     for (remote_path, local_path, is_symlink) in files {
         if cancel.load(Ordering::Relaxed) {
             bail!("transfer cancelled");
         }
-        let local_path = resolve_local_path(&local_path, conflict)?;
-        if is_symlink {
-            download_symlink(
-                sftp,
-                &remote_path,
-                &local_path,
-                total,
-                transferred,
-                conflict,
-                on_progress,
-            )?;
-        } else {
+        if !is_symlink {
             match sftp.open(&remote_path) {
                 Ok(file) => drop(file),
                 Err(error) if sftp_item_is_unavailable(&error) => {
@@ -1867,6 +1879,20 @@ where
                     });
                 }
             }
+        }
+        let local_path =
+            local_child_for_conflict(&local_path, conflict, &mut listed_names)?;
+        if is_symlink {
+            download_symlink(
+                sftp,
+                &remote_path,
+                &local_path,
+                total,
+                transferred,
+                conflict,
+                on_progress,
+            )?;
+        } else {
             download_single_file(
                 sftp,
                 &remote_path,
@@ -1884,7 +1910,8 @@ where
         if cancel.load(Ordering::Relaxed) {
             bail!("transfer cancelled");
         }
-        let local_path = resolve_local_path(&local_path, conflict)?;
+        let local_path =
+            local_child_for_conflict(&local_path, conflict, &mut listed_names)?;
         if !open_local_download_dir(&local_path, conflict)? {
             let skipped = match remote_total_size(sftp, Path::new(&remote_child), &cancel) {
                 Ok(size) => size,
@@ -1997,6 +2024,16 @@ fn resolve_remote_child_path(
     name: &str,
     conflict: TransferConflictStrategy,
 ) -> Result<String> {
+    resolve_remote_child_path_with_names(sftp, parent, name, conflict, None)
+}
+
+fn resolve_remote_child_path_with_names(
+    sftp: &ssh2::Sftp,
+    parent: &str,
+    name: &str,
+    conflict: TransferConflictStrategy,
+    known_names: Option<&mut Option<HashSet<String>>>,
+) -> Result<String> {
     let candidate = remote_child_path(parent, name);
     if !matches!(conflict, TransferConflictStrategy::Rename)
         || !remote_path_exists(sftp, Path::new(&candidate))
@@ -2012,21 +2049,67 @@ fn resolve_remote_child_path(
     }
 
     // Later numbers can run into the hundreds. One directory listing is cheaper
-    // than asking the server about every number.
-    if let Some(names) = remote_directory_names(sftp, parent) {
-        if let Some(next_name) = next_free_numbered_name(&stem, &suffix, &names, 2) {
-            return Ok(remote_child_path(parent, &next_name));
-        }
-    } else {
-        for index in 2..10_000 {
-            let next_name = numbered_copy_name(&stem, &suffix, index);
-            let next_path = remote_child_path(parent, &next_name);
-            if !remote_path_exists(sftp, Path::new(&next_path)) {
-                return Ok(next_path);
-            }
-        }
+    // than asking the server about every number, and the rest of this folder
+    // reuses that listing.
+    if let Some(next_name) = next_free_remote_name(sftp, parent, &stem, &suffix, known_names) {
+        return Ok(remote_child_path(parent, &next_name));
     }
     bail!("failed to allocate unique remote path for {}", candidate)
+}
+
+fn next_free_remote_name(
+    sftp: &ssh2::Sftp,
+    parent: &str,
+    stem: &str,
+    suffix: &str,
+    known_names: Option<&mut Option<HashSet<String>>>,
+) -> Option<String> {
+    if let Some(known) = known_names {
+        if known.is_none() {
+            *known = remote_directory_names(sftp, parent);
+        }
+        if let Some(names) = known.as_mut() {
+            return take_free_remote_name(sftp, parent, stem, suffix, names);
+        }
+    } else if let Some(names) = remote_directory_names(sftp, parent) {
+        return next_free_numbered_name(stem, suffix, &names, 2);
+    }
+
+    for index in 2..10_000 {
+        let next_name = numbered_copy_name(stem, suffix, index);
+        let next_path = remote_child_path(parent, &next_name);
+        if !remote_path_exists(sftp, Path::new(&next_path)) {
+            return Some(next_name);
+        }
+    }
+    None
+}
+
+fn take_free_remote_name(
+    sftp: &ssh2::Sftp,
+    parent: &str,
+    stem: &str,
+    suffix: &str,
+    names: &mut HashSet<String>,
+) -> Option<String> {
+    loop {
+        let next_name = next_free_numbered_name(stem, suffix, names, 2)?;
+        let next_path = remote_child_path(parent, &next_name);
+        names.insert(next_name.clone());
+        if !remote_path_exists(sftp, Path::new(&next_path)) {
+            return Some(next_name);
+        }
+    }
+}
+
+fn remote_child_for_conflict(
+    sftp: &ssh2::Sftp,
+    parent: &str,
+    name: &str,
+    conflict: TransferConflictStrategy,
+    listed: &mut Option<HashSet<String>>,
+) -> Result<String> {
+    resolve_remote_child_path_with_names(sftp, parent, name, conflict, Some(listed))
 }
 
 fn remote_directory_names(sftp: &ssh2::Sftp, parent: &str) -> Option<HashSet<String>> {
@@ -2131,6 +2214,14 @@ fn resolve_local_child_path(
 }
 
 fn resolve_local_path(path: &Path, conflict: TransferConflictStrategy) -> Result<PathBuf> {
+    resolve_local_path_with_names(path, conflict, None)
+}
+
+fn resolve_local_path_with_names(
+    path: &Path,
+    conflict: TransferConflictStrategy,
+    known_names: Option<&mut Option<HashSet<String>>>,
+) -> Result<PathBuf> {
     if !matches!(conflict, TransferConflictStrategy::Rename) || !local_path_exists(path) {
         return Ok(path.to_path_buf());
     }
@@ -2147,22 +2238,62 @@ fn resolve_local_path(path: &Path, conflict: TransferConflictStrategy) -> Result
         return Ok(first_path);
     }
 
-    if let Some(names) = local_directory_names(parent) {
-        if let Some(next_name) = next_free_numbered_name(&stem, &suffix, &names, 2) {
-            return Ok(parent.join(next_name));
-        }
-    } else {
-        for index in 2..10_000 {
-            let candidate = parent.join(numbered_copy_name(&stem, &suffix, index));
-            if !local_path_exists(&candidate) {
-                return Ok(candidate);
-            }
-        }
+    if let Some(next_name) = next_free_local_name(parent, &stem, &suffix, known_names) {
+        return Ok(parent.join(next_name));
     }
     bail!(
         "failed to allocate unique local path for {}",
         path.display()
     )
+}
+
+fn next_free_local_name(
+    parent: &Path,
+    stem: &str,
+    suffix: &str,
+    known_names: Option<&mut Option<HashSet<String>>>,
+) -> Option<String> {
+    if let Some(known) = known_names {
+        if known.is_none() {
+            *known = local_directory_names(parent);
+        }
+        if let Some(names) = known.as_mut() {
+            return take_free_local_name(parent, stem, suffix, names);
+        }
+    } else if let Some(names) = local_directory_names(parent) {
+        return next_free_numbered_name(stem, suffix, &names, 2);
+    }
+
+    for index in 2..10_000 {
+        let next_name = numbered_copy_name(stem, suffix, index);
+        if !local_path_exists(&parent.join(&next_name)) {
+            return Some(next_name);
+        }
+    }
+    None
+}
+
+fn take_free_local_name(
+    parent: &Path,
+    stem: &str,
+    suffix: &str,
+    names: &mut HashSet<String>,
+) -> Option<String> {
+    loop {
+        let next_name = next_free_numbered_name(stem, suffix, names, 2)?;
+        names.insert(fold_local_file_name(&next_name));
+        if !local_path_exists(&parent.join(&next_name)) {
+            return Some(next_name);
+        }
+    }
+}
+
+fn local_child_for_conflict(
+    path: &Path,
+    conflict: TransferConflictStrategy,
+    listed: &mut Option<HashSet<String>>,
+) -> Result<PathBuf> {
+    resolve_local_path_with_names(path, conflict, Some(listed))
 }
 
 fn local_directory_names(parent: &Path) -> Option<HashSet<String>> {
@@ -3467,5 +3598,17 @@ mod numbered_copy_tests {
             resolved.file_name().and_then(|name| name.to_str()),
             Some("report (1).txt")
         );
+    }
+
+    #[test]
+    fn a_numbered_name_taken_from_the_list_is_not_offered_again() {
+        let mut occupied = HashSet::new();
+        occupied.insert("report.txt".to_owned());
+        occupied.insert("report (1).txt".to_owned());
+        let first = next_free_numbered_name("report", ".txt", &occupied, 2).unwrap();
+        occupied.insert(first.clone());
+        let second = next_free_numbered_name("report", ".txt", &occupied, 2).unwrap();
+        assert_eq!(first, "report (2).txt");
+        assert_eq!(second, "report (3).txt");
     }
 }
