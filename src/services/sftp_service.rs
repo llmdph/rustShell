@@ -1920,13 +1920,20 @@ fn resolve_remote_move_target(
         bail!("remote target path is empty");
     }
 
-    if let Ok(stat) = sftp.stat(Path::new(&target)) {
+    if let Ok(stat) = sftp.lstat(Path::new(&target)) {
+        if stat.file_type().is_symlink() {
+            bail!("remote target is a link");
+        }
         if stat.is_dir() {
             let source_name = Path::new(source)
                 .file_name()
                 .ok_or_else(|| anyhow!("remote file name is missing"))?
                 .to_string_lossy();
-            return Ok(remote_child_path(&target, &source_name));
+            let destination = remote_child_path(&target, &source_name);
+            if remote_move_lands_inside(source, &destination) {
+                bail!("remote target is inside the source");
+            }
+            return Ok(destination);
         }
         bail!("remote target already exists: {}", target);
     }
@@ -1934,7 +1941,51 @@ fn resolve_remote_move_target(
     if target.ends_with('/') {
         bail!("remote target directory does not exist: {}", target);
     }
+    if remote_move_lands_inside(source, &target) {
+        bail!("remote target is inside the source");
+    }
     Ok(target)
+}
+
+fn remote_move_lands_inside(source: &str, destination: &str) -> bool {
+    let source = normalize_remote_move_path(source);
+    let destination = normalize_remote_move_path(destination);
+    if source.is_empty() || source == "." {
+        return false;
+    }
+    if source == "/" {
+        return destination != "/";
+    }
+    destination == source || destination.starts_with(&(source.clone() + "/"))
+}
+
+fn normalize_remote_move_path(path: &str) -> String {
+    let trimmed = path.trim();
+    let absolute = trimmed.starts_with('/');
+    let mut parts = Vec::new();
+    for part in trimmed.split(['/', '\\']) {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            if parts.last().is_some_and(|item| *item != "..") {
+                parts.pop();
+            } else if !absolute {
+                parts.push("..");
+            }
+            continue;
+        }
+        parts.push(part);
+    }
+    if absolute {
+        if parts.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("/{}", parts.join("/"))
+        }
+    } else {
+        parts.join("/")
+    }
 }
 
 fn resolve_local_child_path(
@@ -2662,6 +2713,18 @@ mod text_boundary_tests {
         bytes.pop();
         trim_partial_text_suffix(&mut bytes, "utf-8");
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), "你");
+    }
+}
+
+#[cfg(test)]
+mod remote_move_tests {
+    #[test]
+    fn remote_move_does_not_land_inside_the_source() {
+        assert!(super::remote_move_lands_inside("/a/box", "/a/box/child/box"));
+        assert!(super::remote_move_lands_inside("/a/box", "/a/box"));
+        assert!(!super::remote_move_lands_inside("/a/box", "/a/box2/box"));
+        assert!(!super::remote_move_lands_inside("/a/file", "/b/file"));
+        assert!(super::remote_move_lands_inside("/a/box", "/a/box/../box/child"));
     }
 }
 

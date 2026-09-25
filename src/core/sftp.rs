@@ -275,11 +275,25 @@ pub fn local_duplicate(path: &str, new_name: &str) -> std::io::Result<String> {
 pub fn local_move(path: &str, target_path: &str) -> std::io::Result<String> {
     let source = PathBuf::from(path);
     let mut target = PathBuf::from(target_path);
-    if target.is_dir() {
-        let file_name = source.file_name().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "无法确定文件名")
-        })?;
-        target = target.join(file_name);
+    if let Ok(metadata) = fs::symlink_metadata(&target) {
+        if local_path_is_link(&target, &metadata) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "目标是链接，没有把文件移进链接指向的位置",
+            ));
+        }
+        if metadata.is_dir() {
+            let file_name = source.file_name().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "无法确定文件名")
+            })?;
+            target = target.join(file_name);
+        }
+    }
+    if local_move_lands_inside(&source, &target) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "不能把项目移动到它自己或它里面",
+        ));
     }
     if local_path_exists(&target) {
         return Err(std::io::Error::new(
@@ -289,6 +303,22 @@ pub fn local_move(path: &str, target_path: &str) -> std::io::Result<String> {
     }
     fs::rename(&source, &target)?;
     Ok(target.display().to_string())
+}
+
+fn local_move_lands_inside(source: &Path, destination: &Path) -> bool {
+    let source = local_move_cmp(source);
+    let destination = local_move_cmp(destination);
+    destination == source || destination.starts_with(&source)
+}
+
+fn local_move_cmp(path: &Path) -> PathBuf {
+    let mut text = path.to_string_lossy().replace('/', "\\");
+    while text.len() > 3 && text.ends_with('\\') {
+        text.pop();
+    }
+    #[cfg(windows)]
+    let text = text.to_lowercase();
+    PathBuf::from(text)
 }
 
 pub fn local_touch(path: &str, mtime: u64, recursive: bool) -> std::io::Result<()> {
@@ -1052,6 +1082,51 @@ mod tests {
 
         let found = search_local(&listed.display().to_string(), "secret", 10).unwrap();
         assert!(found.entries.is_empty());
+    }
+
+    #[test]
+    fn move_does_not_enter_a_directory_link_or_its_own_child() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-move-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let link = self.0.join("link");
+                let _ = std::fs::remove_file(&link);
+                let _ = std::fs::remove_dir(&link);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.join("link");
+        make_directory_link(&real, &link);
+        let source = root.join("keep.txt");
+        std::fs::write(&source, b"keep").unwrap();
+
+        let error = local_move(&source.display().to_string(), &link.display().to_string()).unwrap_err();
+        assert!(error.to_string().contains("\u94fe\u63a5"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"keep");
+        assert!(!real.join("keep.txt").exists());
+
+        let moved = local_move(&source.display().to_string(), &real.display().to_string()).unwrap();
+        assert_eq!(std::fs::read(&moved).unwrap(), b"keep");
+
+        let tree = root.join("box");
+        let child = tree.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let error = local_move(&tree.display().to_string(), &child.display().to_string()).unwrap_err();
+        assert!(error.to_string().contains("\u81ea\u5df1"));
+        assert!(child.is_dir());
+        assert!(tree.is_dir());
     }
 
     #[test]
