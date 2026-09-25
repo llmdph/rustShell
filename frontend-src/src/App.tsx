@@ -192,6 +192,11 @@ type AppEvents = {
 
 const defaultFileSort: FileSort = { key: "name", direction: "asc" };
 const emptyCompareMarks = new Map<string, FileCompareMark>();
+const emptyDirectoryCompare: DirectoryCompare = {
+  local: emptyCompareMarks,
+  remote: emptyCompareMarks,
+  summary: { same: 0, different: 0, onlyLocal: 0, onlyRemote: 0 }
+};
 const terminalSnippets = ["pwd", "ls -la", "df -h", "free -h", "ps aux | head", "whoami"];
 const defaultLeftPanelWidth = 272;
 const defaultRightPanelWidth = 386;
@@ -531,8 +536,11 @@ export default function App() {
     [remoteFiles, remoteFilter, remoteSort, showRemoteHidden]
   );
   const directoryCompare = useMemo(
-    () => buildDirectoryCompare(baseVisibleLocalFiles, baseVisibleRemoteFiles),
-    [baseVisibleLocalFiles, baseVisibleRemoteFiles]
+    () =>
+      compareDirectories
+        ? buildDirectoryCompare(baseVisibleLocalFiles, baseVisibleRemoteFiles)
+        : emptyDirectoryCompare,
+    [baseVisibleLocalFiles, baseVisibleRemoteFiles, compareDirectories]
   );
   const visibleLocalFiles = useMemo(
     () => filterCompareView(baseVisibleLocalFiles, directoryCompare.local, compareDirectories ? compareView : "all"),
