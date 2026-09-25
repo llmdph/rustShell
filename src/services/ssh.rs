@@ -13,8 +13,14 @@ use ssh2::{
     Prompt, Session,
 };
 use std::{
+    io,
     net::{TcpStream, ToSocketAddrs},
     path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread,
     time::Duration,
 };
 
@@ -83,6 +89,8 @@ pub fn establish(
     Ok(session)
 }
 
+const CONNECT_ATTEMPT_STAGGER: Duration = Duration::from_millis(250);
+
 fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ConnectFailure> {
     let addrs: Vec<_> = (host, port)
         .to_socket_addrs()
@@ -91,23 +99,91 @@ fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ConnectFailure> {
     if addrs.is_empty() {
         return Err(ConnectFailure::Other(anyhow!("无法解析主机 {}", host)));
     }
+    if addrs.len() == 1 {
+        return tcp_connect_result(host, port, connect_one_address(&addrs[0]));
+    }
 
-    let mut last_error = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-            Ok(stream) => {
-                stream.set_nodelay(true).ok();
-                return Ok(stream);
-            }
-            Err(error) => last_error = Some(error),
+    // The first address is often one that never answers. Waiting out its
+    // timeout makes every later address look unreachable.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let mut started = 0usize;
+    for (index, addr) in addrs.iter().copied().enumerate() {
+        let tx = tx.clone();
+        let cancel = Arc::clone(&cancel);
+        let spawned = thread::Builder::new()
+            .name(format!("connect-{}", index))
+            .spawn(move || {
+                if index > 0 {
+                    thread::sleep(CONNECT_ATTEMPT_STAGGER * index as u32);
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let _ = tx.send(connect_one_address(&addr));
+            });
+        if let Ok(handle) = spawned {
+            started += 1;
+            // Joining would wait for an address that already lost the race.
+            drop(handle);
         }
     }
-    Err(ConnectFailure::Other(anyhow!(
-        "无法连接 {}:{} — {}",
+    drop(tx);
+    if started == 0 {
+        return tcp_connect_result(
+            host,
+            port,
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "failed to start connection",
+            )),
+        );
+    }
+
+    let mut last_error = None;
+    let mut failures = addrs.len() - started;
+    while failures < addrs.len() {
+        match rx.recv() {
+            Ok(Ok(stream)) => {
+                cancel.store(true, Ordering::Relaxed);
+                return Ok(stream);
+            }
+            Ok(Err(error)) => {
+                last_error = Some(error);
+                failures += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    tcp_connect_result(
         host,
         port,
-        last_error.map(|e| e.to_string()).unwrap_or_default()
-    )))
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "connection timed out")
+        })),
+    )
+}
+
+fn connect_one_address(addr: &std::net::SocketAddr) -> io::Result<TcpStream> {
+    let stream = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT)?;
+    stream.set_nodelay(true).ok();
+    Ok(stream)
+}
+
+fn tcp_connect_result(
+    host: &str,
+    port: u16,
+    result: io::Result<TcpStream>,
+) -> Result<TcpStream, ConnectFailure> {
+    match result {
+        Ok(stream) => Ok(stream),
+        Err(error) => Err(ConnectFailure::Other(anyhow!(
+            "无法连接 {}:{} — {}",
+            host,
+            port,
+            error
+        ))),
+    }
 }
 
 fn verify_host_key(session: &Session, host: &str, port: u16) -> Result<(), ConnectFailure> {
