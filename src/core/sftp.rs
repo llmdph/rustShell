@@ -923,13 +923,23 @@ fn copy_dir_entries(source: &Path, target: &Path, fail_if_unreadable: bool) -> s
             copy_local_symlink(&child_source, &child_target)?;
         } else if child_metadata.is_dir() {
             copy_dir_entries(&child_source, &child_target, false)?;
-        } else {
-            fs::copy(&child_source, &child_target)?;
+        } else if copy_nested_file(&child_source, &child_target)? {
             preserve_local_metadata(&child_target, &child_metadata)?;
         }
     }
     preserve_local_metadata(target, &metadata)?;
     Ok(())
+}
+
+
+fn copy_nested_file(source: &Path, target: &Path) -> std::io::Result<bool> {
+    // A locked or unreadable file is skipped. Failure to create or write the
+    // destination still stops the copy, so a full disk is not reported as success.
+    if fs::File::open(source).is_err() {
+        return Ok(false);
+    }
+    fs::copy(source, target)?;
+    Ok(true)
 }
 
 fn preserve_local_metadata(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
@@ -1477,6 +1487,58 @@ mod tests {
         assert_eq!(std::fs::read(copied.join("ok.txt")).unwrap(), b"hello");
         assert!(copied.join("locked").is_dir());
         assert!(!copied.join("locked").join("secret.txt").exists());
+        assert!(local_duplicate(&locked.display().to_string(), "locked-copy").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn duplicating_a_folder_skips_an_unreadable_file() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-dup-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let user = std::env::var("USERNAME").unwrap_or_default();
+                let _ = std::process::Command::new("icacls")
+                    .arg(self.0.join("source").join("locked.txt"))
+                    .arg("/grant")
+                    .arg(format!("{user}:F"))
+                    .status();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let source = root.join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("ok.txt"), b"hello").unwrap();
+        let locked = source.join("locked.txt");
+        std::fs::write(&locked, b"secret").unwrap();
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        let deny_user = format!("{user}:(RD)");
+        let commands: [&[&str]; 2] = [
+            &["/deny", deny_user.as_str()],
+            &["/deny", "*S-1-1-0:(RD)"],
+        ];
+        for args in commands {
+            let status = std::process::Command::new("icacls")
+                .arg(&locked)
+                .args(args)
+                .status()
+                .expect("icacls");
+            assert!(status.success(), "icacls failed");
+        }
+
+        let copied = local_duplicate(&source.display().to_string(), "copy").unwrap();
+        let copied = std::path::PathBuf::from(copied);
+        assert_eq!(std::fs::read(copied.join("ok.txt")).unwrap(), b"hello");
+        assert!(!copied.join("locked.txt").exists());
         assert!(local_duplicate(&locked.display().to_string(), "locked-copy").is_err());
     }
 
