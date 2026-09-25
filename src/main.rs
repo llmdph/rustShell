@@ -22,7 +22,7 @@ use crate::{
             search_local as search_local_impl, DirListing, FileEntry, FileSearchResult, LocalPathStats,
             LocalTextFile, TransferConflictStrategy, TransferDirection, DIR_ENTRY_LIMIT,
         },
-        terminal::{HostKeyIssue, TerminalModel, TerminalSize, TerminalStatus},
+        terminal::{decode_pending, HostKeyIssue, TerminalModel, TerminalSize, TerminalStatus},
     },
     services::{
         sftp_pool, sftp_service, ssh,
@@ -790,20 +790,25 @@ async fn terminal_drain(
     blocking(move || {
         let state = app.state::<AppRuntime>();
     let id = parse_uuid(&terminal_id)?;
-    let mut terminals = lock(&state.terminals)?;
-    let terminal = terminals
-        .get_mut(&id)
-        .ok_or_else(|| "终端不存在或已关闭".to_owned())?;
-    let output = terminal.drain_output();
-    Ok(TerminalDrain {
-        id: terminal.id.to_string(),
-        status: status_name(terminal.status).to_owned(),
-        status_label: terminal.status.label(),
-        output,
-        last_error: terminal.last_error.clone(),
-        host_key_issue: terminal.host_key_issue.clone(),
-        current_directory: terminal.current_directory.clone(),
-    })
+    let (pending, decoder, mut snapshot) = {
+        let mut terminals = lock(&state.terminals)?;
+        let terminal = terminals
+            .get_mut(&id)
+            .ok_or_else(|| "终端不存在或已关闭".to_owned())?;
+        let (pending, decoder) = terminal.pump_pending_output();
+        let snapshot = TerminalDrain {
+            id: terminal.id.to_string(),
+            status: status_name(terminal.status).to_owned(),
+            status_label: terminal.status.label(),
+            output: String::new(),
+            last_error: terminal.last_error.clone(),
+            host_key_issue: terminal.host_key_issue.clone(),
+            current_directory: terminal.current_directory.clone(),
+        };
+        (pending, decoder, snapshot)
+    };
+    snapshot.output = decode_pending(&decoder, &pending);
+    Ok(snapshot)
     }).await
 }
 

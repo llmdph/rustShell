@@ -186,12 +186,12 @@ pub struct TerminalModel {
     history: HistoryBuffer,
     pending_output: Vec<u8>,
     osc_scan_buffer: Vec<u8>,
-    output_decoder: Decoder,
+    output_decoder: Arc<Mutex<Decoder>>,
 }
 
 impl TerminalModel {
     pub fn new(profile: SessionProfile, size: TerminalSize) -> Self {
-        let output_decoder = terminal_encoding(&profile.charset).new_decoder();
+        let output_decoder = Arc::new(Mutex::new(terminal_encoding(&profile.charset).new_decoder()));
         Self {
             id: Uuid::new_v4(),
             title: profile.name.clone(),
@@ -273,7 +273,7 @@ impl TerminalModel {
         if trim_bounded_prefix(&mut self.pending_output, TERMINAL_PENDING_CAP, &self.profile.charset).is_some() {
             // Unread bytes were discarded, including any continuation the
             // decoder was waiting on. Start clean at the aligned boundary.
-            self.output_decoder = terminal_encoding(&self.profile.charset).new_decoder();
+            *lock_decoder(&self.output_decoder) = terminal_encoding(&self.profile.charset).new_decoder();
         }
     }
 
@@ -294,16 +294,23 @@ impl TerminalModel {
     }
 
     pub fn drain_output(&mut self) -> String {
+        let (output, decoder) = self.pump_pending_output();
+        decode_pending(&decoder, &output)
+    }
+
+    /// Pump and detach the bytes so the caller can decode them without holding
+    /// the terminal map lock. Typing stays responsive while a large chunk is decoded.
+    pub fn pump_pending_output(&mut self) -> (Vec<u8>, Arc<Mutex<Decoder>>) {
         self.pump_events();
         let output = std::mem::take(&mut self.pending_output);
-        decode_terminal_stream(&mut self.output_decoder, &output)
+        (output, Arc::clone(&self.output_decoder))
     }
 
     /// The replay string already contains this output. Drop it so the next
     /// drain does not write the same bytes into the terminal again.
     pub fn discard_replayed_output(&mut self) {
         self.pending_output.clear();
-        self.output_decoder = terminal_encoding(&self.profile.charset).new_decoder();
+        *lock_decoder(&self.output_decoder) = terminal_encoding(&self.profile.charset).new_decoder();
     }
 
     pub fn encode_input(&self, text: &str) -> Vec<u8> {
@@ -407,6 +414,18 @@ fn percent_decode(value: &str) -> String {
 
 fn terminal_encoding(charset: &str) -> &'static Encoding {
     Encoding::for_label(charset.trim().as_bytes()).unwrap_or(UTF_8)
+}
+
+
+fn lock_decoder(decoder: &Mutex<Decoder>) -> std::sync::MutexGuard<'_, Decoder> {
+    match decoder.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+pub(crate) fn decode_pending(decoder: &Mutex<Decoder>, bytes: &[u8]) -> String {
+    decode_terminal_stream(&mut lock_decoder(decoder), bytes)
 }
 
 fn decode_terminal_bytes(charset: &str, bytes: &[u8]) -> String {
