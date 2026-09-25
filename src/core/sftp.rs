@@ -598,7 +598,10 @@ pub(crate) fn text_contains_query(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    if haystack.is_ascii() && needle.is_ascii() {
+    if haystack.is_ascii() {
+        if !needle.is_ascii() {
+            return false;
+        }
         let needle_bytes = needle.as_bytes();
         return haystack
             .as_bytes()
@@ -987,6 +990,7 @@ mod tests {
         assert!(text_contains_query("notes.txt", "TXT"));
         assert!(text_contains_query("\u{76ee}\u{5f55}/\u{62a5}\u{544a}.txt", "\u{62a5}\u{544a}"));
         assert!(!text_contains_query("notes.txt", "png"));
+        assert!(!text_contains_query("notes.txt", "\u{62a5}\u{544a}"));
         assert!(path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), "notes"));
         assert!(path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), "projects/notes"));
         assert!(!path_contains_query(Path::new(r"C:\Projects\Notes.TXT"), "png"));
