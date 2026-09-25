@@ -124,10 +124,70 @@ fn lock_pty_output(queue: &Mutex<PtyOutputQueue>) -> std::sync::MutexGuard<'_, P
     queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+struct PtyExitSignal {
+    code: Mutex<Option<Option<i32>>>,
+    ready: Condvar,
+}
+
+impl PtyExitSignal {
+    fn new() -> Self {
+        Self {
+            code: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+fn lock_exit_code(signal: &PtyExitSignal) -> std::sync::MutexGuard<'_, Option<Option<i32>>> {
+    signal.code.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn signal_pty_exit(signal: &PtyExitSignal, code: Option<i32>) {
+    let mut guard = lock_exit_code(signal);
+    if guard.is_some() {
+        return;
+    }
+    *guard = Some(code);
+    signal.ready.notify_one();
+}
+
+fn pty_exit_is_signaled(signal: &PtyExitSignal) -> bool {
+    lock_exit_code(signal).is_some()
+}
+
+/// Queue the closed state only after the caller has recorded the exit code.
+/// Output already sent on this channel stays ahead of it.
+fn finish_pty_session(signal: &PtyExitSignal, event_tx: &Sender<TerminalEvent>) {
+    let code = {
+        let mut guard = lock_exit_code(signal);
+        loop {
+            if let Some(code) = *guard {
+                break code;
+            }
+            guard = signal
+                .ready
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    };
+    event_tx
+        .send(TerminalEvent::Disconnected { exit_code: code })
+        .ok();
+}
+
+struct ExitOnDrop(Arc<PtyExitSignal>);
+
+impl Drop for ExitOnDrop {
+    fn drop(&mut self) {
+        signal_pty_exit(&self.0, None);
+    }
+}
+
 fn spawn_pty_output_reader(
     reader: Box<dyn Read + Send>,
     event_tx: Sender<TerminalEvent>,
-) -> std::io::Result<()> {
+) -> std::io::Result<Arc<PtyExitSignal>> {
+    let signal = Arc::new(PtyExitSignal::new());
     let queue = Arc::new(Mutex::new(PtyOutputQueue {
         chunks: VecDeque::new(),
         bytes: 0,
@@ -138,22 +198,25 @@ fn spawn_pty_output_reader(
     let sender_queue = Arc::clone(&queue);
     let sender_ready = Arc::clone(&ready);
     let sender_tx = event_tx.clone();
+    let sender_signal = Arc::clone(&signal);
     thread::Builder::new()
         .name("pty-output".to_owned())
-        .spawn(move || send_pty_output(sender_queue, sender_ready, sender_tx))?;
+        .spawn(move || send_pty_output(sender_queue, sender_ready, sender_tx, sender_signal))?;
 
     let reader_queue = Arc::clone(&queue);
     let reader_ready = Arc::clone(&ready);
+    let reader_signal = Arc::clone(&signal);
     if let Err(error) = thread::Builder::new()
         .name("pty-reader".to_owned())
-        .spawn(move || read_pty_output(reader, reader_queue, reader_ready, event_tx))
+        .spawn(move || read_pty_output(reader, reader_queue, reader_ready, event_tx, reader_signal))
     {
         let mut guard = lock_pty_output(&queue);
         guard.finished = true;
         ready.notify_one();
+        signal_pty_exit(&signal, None);
         return Err(error);
     }
-    Ok(())
+    Ok(signal)
 }
 
 fn read_pty_output(
@@ -161,6 +224,7 @@ fn read_pty_output(
     queue: Arc<Mutex<PtyOutputQueue>>,
     ready: Arc<Condvar>,
     event_tx: Sender<TerminalEvent>,
+    exit_signal: Arc<PtyExitSignal>,
 ) {
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -186,7 +250,11 @@ fn read_pty_output(
                 ready.notify_one();
             }
             Err(error) => {
-                let _ = event_tx.try_send(TerminalEvent::Error(error.to_string()));
+                // Closing the shell drops the console. That is not a failure
+                // if the session is already finished.
+                if !pty_exit_is_signaled(&exit_signal) {
+                    let _ = event_tx.try_send(TerminalEvent::Error(error.to_string()));
+                }
                 break;
             }
         }
@@ -200,6 +268,7 @@ fn send_pty_output(
     queue: Arc<Mutex<PtyOutputQueue>>,
     ready: Arc<Condvar>,
     event_tx: Sender<TerminalEvent>,
+    exit_signal: Arc<PtyExitSignal>,
 ) {
     loop {
         let chunk = {
@@ -216,7 +285,7 @@ fn send_pty_output(
             }
         };
         let Some(chunk) = chunk else {
-            return;
+            break;
         };
         if event_tx.send(TerminalEvent::Output(chunk)).is_err() {
             let mut guard = lock_pty_output(&queue);
@@ -224,9 +293,11 @@ fn send_pty_output(
             guard.chunks.clear();
             guard.bytes = 0;
             ready.notify_one();
-            return;
+            break;
         }
     }
+    // Everything still queued has been sent. The closed state comes after it.
+    finish_pty_session(&exit_signal, &event_tx);
 }
 
 
@@ -308,7 +379,8 @@ fn run_local_shell(
 
     // Reading stays ahead of the window. Otherwise a command that prints
     // faster than the screen can fill the console and stop accepting input.
-    spawn_pty_output_reader(reader, event_tx.clone()).context("failed to spawn PTY reader")?;
+    let exit_signal = spawn_pty_output_reader(reader, event_tx.clone()).context("failed to spawn PTY reader")?;
+    let _exit_on_drop = ExitOnDrop(Arc::clone(&exit_signal));
 
     let master = pair.master;
     let mut exit_code = None;
@@ -350,9 +422,8 @@ fn run_local_shell(
         let _ = child.kill();
         let _ = child.wait();
     }
-    event_tx
-        .send(TerminalEvent::Disconnected { exit_code })
-        .ok();
+    // The output sender closes the session after the last queued text.
+    signal_pty_exit(&exit_signal, exit_code);
     Ok(())
 }
 
@@ -418,7 +489,8 @@ fn run_system_ssh_shell(
 
     event_tx.send(TerminalEvent::Connected).ok();
 
-    spawn_pty_output_reader(reader, event_tx.clone()).context("failed to spawn SSH PTY reader")?;
+    let exit_signal = spawn_pty_output_reader(reader, event_tx.clone()).context("failed to spawn SSH PTY reader")?;
+    let _exit_on_drop = ExitOnDrop(Arc::clone(&exit_signal));
 
     let master = pair.master;
     let mut exit_code = None;
@@ -464,9 +536,8 @@ fn run_system_ssh_shell(
         let _ = child.kill();
         exit_code = child.wait().ok().map(|status| status.exit_code() as i32);
     }
-    event_tx
-        .send(TerminalEvent::Disconnected { exit_code })
-        .ok();
+    // The output sender closes the session after the last queued text.
+    signal_pty_exit(&exit_signal, exit_code);
     Ok(())
 }
 
@@ -742,5 +813,37 @@ mod tests {
         let parts = split_command_line("cmd.exe /k chcp 65001");
 
         assert_eq!(parts, ["cmd.exe", "/k", "chcp", "65001"]);
+    }
+
+    #[test]
+    fn shell_output_is_sent_before_the_session_closes() {
+        use crate::core::terminal::TerminalEvent;
+        use crossbeam_channel::bounded;
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (event_tx, event_rx) = bounded::<TerminalEvent>(8);
+        let signal = Arc::new(PtyExitSignal::new());
+        let (entered_tx, entered_rx) = bounded(1);
+        let tx = event_tx.clone();
+        let sig = Arc::clone(&signal);
+        let worker = thread::spawn(move || {
+            tx.send(TerminalEvent::Output(b"last".to_vec())).unwrap();
+            let _ = entered_tx.send(());
+            finish_pty_session(&sig, &tx);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        signal_pty_exit(&signal, Some(7));
+        worker.join().unwrap();
+        match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+            TerminalEvent::Output(bytes) => assert_eq!(bytes, b"last"),
+            other => panic!("expected output before close, got {other:?}"),
+        }
+        match event_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+            TerminalEvent::Disconnected { exit_code } => assert_eq!(exit_code, Some(7)),
+            other => panic!("expected the session to close after output, got {other:?}"),
+        }
+        assert!(event_rx.try_recv().is_err());
     }
 }
