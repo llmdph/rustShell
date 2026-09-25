@@ -3342,6 +3342,7 @@ fn collect_remote_path_stats_from_stat(
             true
         })?;
         for (child, child_stat) in children {
+            let child_stat = resolve_remote_listing_stat(sftp, &child, child_stat);
             collect_remote_path_stats_from_stat(sftp, &child, child_stat, stats)?;
         }
     } else {
