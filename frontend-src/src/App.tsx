@@ -4427,10 +4427,10 @@ export default function App() {
     <div className={`app-shell ${isFileManagerWindow ? "file-window-shell" : ""}`}>
       {!isFileManagerWindow && (
         <header className="chrome" onMouseDown={startWindowDrag}>
-          <div className="titlebar">
-            <div className="brand" data-tauri-drag-region>
+          <div className="titlebar" data-tauri-drag-region="deep">
+            <div className="brand">
               <img className="brand-mark" src="/rustshell-logo.svg" alt="" aria-hidden="true" draggable={false} />
-              <div data-tauri-drag-region>
+              <div>
                 <div className="brand-title">RustShell</div>
                 <div className="brand-subtitle">SSH 终端工具</div>
               </div>
@@ -4438,7 +4438,7 @@ export default function App() {
             <AppMenuBar menus={appMenus} />
             {windowControls}
           </div>
-          <div className="toolbar">
+          <div className="toolbar" data-tauri-drag-region="deep">
             <IconButton title="新建会话" icon={<CirclePlus size={15} />} onClick={() => openProfileEditor()} />
             <IconButton title="快速连接" icon={<Cable size={15} />} onClick={() => setDialog("quick")} />
             <IconButton title="重连" icon={<RefreshCcw size={15} />} onClick={reconnectActive} disabled={!activeProfile} />
@@ -4447,7 +4447,7 @@ export default function App() {
             <IconButton title="显示文件区" icon={<Folder size={15} />} onClick={() => setRightPanelCollapsed(false)} />
             <IconButton title="传输队列" icon={<ListChecks size={15} />} onClick={() => setDialog("transfers")} />
             <IconButton title="设置" icon={<Settings size={15} />} onClick={() => setDialog("settings")} />
-            <div className="topbar-drag-region" data-tauri-drag-region />
+            <div className="topbar-drag-region" />
             <div className="topbar-connect">
               <input
                 className="host-search"
@@ -4738,10 +4738,10 @@ export default function App() {
               <section className="file-panel">
                 <div
                   className="file-panel-heading"
-                  data-tauri-drag-region={isFileManagerWindow ? "" : undefined}
+                  data-tauri-drag-region={isFileManagerWindow ? "deep" : undefined}
                   onMouseDown={isFileManagerWindow ? startWindowDrag : undefined}
                 >
-                  <h3 data-tauri-drag-region={isFileManagerWindow ? "" : undefined}>
+                  <h3>
                     文件管理器
                   </h3>
                   {isFileManagerWindow && (
@@ -7063,7 +7063,7 @@ function AppSelect<T extends string>({
         <span className="app-select-value">{selected?.label ?? ""}</span>
       </button>
       {open && (
-        <div ref={menuRef} className="app-select-menu" style={menuStyle} role="listbox">
+        <div ref={menuRef} className="app-select-menu" style={menuStyle} role="listbox" data-tauri-drag-region="false">
           {options.map((option) => (
             <button
               key={option.value}
@@ -8722,7 +8722,7 @@ function AppMenuBar({ menus }: { menus: AppMenuGroup[] }) {
               {menu.label}
             </button>
             {open && (
-              <div className="app-menu-panel" role="menu">
+              <div className="app-menu-panel" role="menu" data-tauri-drag-region="false">
                 {menu.items.map((item, index) =>
                   item.type === "separator" ? (
                     <div key={`separator-${index}`} className="app-menu-separator" />
