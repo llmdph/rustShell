@@ -290,7 +290,7 @@ export default function App() {
   const [leftPanelWidth, setLeftPanelWidth] = useState(defaultLeftPanelWidth);
   const [rightPanelWidth, setRightPanelWidth] = useState(defaultRightPanelWidth);
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
-  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(!isFileManagerWindow);
+  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
   const [localPath, setLocalPath] = useState("");
   const [remotePath, setRemotePath] = useState("/root");
   const [remoteHomeReady, setRemoteHomeReady] = useState(false);
@@ -3892,9 +3892,9 @@ export default function App() {
     });
   };
   const sideInfoPanel = (
-    <section className="info-panel compact-info-panel">
+    <section className="info-panel compact-info-panel session-info-panel">
       <div className="compact-info-head">
-        <h3>连接概览</h3>
+        <h3>会话信息</h3>
         <IconButton
           title="刷新服务器状态"
           icon={<RefreshCcw size={14} />}
@@ -3905,9 +3905,10 @@ export default function App() {
       <div className="compact-info-grid">
         <InfoRow label="名称" value={activeProfile?.name ?? "-"} />
         <InfoRow label="主机" value={activeProfile?.host ?? "-"} />
-        <InfoRow label="协议" value={normalizeProtocolLabel(activeProfile?.protocol)} />
-        <InfoRow label="用户" value={activeProfile?.username ?? "-"} />
         <InfoRow label="端口" value={String(activeProfile?.port ?? "-")} />
+        <InfoRow label="协议" value={normalizeProtocolLabel(activeProfile?.protocol)} />
+        <InfoRow label="用户名" value={activeProfile?.username ?? "-"} />
+        <InfoRow label="字符集" value={activeProfile?.charset || "UTF-8"} />
         {serverStatus && (
           <>
             <InfoRow label="节点" value={serverStatus.hostname} />
@@ -3920,9 +3921,9 @@ export default function App() {
           </>
         )}
       </div>
-      {!serverStatus && (
+      {(serverStatusLoading || serverStatusError) && (
         <div className="server-status-empty">
-          {serverStatusLoading ? "正在读取服务器状态..." : serverStatusError ? `状态读取失败: ${serverStatusError}` : "暂无状态数据"}
+          {serverStatusLoading ? "正在读取服务器状态..." : `状态读取失败: ${serverStatusError}`}
         </div>
       )}
     </section>
@@ -4013,6 +4014,27 @@ export default function App() {
       ]
     },
     {
+      label: "编辑(E)",
+      items: [
+        { label: "复制终端", hint: "Copy", onClick: copyActiveTerminal, disabled: !activeTab },
+        { label: "粘贴到终端", hint: "Paste", onClick: pasteToActiveTerminal, disabled: !activeTab || activeTab.status !== "connected" },
+        { label: "清屏", hint: "Clear", onClick: clearActiveTerminal, disabled: !activeTab || activeTab.status !== "connected" }
+      ]
+    },
+    {
+      label: "查看(V)",
+      items: [
+        {
+          label: leftPanelCollapsed ? "显示会话栏" : "隐藏会话栏",
+          onClick: () => setLeftPanelCollapsed((current) => !current)
+        },
+        {
+          label: rightPanelCollapsed ? "显示右侧栏" : "隐藏右侧栏",
+          onClick: () => setRightPanelCollapsed((current) => !current)
+        }
+      ]
+    },
+    {
       label: "连接(C)",
       items: [
         { label: "快速连接", hint: "Quick", onClick: () => setDialog("quick") },
@@ -4069,7 +4091,7 @@ export default function App() {
     }
   ];
   const windowControls = (
-    <div className="window-controls" aria-label="窗口控制">
+    <div className="window-controls" aria-label="窗口控制" onMouseDown={(event) => event.stopPropagation()}>
       <button title="最小化" onClick={() => void runWindowAction("minimize")}>
         <Minus size={14} />
       </button>
@@ -4085,30 +4107,43 @@ export default function App() {
   return (
     <div className={`app-shell ${isFileManagerWindow ? "file-window-shell" : ""}`}>
       {!isFileManagerWindow && (
-        <header className="topbar" onMouseDown={startWindowDrag}>
-          <div className="brand" data-tauri-drag-region>
-            <img className="brand-mark" src="/rustshell-logo.svg" alt="" aria-hidden="true" draggable={false} />
-            <div data-tauri-drag-region>
-              <div className="brand-title">RustShell</div>
+        <header className="chrome" onMouseDown={startWindowDrag}>
+          <div className="titlebar">
+            <div className="brand" data-tauri-drag-region>
+              <img className="brand-mark" src="/rustshell-logo.svg" alt="" aria-hidden="true" draggable={false} />
+              <div data-tauri-drag-region>
+                <div className="brand-title">RustShell</div>
+                <div className="brand-subtitle">SSH 终端工具</div>
+              </div>
+            </div>
+            <AppMenuBar menus={appMenus} />
+            {windowControls}
+          </div>
+          <div className="toolbar">
+            <IconButton title="新建会话" icon={<CirclePlus size={15} />} onClick={() => openProfileEditor()} />
+            <IconButton title="快速连接" icon={<Cable size={15} />} onClick={() => setDialog("quick")} />
+            <IconButton title="重连" icon={<RefreshCcw size={15} />} onClick={reconnectActive} disabled={!activeProfile} />
+            <IconButton title="本地终端" icon={<Monitor size={15} />} onClick={openLocalShell} />
+            <span className="toolbar-sep" />
+            <IconButton title="显示文件区" icon={<Folder size={15} />} onClick={() => setRightPanelCollapsed(false)} />
+            <IconButton title="传输队列" icon={<ListChecks size={15} />} onClick={() => setDialog("transfers")} />
+            <IconButton title="设置" icon={<Settings size={15} />} onClick={() => setDialog("settings")} />
+            <div className="topbar-drag-region" data-tauri-drag-region />
+            <div className="topbar-connect">
+              <input
+                className="host-search"
+                value={hostSearch}
+                onChange={(event) => setHostSearch(event.target.value)}
+                placeholder="主机名、IP 地址或会话名称"
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") connectFromSearch();
+                }}
+              />
+              <button className="primary-button" onClick={connectFromSearch}>
+                连接
+              </button>
             </div>
           </div>
-          <AppMenuBar menus={appMenus} />
-          <div className="topbar-drag-region" data-tauri-drag-region />
-          <div className="topbar-connect">
-            <input
-              className="host-search"
-              value={hostSearch}
-              onChange={(event) => setHostSearch(event.target.value)}
-              placeholder="主机名、IP 或会话名称"
-              onKeyDown={(event) => {
-                if (event.key === "Enter") connectFromSearch();
-              }}
-            />
-            <button className="primary-button" onClick={connectFromSearch}>
-              连接
-            </button>
-          </div>
-          {windowControls}
         </header>
       )}
 
@@ -4127,22 +4162,25 @@ export default function App() {
             </button>
           ) : (
             <>
-              <div className="left-panel-main">
-                <PanelHeader
-                  title="会话管理器"
-                  action={
-                    <div className="panel-header-actions">
-                      <IconButton title="新建会话" icon={<CirclePlus size={14} />} onClick={() => openProfileEditor()} />
-                      <IconButton title="收起左侧" icon={<ChevronLeft size={14} />} onClick={() => setLeftPanelCollapsed(true)} />
-                    </div>
-                  }
-                />
+              <PanelHeader
+                title="会话管理器"
+                action={
+                  <div className="panel-header-actions">
+                    <IconButton title="新建会话" icon={<CirclePlus size={14} />} onClick={() => openProfileEditor()} />
+                    <IconButton title="收起左侧" icon={<ChevronLeft size={14} />} onClick={() => setLeftPanelCollapsed(true)} />
+                  </div>
+                }
+              />
+              <label className="panel-search-wrap">
+                <Search size={13} />
                 <input
                   className="panel-search"
                   value={sessionSearch}
                   onChange={(event) => setSessionSearch(event.target.value)}
                   placeholder="搜索会话"
                 />
+              </label>
+              <div className="left-panel-main">
                 <SessionTree
                   profiles={filteredProfiles}
                   activeProfileId={activeProfile?.id ?? null}
@@ -4158,7 +4196,6 @@ export default function App() {
                   onDeleteFolder={deleteSessionFolder}
                 />
               </div>
-              {sideInfoPanel}
             </>
           )}
         </aside>
@@ -4220,6 +4257,9 @@ export default function App() {
                 </span>
               </button>
             ))}
+            <button type="button" className="tab-add" title="新建会话" onClick={() => openProfileEditor()}>
+              <CirclePlus size={14} />
+            </button>
             {tabContextMenu && (
               <FileContextMenu
                 x={tabContextMenu.x}
@@ -4272,6 +4312,7 @@ export default function App() {
               </div>
             )}
           </div>
+          <div className="terminal-bottom">
           <section className="terminal-tools terminal-tools-inline">
             <div className="terminal-tool-grid">
               <IconButton title="复制终端内容" icon={<Copy size={14} />} onClick={copyActiveTerminal} disabled={!activeTab} />
@@ -4322,6 +4363,19 @@ export default function App() {
               />
             </div>
           </section>
+          <footer className="term-status">
+            <span className="term-status-main">
+              {activeTab?.endpoint ||
+                (activeProfile
+                  ? `${normalizeProtocolLabel(activeProfile.protocol).toLowerCase()}://${activeProfile.username}@${activeProfile.host}:${activeProfile.port}`
+                  : "未连接")}
+            </span>
+            <span>{activeProfile ? normalizeProtocolLabel(activeProfile.protocol) : "SSH"}</span>
+            <span>{activeTab ? `${activeTab.cols}×${activeTab.rows}` : "--"}</span>
+            <span>{tabs.length} 会话</span>
+            <span>{new Set(profiles.map((profile) => profile.group || "未分组")).size} 个分组</span>
+          </footer>
+          </div>
         </section>
 
         <div
@@ -4337,11 +4391,31 @@ export default function App() {
 
         <aside className={`right-panel ${rightPanelCollapsed ? "collapsed" : ""}`}>
           {rightPanelCollapsed && !isFileManagerWindow ? (
-            <button className="panel-rail-button" title="打开文件管理器" onClick={openSftpManager}>
-              <FolderSync size={16} />
+            <button className="panel-rail-button" title="展开右侧" onClick={() => setRightPanelCollapsed(false)}>
+              <ChevronLeft size={16} />
             </button>
           ) : (
             <>
+              {!isFileManagerWindow && (
+                <section className="side-card toolbox-panel">
+                  <div className="compact-info-head">
+                    <h3>工具箱</h3>
+                    <IconButton title="收起右侧" icon={<X size={14} />} onClick={() => setRightPanelCollapsed(true)} />
+                  </div>
+                  <div className="toolbox-grid">
+                    <IconButton title="新建会话" icon={<CirclePlus size={15} />} onClick={() => openProfileEditor()} />
+                    <IconButton title="快速连接" icon={<Cable size={15} />} onClick={() => setDialog("quick")} />
+                    <IconButton title="重连" icon={<RefreshCcw size={15} />} onClick={reconnectActive} disabled={!activeProfile} />
+                    <IconButton title="本地终端" icon={<Monitor size={15} />} onClick={openLocalShell} />
+                    <IconButton title="复制终端" icon={<Copy size={15} />} onClick={copyActiveTerminal} disabled={!activeTab} />
+                    <IconButton title="粘贴" icon={<ClipboardPaste size={15} />} onClick={pasteToActiveTerminal} disabled={!activeTab || activeTab.status !== "connected"} />
+                    <IconButton title="清屏" icon={<Eraser size={15} />} onClick={clearActiveTerminal} disabled={!activeTab || activeTab.status !== "connected"} />
+                    <IconButton title="传输队列" icon={<ListChecks size={15} />} onClick={() => setDialog("transfers")} />
+                    <IconButton title="设置" icon={<Settings size={15} />} onClick={() => setDialog("settings")} />
+                  </div>
+                </section>
+              )}
+              {!isFileManagerWindow && sideInfoPanel}
               <section className="file-panel">
                 <div
                   className="file-panel-heading"
@@ -4391,10 +4465,7 @@ export default function App() {
                   <IconButton
                     title="传输队列"
                     icon={<ListChecks size={14} />}
-                    onClick={() => {
-                      setDialog("transfers");
-                      if (!isFileManagerWindow) setRightPanelCollapsed(true);
-                    }}
+                    onClick={() => setDialog("transfers")}
                   />
                   {isFileManagerWindow ? (
                     windowControls
@@ -8291,7 +8362,7 @@ function buildSessionFolderTree(profiles: Profile[], customFolders: string[]) {
         continue;
       }
 
-      let child = node.children.find((item) => item.name === part);
+      let child: SessionFolderNode | undefined = node.children.find((item) => item.name === part);
       if (!child) {
         child = { name: part, path: currentPath, children: [], profiles: [] };
         node.children = [...node.children, child];
