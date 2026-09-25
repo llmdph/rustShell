@@ -1885,10 +1885,8 @@ fn remove_remote_recursive(sftp: &ssh2::Sftp, path: &Path) -> Result<()> {
             .with_context(|| format!("failed to remove remote file {}", path.display()));
     }
 
-    for (child, _) in sftp
-        .readdir(path)
-        .with_context(|| format!("failed to list {}", path.display()))?
-    {
+    let children = read_remote_entries(sftp, path, None)?;
+    for (child, _) in children {
         remove_remote_recursive(sftp, &child)?;
     }
 
@@ -1923,10 +1921,8 @@ fn copy_remote_path(
         let mode = (stat.perm.unwrap_or(0o755) & 0o7777) as i32;
         sftp.mkdir(target, mode)
             .with_context(|| format!("failed to create remote directory {}", target.display()))?;
-        for (child, _) in sftp
-            .readdir(source)
-            .with_context(|| format!("failed to list {}", source.display()))?
-        {
+        let children = read_remote_entries(sftp, source, None)?;
+        for (child, _) in children {
             let name = child
                 .file_name()
                 .ok_or_else(|| anyhow!("remote file name is missing"))?;
@@ -2001,10 +1997,8 @@ fn chmod_recursive(sftp: &ssh2::Sftp, path: &Path, mode: u32) -> Result<()> {
         return Ok(());
     }
 
-    for (child, _) in sftp
-        .readdir(path)
-        .with_context(|| format!("failed to list {}", path.display()))?
-    {
+    let children = read_remote_entries(sftp, path, None)?;
+    for (child, _) in children {
         chmod_recursive(sftp, &child, mode)?;
     }
     Ok(())
@@ -2045,10 +2039,8 @@ fn chown_recursive(
         return Ok(());
     }
 
-    for (child, _) in sftp
-        .readdir(path)
-        .with_context(|| format!("failed to list {}", path.display()))?
-    {
+    let children = read_remote_entries(sftp, path, None)?;
+    for (child, _) in children {
         chown_recursive(sftp, &child, uid, gid)?;
     }
     Ok(())
@@ -2097,10 +2089,8 @@ fn touch_recursive(sftp: &ssh2::Sftp, path: &Path, mtime: u64) -> Result<()> {
         return Ok(());
     }
 
-    for (child, _) in sftp
-        .readdir(path)
-        .with_context(|| format!("failed to list {}", path.display()))?
-    {
+    let children = read_remote_entries(sftp, path, None)?;
+    for (child, _) in children {
         touch_recursive(sftp, &child, mtime)?;
     }
     Ok(())
