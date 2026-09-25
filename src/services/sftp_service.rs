@@ -1071,12 +1071,25 @@ where
         if read == 0 {
             break;
         }
-        writer.write_all(&buffer[..read])?;
-        *transferred += read as u64;
-        let now = Instant::now();
-        if now.duration_since(last_progress) >= TRANSFER_PROGRESS_INTERVAL {
-            on_progress(*transferred, total);
-            last_progress = now;
+        let mut offset = 0;
+        while offset < read {
+            if cancel.load(Ordering::Relaxed) {
+                on_progress(*transferred, total);
+                bail!("transfer cancelled");
+            }
+            let wrote = writer.write(&buffer[offset..read])?;
+            if wrote == 0 {
+                bail!(
+                    "传输中断，没有写入新的数据",
+                );
+            }
+            offset += wrote;
+            *transferred += wrote as u64;
+            let now = Instant::now();
+            if now.duration_since(last_progress) >= TRANSFER_PROGRESS_INTERVAL {
+                on_progress(*transferred, total);
+                last_progress = now;
+            }
         }
     }
     on_progress(*transferred, total);
