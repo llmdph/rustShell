@@ -49,6 +49,7 @@ import {
 import {
   Fragment,
   startTransition,
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -6551,6 +6552,21 @@ function directoryPathFromDropTarget(target: EventTarget | null): string | null 
   return path || null;
 }
 
+
+type FileListHandlers = {
+  onSelect: (file: FileEntry, event: FileSelectModifiers) => void;
+  onSort: (key: FileSortKey) => void;
+  onOpen: (file: FileEntry) => void;
+  onDragStart: (file: FileEntry, event: DragEvent<HTMLButtonElement>) => void;
+  onDragEnd: () => void;
+  onSelectAll: () => void;
+  onClearSelection: () => void;
+  onRemove: () => void;
+  onRename: () => void;
+  onParent: () => void;
+  onContextMenu: (event: MouseEvent, file?: FileEntry, alreadySelected?: boolean) => void;
+};
+
 function FilePane({
   side,
   title,
@@ -6643,6 +6659,19 @@ function FilePane({
   const [pathDraft, setPathDraft] = useState(path);
   const [bookmarkPath, setBookmarkPath] = useState("");
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const fileListHandlersRef = useRef<FileListHandlers>({
+    onSelect: () => undefined,
+    onSort: () => undefined,
+    onOpen: () => undefined,
+    onDragStart: () => undefined,
+    onDragEnd: () => undefined,
+    onSelectAll: () => undefined,
+    onClearSelection: () => undefined,
+    onRemove: () => undefined,
+    onRename: () => undefined,
+    onParent: () => undefined,
+    onContextMenu: () => undefined
+  });
 
   useEffect(() => {
     setPathDraft(path);
@@ -6679,6 +6708,20 @@ function FilePane({
       x: Math.max(8, Math.min(event.clientX, window.innerWidth - width - 8)),
       y: Math.max(8, Math.min(event.clientY, window.innerHeight - height - 8))
     });
+  };
+
+  fileListHandlersRef.current = {
+    onSelect,
+    onSort,
+    onOpen,
+    onDragStart,
+    onDragEnd,
+    onSelectAll,
+    onClearSelection,
+    onRemove,
+    onRename,
+    onParent,
+    onContextMenu: openContextMenu
   };
 
   const commitPath = () => {
@@ -6789,18 +6832,8 @@ function FilePane({
         selected={selected}
         selectedPaths={selectedPaths}
         sort={sort}
-        onSelect={onSelect}
-        onSort={onSort}
-        onOpen={onOpen}
-        onDragStart={onDragStart}
-        onDragEnd={onDragEnd}
         dropDirectory={dropDirectory}
-        onSelectAll={onSelectAll}
-        onClearSelection={onClearSelection}
-        onRemove={onRemove}
-        onRename={onRename}
-        onParent={onParent}
-        onContextMenu={openContextMenu}
+        handlersRef={fileListHandlersRef}
       />
       {contextMenu && (
         <FileContextMenu
@@ -7040,25 +7073,49 @@ function revealFileRow(node: HTMLElement, index: number, mode: "nearest" | "cent
   node.scrollTop = Math.max(0, rowTop - Math.max(0, (node.clientHeight - FILE_ROW_HEIGHT) / 2));
 }
 
-function FileList({
+function sameFileListProps(
+  prev: {
+    files: FileEntry[];
+    scrollKey: string;
+    compareMarks: Map<string, FileCompareMark>;
+    selected: FileEntry | null;
+    selectedPaths: string[];
+    sort: FileSort;
+    dropDirectory: string | null;
+    handlersRef: { current: FileListHandlers };
+  },
+  next: {
+    files: FileEntry[];
+    scrollKey: string;
+    compareMarks: Map<string, FileCompareMark>;
+    selected: FileEntry | null;
+    selectedPaths: string[];
+    sort: FileSort;
+    dropDirectory: string | null;
+    handlersRef: { current: FileListHandlers };
+  }
+) {
+  return (
+    prev.files === next.files &&
+    prev.scrollKey === next.scrollKey &&
+    prev.compareMarks === next.compareMarks &&
+    prev.selected === next.selected &&
+    prev.selectedPaths === next.selectedPaths &&
+    prev.sort === next.sort &&
+    prev.dropDirectory === next.dropDirectory &&
+    prev.handlersRef === next.handlersRef
+  );
+}
+
+const FileList = memo(function FileList({
   files,
   scrollKey,
   compareMarks,
   selected,
   selectedPaths,
   sort,
-  onSelect,
-  onSort,
-  onOpen,
-  onDragStart,
-  onDragEnd,
   dropDirectory,
-  onSelectAll,
-  onClearSelection,
-  onRemove,
-  onRename,
-  onParent,
-  onContextMenu
+  handlersRef
 }: {
   files: FileEntry[];
   scrollKey: string;
@@ -7066,18 +7123,8 @@ function FileList({
   selected: FileEntry | null;
   selectedPaths: string[];
   sort: FileSort;
-  onSelect: (file: FileEntry, event: FileSelectModifiers) => void;
-  onSort: (key: FileSortKey) => void;
-  onOpen: (file: FileEntry) => void;
-  onDragStart: (file: FileEntry, event: DragEvent<HTMLButtonElement>) => void;
-  onDragEnd: () => void;
   dropDirectory: string | null;
-  onSelectAll: () => void;
-  onClearSelection: () => void;
-  onRemove: () => void;
-  onRename: () => void;
-  onParent: () => void;
-  onContextMenu: (event: MouseEvent, file?: FileEntry, alreadySelected?: boolean) => void;
+  handlersRef: { current: FileListHandlers };
 }) {
   const selectedPathSet = useMemo(() => new Set(selectedPaths), [selectedPaths]);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -7148,12 +7195,12 @@ function FileList({
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
       event.preventDefault();
-      onSelectAll();
+      handlersRef.current.onSelectAll();
       return;
     }
     if (event.key === "Escape") {
       event.preventDefault();
-      onClearSelection();
+      handlersRef.current.onClearSelection();
       return;
     }
     const moveSelection = (key: "ArrowDown" | "ArrowUp" | "Home" | "End" | "PageDown" | "PageUp") => {
@@ -7180,7 +7227,7 @@ function FileList({
       const file = files[nextIndex];
       if (!file || (file.path === selected?.path && !event.shiftKey)) return;
       if (file.path !== selected?.path) revealModeRef.current = "nearest";
-      onSelect(file, { shiftKey: event.shiftKey, ctrlKey: false, metaKey: false });
+      handlersRef.current.onSelect(file, { shiftKey: event.shiftKey, ctrlKey: false, metaKey: false });
     };
 
     if (
@@ -7197,36 +7244,36 @@ function FileList({
     }
     if (event.key === "Backspace") {
       event.preventDefault();
-      onParent();
+      handlersRef.current.onParent();
       return;
     }
     if (event.key === "Delete") {
       if (selectedPaths.length === 0) return;
       event.preventDefault();
-      onRemove();
+      handlersRef.current.onRemove();
       return;
     }
     if (event.key === "F2") {
       if (!selected || selectedPaths.length > 1) return;
       event.preventDefault();
-      onRename();
+      handlersRef.current.onRename();
       return;
     }
     if (event.key === "Enter") {
       if (!selected) return;
       event.preventDefault();
-      onOpen(selected);
+      handlersRef.current.onOpen(selected);
     }
   };
 
   return (
-    <div className="file-list" ref={listRef} tabIndex={0} onKeyDown={handleKeyDown} onContextMenu={(event) => onContextMenu(event)}>
+    <div className="file-list" ref={listRef} tabIndex={0} onKeyDown={handleKeyDown} onContextMenu={(event) => handlersRef.current.onContextMenu(event)}>
       <div className="file-row file-head">
-        <SortHeader label="名称" sortKey="name" sort={sort} onSort={onSort} />
-        <SortHeader label="权限" sortKey="permissions" sort={sort} onSort={onSort} />
-        <SortHeader label="属主" sortKey="owner" sort={sort} onSort={onSort} />
-        <SortHeader label="大小" sortKey="size" sort={sort} onSort={onSort} />
-        <SortHeader label="时间" sortKey="modifiedAt" sort={sort} onSort={onSort} />
+        <SortHeader label="名称" sortKey="name" sort={sort} onSort={(key) => handlersRef.current.onSort(key)} />
+        <SortHeader label="权限" sortKey="permissions" sort={sort} onSort={(key) => handlersRef.current.onSort(key)} />
+        <SortHeader label="属主" sortKey="owner" sort={sort} onSort={(key) => handlersRef.current.onSort(key)} />
+        <SortHeader label="大小" sortKey="size" sort={sort} onSort={(key) => handlersRef.current.onSort(key)} />
+        <SortHeader label="时间" sortKey="modifiedAt" sort={sort} onSort={(key) => handlersRef.current.onSort(key)} />
       </div>
       <div
         className="file-list-body"
@@ -7246,12 +7293,12 @@ function FileList({
             } ${selected?.path === file.path ? "primary" : ""} ${dropDirectory === file.path ? "drop-target" : ""}`}
             data-entry-path={file.path}
             data-entry-dir={file.isDir ? "1" : undefined}
-            onClick={(event) => onSelect(file, event)}
-            onDoubleClick={() => onOpen(file)}
+            onClick={(event) => handlersRef.current.onSelect(file, event)}
+            onDoubleClick={() => handlersRef.current.onOpen(file)}
             draggable
-            onDragStart={(event) => onDragStart(file, event)}
-            onDragEnd={onDragEnd}
-            onContextMenu={(event) => onContextMenu(event, file, selectedPathSet.has(file.path))}
+            onDragStart={(event) => handlersRef.current.onDragStart(file, event)}
+            onDragEnd={() => handlersRef.current.onDragEnd()}
+            onContextMenu={(event) => handlersRef.current.onContextMenu(event, file, selectedPathSet.has(file.path))}
             title={[file.linkTarget ? `${file.path} -> ${file.linkTarget}` : file.path, compareDetail || compareText]
               .filter(Boolean)
               .join(" · ")}
@@ -7272,7 +7319,7 @@ function FileList({
       </div>
     </div>
   );
-}
+}, sameFileListProps);
 
 function PermissionCell({ file }: { file: FileEntry }) {
   const mode = formatMode(file.permissions);
