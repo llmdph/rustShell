@@ -334,6 +334,8 @@ export default function App() {
   const selectedRemoteRef = useRef<FileEntry | null>(null);
   const pendingLocalPreferPathRef = useRef<string | null>(null);
   const pendingRemotePreferPathRef = useRef<string | null>(null);
+  const localListGenerationRef = useRef(0);
+  const remoteListGenerationRef = useRef(0);
   const localSelectionAnchorRef = useRef<string | null>(null);
   const remoteSelectionAnchorRef = useRef<string | null>(null);
   const [chmodTarget, setChmodTarget] = useState<FileEntry | null>(null);
@@ -1126,10 +1128,13 @@ export default function App() {
 
   const refreshLocalFiles = useCallback(async (preferPath?: string) => {
     if (!localPath) return;
+    const generation = ++localListGenerationRef.current;
+    const requestedPath = localPath;
     const preferredPath = preferPath ?? pendingLocalPreferPathRef.current ?? undefined;
     pendingLocalPreferPathRef.current = null;
     try {
-      const listing = await api.listLocalDir(localPath);
+      const listing = await api.listLocalDir(requestedPath);
+      if (generation !== localListGenerationRef.current) return;
       const files = listing.entries;
       const picked = pickSelection(files, preferredPath, selectedLocalRef.current);
       setLocalFiles(files);
@@ -1137,15 +1142,17 @@ export default function App() {
       setSelectedLocal(picked);
       setSelectedLocalPaths(picked ? [picked.path] : []);
       setLocalSearch(null);
-      setStatus(`本地 ${localPath}`);
+      setStatus(`本地 ${requestedPath}`);
     } catch (error) {
+      if (generation !== localListGenerationRef.current) return;
       setStatus(`本地目录读取失败: ${String(error)}`);
       pushToast("error", "本地目录读取失败");
     }
   }, [localPath, pushToast]);
 
-  const loadRemoteFilesFor = useCallback(async (profile: Profile, path: string, password: string | null, preferPath?: string) => {
+  const loadRemoteFilesFor = useCallback(async (profile: Profile, path: string, password: string | null, preferPath: string | undefined, generation: number) => {
     const listing = await api.listRemoteDir(profile.id, path, password);
+    if (generation !== remoteListGenerationRef.current) return;
     const files = listing.entries;
     const picked = pickSelection(files, preferPath, selectedRemoteRef.current);
     setRemoteFiles(files);
@@ -1158,17 +1165,27 @@ export default function App() {
 
   const refreshRemoteFiles = useCallback(async (preferPath?: string) => {
     if (!activeProfile || isLocalProtocol(activeProfile.protocol)) {
+      remoteListGenerationRef.current += 1;
       setRemoteFiles([]);
       setRemoteDirTruncated(false);
       clearRemoteSelection();
       setRemoteSearch(null);
       return;
     }
+    const generation = ++remoteListGenerationRef.current;
+    const requestedPath = remotePath;
     const preferredPath = preferPath ?? pendingRemotePreferPathRef.current ?? undefined;
     pendingRemotePreferPathRef.current = null;
     try {
-      await loadRemoteFilesFor(activeProfile, remotePath, passwordForActive, typeof preferredPath === "string" ? preferredPath : undefined);
+      await loadRemoteFilesFor(
+        activeProfile,
+        requestedPath,
+        passwordForActive,
+        typeof preferredPath === "string" ? preferredPath : undefined,
+        generation
+      );
     } catch (error) {
+      if (generation !== remoteListGenerationRef.current) return;
       const message = String(error);
       if (shouldPromptForPassword(activeProfile, message)) {
         requestProfileSecret(activeProfile, message);
@@ -1232,6 +1249,7 @@ export default function App() {
 
   useEffect(() => {
     if (!activeProfile || isLocalProtocol(activeProfile.protocol) || !remoteBrowserReady) {
+      remoteListGenerationRef.current += 1;
       setRemoteHomeReady(false);
       setRemoteFiles([]);
       setRemoteDirTruncated(false);
@@ -1255,6 +1273,7 @@ export default function App() {
           requestProfileSecret(activeProfile, message);
           pushToast("info", "请输入连接密码/口令");
         }
+        remoteListGenerationRef.current += 1;
         setRemoteBackHistory([]);
         setRemoteForwardHistory([]);
         setRemotePath(".");
@@ -3353,6 +3372,7 @@ export default function App() {
     try {
       if (side === "local") {
         const listing = await api.listLocalDir(targetPath);
+        localListGenerationRef.current += 1;
         setLocalFiles(listing.entries);
         setLocalDirTruncated(listing.truncated);
         setSelectedLocal(null);
@@ -3363,6 +3383,7 @@ export default function App() {
 
       if (!activeProfile || isLocalProtocol(activeProfile.protocol)) return;
       const listing = await api.listRemoteDir(activeProfile.id, targetPath, passwordForActive);
+      remoteListGenerationRef.current += 1;
       setRemoteFiles(listing.entries);
       setRemoteDirTruncated(listing.truncated);
       setSelectedRemote(null);
@@ -3409,6 +3430,7 @@ export default function App() {
     if (!query?.trim()) return;
     try {
       const result = await api.searchRemote(activeProfile.id, remotePath, query.trim(), 300, passwordForActive);
+      remoteListGenerationRef.current += 1;
       setRemoteFiles(result.entries);
       setRemoteDirTruncated(false);
       clearRemoteSelection();
@@ -3431,6 +3453,7 @@ export default function App() {
     if (!query?.trim()) return;
     try {
       const result = await api.searchLocal(localPath, query.trim(), 300);
+      localListGenerationRef.current += 1;
       setLocalFiles(result.entries);
       setLocalDirTruncated(false);
       clearLocalSelection();
@@ -3921,6 +3944,7 @@ export default function App() {
     window.localStorage.setItem(fileManagerProfileStorageKey, profileId);
     setSelectedProfileId(profileId);
     setRemoteBrowserProfileId(profileId);
+    remoteListGenerationRef.current += 1;
     setRemoteHomeReady(false);
     setRemoteFiles([]);
     setRemoteDirTruncated(false);
@@ -3938,6 +3962,7 @@ export default function App() {
       }
       setSelectedProfileId(profileId);
       setRemoteBrowserProfileId(profileId);
+      remoteListGenerationRef.current += 1;
       setRemoteHomeReady(false);
       setRemoteFiles([]);
       setRemoteDirTruncated(false);
