@@ -47,7 +47,7 @@ use tauri::{
     menu::MenuBuilder,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::PageLoadEvent,
-    AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use uuid::Uuid;
 
@@ -61,6 +61,7 @@ struct AppRuntime {
     settings: Mutex<AppSettings>,
     transfers: Mutex<HashMap<Uuid, TransferTask>>,
     allow_main_close: AtomicBool,
+    ui_ready: AtomicBool,
 }
 
 const TRANSFER_HISTORY_LIMIT: usize = 200;
@@ -834,6 +835,55 @@ async fn duplicate_terminal(terminal_id: String, app: AppHandle) -> Result<Termi
 #[tauri::command]
 fn load_settings(state: State<'_, AppRuntime>) -> Result<AppSettings, String> {
     Ok(lock(&state.settings)?.clone())
+}
+
+#[tauri::command]
+fn mark_ui_ready(app: AppHandle) {
+    app.state::<AppRuntime>()
+        .ui_ready
+        .store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    exit_main_window(&app);
+}
+
+fn request_main_exit(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        exit_main_window(app);
+        return;
+    };
+    if state.allow_main_close.load(Ordering::SeqCst) {
+        exit_main_window(app);
+        return;
+    }
+    let confirm = lock_poison_ok(&state.settings).confirm_on_exit;
+    let ready = state.ui_ready.load(Ordering::SeqCst);
+    if !confirm || !ready {
+        exit_main_window(app);
+        return;
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.emit("rustshell-close-requested", true);
+    } else {
+        exit_main_window(app);
+    }
+}
+
+fn exit_main_window(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppRuntime>() {
+        state.allow_main_close.store(true, Ordering::SeqCst);
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+        let _ = window.destroy();
+    }
+    app.exit(0);
+    std::process::exit(0);
 }
 
 #[tauri::command]
@@ -1898,6 +1948,7 @@ fn main() {
         settings: Mutex::new(settings),
         transfers: Mutex::new(HashMap::new()),
         allow_main_close: AtomicBool::new(false),
+        ui_ready: AtomicBool::new(false),
     };
 
     tauri::Builder::default()
@@ -1918,7 +1969,7 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show-main" => show_main_window(app),
-                    "quit-app" => app.exit(0),
+                    "quit-app" => request_main_exit(app),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| match event {
@@ -1945,15 +1996,17 @@ fn main() {
                 if state.allow_main_close.load(Ordering::SeqCst) {
                     return;
                 }
-                // Match main: the title-bar close exits the process. Hiding to
-                // the tray looked like the window could not be closed.
+                let confirm = lock_poison_ok(&state.settings).confirm_on_exit;
+                let ready = state.ui_ready.load(Ordering::SeqCst);
                 api.prevent_close();
-                state.allow_main_close.store(true, Ordering::SeqCst);
-                let app = window.app_handle().clone();
-                let _ = window.hide();
-                let _ = window.destroy();
-                app.exit(0);
-                std::process::exit(0);
+                if !confirm || !ready {
+                    exit_main_window(window.app_handle());
+                    return;
+                }
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+                let _ = window.emit("rustshell-close-requested", true);
             }
         })
         .manage(runtime)
@@ -1973,6 +2026,8 @@ fn main() {
             duplicate_terminal,
             load_settings,
             save_settings,
+            mark_ui_ready,
+            quit_app,
             trust_host_key,
             load_known_hosts,
             save_known_hosts,

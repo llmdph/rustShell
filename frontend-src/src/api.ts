@@ -231,6 +231,8 @@ export const api = {
   closeTerminal: (terminalId: string) => invoke<void>("close_terminal", { terminalId }),
   loadSettings: () => invoke<AppSettings>("load_settings"),
   saveSettings: (settings: AppSettings) => invoke<AppSettings>("save_settings", { settings }),
+  markUiReady: () => invoke<void>("mark_ui_ready"),
+  quitApp: () => invoke<void>("quit_app"),
   trustHostKey: (issue: HostKeyIssue) =>
     invoke<void>("trust_host_key", {
       request: {

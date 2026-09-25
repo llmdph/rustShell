@@ -1,6 +1,7 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { Terminal } from "@xterm/xterm";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -625,6 +626,38 @@ export default function App() {
       });
     });
   }, []);
+
+  useEffect(() => {
+    if (!hasTauriRuntime() || isFileManagerWindow) return;
+    let disposed = false;
+    let unlisten = () => {};
+    let pending = false;
+    void listen("rustshell-close-requested", async () => {
+      if (disposed || pending) return;
+      pending = true;
+      const accepted = await confirmAction("退出", {
+        message: "确定要退出吗？",
+        confirmLabel: "退出",
+        cancelLabel: "取消",
+        danger: true
+      });
+      pending = false;
+      if (disposed || !accepted) return;
+      await api.quitApp().catch(() => undefined);
+    }).then((stop) => {
+      if (disposed) {
+        stop();
+        return;
+      }
+      unlisten = stop;
+      void api.markUiReady().catch(() => undefined);
+    });
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [confirmAction, isFileManagerWindow]);
+
 
   const showTextDialog = useCallback(
     (title: string, text: string) =>
