@@ -1185,10 +1185,17 @@ fn copy_dir_entries(source: &Path, target: &Path, fail_if_unreadable: bool) -> s
 fn copy_nested_file(source: &Path, target: &Path) -> std::io::Result<bool> {
     // A locked or unreadable file is skipped. Failure to create or write the
     // destination still stops the copy, so a full disk is not reported as success.
-    if fs::File::open(source).is_err() {
-        return Ok(false);
+    // The handle is reused for the copy. Opening the file again would read it twice.
+    let mut input = match fs::File::open(source) {
+        Ok(file) => file,
+        Err(_) => return Ok(false),
+    };
+    let mut output = fs::File::create(target)?;
+    if let Err(error) = std::io::copy(&mut input, &mut output) {
+        drop(output);
+        let _ = fs::remove_file(target);
+        return Err(error);
     }
-    fs::copy(source, target)?;
     Ok(true)
 }
 
