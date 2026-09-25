@@ -306,19 +306,70 @@ pub fn local_move(path: &str, target_path: &str) -> std::io::Result<String> {
 }
 
 fn local_move_lands_inside(source: &Path, destination: &Path) -> bool {
-    let source = local_move_cmp(source);
-    let destination = local_move_cmp(destination);
-    destination == source || destination.starts_with(&source)
+    let source = normalize_local_move_path(source);
+    let destination = normalize_local_move_path(destination);
+    if source.is_empty() || source == "." {
+        return false;
+    }
+    if destination == source {
+        return true;
+    }
+    let mut prefix = source;
+    if !prefix.ends_with("\\") {
+        prefix.push("\\");
+    }
+    destination.starts_with(&prefix)
 }
 
-fn local_move_cmp(path: &Path) -> PathBuf {
-    let mut text = path.to_string_lossy().replace('/', "\\");
-    while text.len() > 3 && text.ends_with('\\') {
-        text.pop();
-    }
+/// Compare move paths after `.` and `..`, so a path that steps out and
+/// back in is still inside the folder, and a sibling path is not.
+fn normalize_local_move_path(path: &Path) -> String {
+    let mut text = path.to_string_lossy().replace("/", "\\");
+    let unc = text.starts_with("\\\\");
+    let has_drive = text.as_bytes().get(1) == Some(&b':');
     #[cfg(windows)]
-    let text = text.to_lowercase();
-    PathBuf::from(text)
+    {
+        text = text.to_lowercase();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for part in text.split("\\") {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            if unc && !parts.is_empty() && parts.len() <= 2 {
+                continue;
+            }
+            if has_drive && parts.len() == 1 && parts[0].ends_with(":") {
+                continue;
+            }
+            if parts.last().is_some_and(|item| item != "..") {
+                parts.pop();
+            } else if !unc && !has_drive {
+                parts.push("..".to_owned());
+            }
+            continue;
+        }
+        parts.push(part.to_owned());
+    }
+    if unc {
+        if parts.is_empty() {
+            return "\\\\".to_owned();
+        }
+        return format!("\\\\{}", parts.join("\\"));
+    }
+    if has_drive {
+        if parts.is_empty() || (parts.len() == 1 && parts[0].ends_with(":")) {
+            let drive = parts.first().map(String::as_str).unwrap_or(".");
+            return format!("{drive}\\");
+        }
+        return parts.join("\\");
+    }
+    if parts.is_empty() {
+        ".".to_owned()
+    } else {
+        parts.join("\\")
+    }
 }
 
 pub fn local_touch(path: &str, mtime: u64, recursive: bool) -> std::io::Result<()> {
@@ -1233,5 +1284,27 @@ mod tests {
 
         let missing = root.join("missing");
         assert!(search_local(&missing.display().to_string(), "hello", 10).is_err());
+    }
+
+    #[test]
+    fn local_move_does_not_land_inside_the_source() {
+        assert!(local_move_lands_inside(Path::new(r"C:\a\box"), Path::new(r"C:\a\box\child")));
+        assert!(local_move_lands_inside(Path::new(r"C:\a\box"), Path::new(r"C:\a\box")));
+        assert!(!local_move_lands_inside(Path::new(r"C:\a\box"), Path::new(r"C:\a\box2\box")));
+        assert!(!local_move_lands_inside(Path::new(r"C:\a\file"), Path::new(r"D:\a\file")));
+        assert!(local_move_lands_inside(Path::new(r"C:\a\box"), Path::new(r"C:\a\box\..\box\child")));
+        assert!(local_move_lands_inside(Path::new(r"C:\a\box"), Path::new(r"C:\a\box2\..\box\child")));
+        assert!(!local_move_lands_inside(Path::new(r"C:\a\box"), Path::new(r"C:\a\box\..\box2")));
+        assert!(!local_move_lands_inside(Path::new(r"C:\a\box"), Path::new(r"C:\a\box2\..\other")));
+        assert!(local_move_lands_inside(Path::new(r"\\server\share\box"), Path::new(r"\\server\share\box\..\box\child")));
+        assert!(!local_move_lands_inside(Path::new(r"\\server\share\box"), Path::new(r"\\server\share\box2")));
+        assert!(local_move_lands_inside(Path::new(r"C:\"), Path::new(r"C:\foo")));
+        assert!(!local_move_lands_inside(Path::new(r"C:\"), Path::new(r"D:\foo")));
+        assert!(!local_move_lands_inside(Path::new(r"foo"), Path::new(r"foo\..\bar")));
+        assert!(local_move_lands_inside(Path::new(r"foo"), Path::new(r"foo\..\foo\child")));
+        #[cfg(windows)]
+        {
+            assert!(local_move_lands_inside(Path::new(r"C:\a\Box"), Path::new(r"c:\a\box\Child")));
+        }
     }
 }
