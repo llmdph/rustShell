@@ -875,17 +875,35 @@ pub fn local_rename(path: &str, new_name: &str) -> std::io::Result<()> {
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> std::io::Result<()> {
+    copy_dir_entries(source, target, true)
+}
+
+fn copy_dir_entries(source: &Path, target: &Path, fail_if_unreadable: bool) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     fs::create_dir(target)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
+    let entries = match fs::read_dir(source) {
+        Ok(entries) => entries,
+        Err(error) if fail_if_unreadable => return Err(error),
+        Err(_) => {
+            preserve_local_metadata(target, &metadata)?;
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
         let child_source = entry.path();
         let child_target = target.join(entry.file_name());
-        let child_metadata = fs::symlink_metadata(&child_source)?;
+        let child_metadata = match fs::symlink_metadata(&child_source) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
         if local_path_is_link(&child_source, &child_metadata) {
             copy_local_symlink(&child_source, &child_target)?;
         } else if child_metadata.is_dir() {
-            copy_dir_recursive(&child_source, &child_target)?;
+            copy_dir_entries(&child_source, &child_target, false)?;
         } else {
             fs::copy(&child_source, &child_target)?;
             preserve_local_metadata(&child_target, &child_metadata)?;
@@ -1381,5 +1399,60 @@ mod tests {
         assert_eq!(stats.file_count, 1);
         assert_eq!(stats.dir_count, 2);
         assert!(local_path_stats(&locked.display().to_string()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn duplicating_a_folder_skips_an_unreadable_child() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-dup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let user = std::env::var("USERNAME").unwrap_or_default();
+                let _ = std::process::Command::new("icacls")
+                    .arg(self.0.join("source").join("locked"))
+                    .arg("/grant")
+                    .arg(format!("{user}:(OI)(CI)F"))
+                    .status();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let source = root.join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("ok.txt"), b"hello").unwrap();
+        let locked = source.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("secret.txt"), b"secret-data").unwrap();
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        let deny_user = format!("{user}:(RX)");
+        let commands: [&[&str]; 3] = [
+            &["/inheritance:r"],
+            &["/deny", deny_user.as_str()],
+            &["/deny", "*S-1-1-0:(RX)"],
+        ];
+        for args in commands {
+            let status = std::process::Command::new("icacls")
+                .arg(&locked)
+                .args(args)
+                .status()
+                .expect("icacls");
+            assert!(status.success(), "icacls failed");
+        }
+
+        let copied = local_duplicate(&source.display().to_string(), "copy").unwrap();
+        let copied = std::path::PathBuf::from(copied);
+        assert_eq!(std::fs::read(copied.join("ok.txt")).unwrap(), b"hello");
+        assert!(copied.join("locked").is_dir());
+        assert!(!copied.join("locked").join("secret.txt").exists());
+        assert!(local_duplicate(&locked.display().to_string(), "locked-copy").is_err());
     }
 }
