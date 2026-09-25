@@ -540,10 +540,21 @@ fn search_local_recursive(
                 continue;
             }
         };
-        let walk = metadata.is_dir() && !local_path_is_link(&path, &metadata);
-        let file_entry = local_entry_from_path(path.clone(), metadata);
-        if entry_matches_query(&file_entry, query) {
-            output.push(file_entry);
+        let is_link = local_path_is_link(&path, &metadata);
+        let walk = metadata.is_dir() && !is_link;
+        let name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut matched = text_contains_query(&name, query)
+            || text_contains_query(&path.display().to_string(), query);
+        if !matched && is_link {
+            if let Ok(target) = fs::read_link(&path) {
+                matched = text_contains_query(&target.display().to_string(), query);
+            }
+        }
+        if matched {
+            output.push(local_entry_from_path(path.clone(), metadata));
         }
         if walk && search_local_recursive(&path, query, max_results, output, incomplete, limited).is_err() {
             *incomplete = true;
@@ -552,13 +563,18 @@ fn search_local_recursive(
     Ok(())
 }
 
-fn entry_matches_query(entry: &FileEntry, query: &str) -> bool {
-    entry.name.to_lowercase().contains(query)
-        || entry.path.to_lowercase().contains(query)
-        || entry
-            .link_target
-            .as_deref()
-            .is_some_and(|target| target.to_lowercase().contains(query))
+pub(crate) fn text_contains_query(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle.is_ascii() {
+        let needle_bytes = needle.as_bytes();
+        return haystack
+            .as_bytes()
+            .windows(needle_bytes.len())
+            .any(|window| window.eq_ignore_ascii_case(needle_bytes));
+    }
+    haystack.to_lowercase().contains(needle)
 }
 
 
@@ -868,6 +884,14 @@ mod tests {
         let listing = list_local_dir(&root.display().to_string()).unwrap();
         assert!(!listing.truncated);
         assert_eq!(listing.entries.len(), DIR_ENTRY_LIMIT);
+    }
+
+    #[test]
+    fn search_text_matches_ascii_case_and_other_letters() {
+        assert!(text_contains_query("Hello.TXT", "hello"));
+        assert!(text_contains_query("notes.txt", "TXT"));
+        assert!(text_contains_query("目录/报告.txt", "报告"));
+        assert!(!text_contains_query("notes.txt", "png"));
     }
 
     #[test]

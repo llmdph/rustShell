@@ -1,8 +1,8 @@
 use crate::core::{
     session::SessionProfile,
     sftp::{
-        local_path_is_link, remote_child_path, remote_parent_path, DirListing, FileEntry,
-        FileSearchResult,
+        local_path_is_link, remote_child_path, remote_parent_path, text_contains_query, DirListing,
+        FileEntry, FileSearchResult,
         TransferConflictStrategy, DIR_ENTRY_LIMIT,
     },
 };
@@ -625,9 +625,20 @@ fn search_remote_recursive(
             return false;
         }
         let should_descend = stat.is_dir() && !stat.file_type().is_symlink();
-        let entry = entry_from_stat(sftp, path_buf.clone(), stat);
-        if entry_matches_query(&entry, query) {
-            output.push(entry);
+        let is_symlink = stat.file_type().is_symlink();
+        let name = path_buf
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| remote_path_text(&path_buf));
+        let mut matched =
+            text_contains_query(&name, query) || text_contains_query(&remote_path_text(&path_buf), query);
+        if !matched && is_symlink {
+            if let Ok(target) = sftp.readlink(&path_buf) {
+                matched = text_contains_query(&remote_path_text(&target), query);
+            }
+        }
+        if matched {
+            output.push(entry_from_stat(sftp, path_buf.clone(), stat));
         }
         if should_descend {
             directories.push(path_buf);
@@ -807,15 +818,6 @@ fn trim_partial_utf8_suffix(bytes: &mut Vec<u8>) {
             return;
         }
     }
-}
-
-fn entry_matches_query(entry: &FileEntry, query: &str) -> bool {
-    entry.name.to_lowercase().contains(query)
-        || entry.path.to_lowercase().contains(query)
-        || entry
-            .link_target
-            .as_deref()
-            .is_some_and(|target| target.to_lowercase().contains(query))
 }
 
 fn entry_from_stat(sftp: &ssh2::Sftp, path_buf: PathBuf, stat: ssh2::FileStat) -> FileEntry {
