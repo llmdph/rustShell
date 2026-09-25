@@ -973,10 +973,7 @@ async fn terminal_resize(request: ResizeRequest, app: AppHandle) -> Result<(), S
     let terminal = terminals
         .get_mut(&id)
         .ok_or_else(|| "终端不存在或已关闭".to_owned())?;
-    terminal.resize(TerminalSize {
-        cols: request.cols.clamp(40, 240),
-        rows: request.rows.clamp(12, 80),
-    });
+    terminal.resize(TerminalSize::from_measured(request.cols, request.rows));
     Ok(())
     }).await
 }

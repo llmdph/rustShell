@@ -25,6 +25,18 @@ impl Default for TerminalSize {
     }
 }
 
+impl TerminalSize {
+    /// Use the size measured by the terminal view. Clamping to a small grid
+    /// makes a wide window wrap early and a narrow window wrap late, so
+    /// typed text no longer lands on the cursor.
+    pub fn from_measured(cols: u16, rows: u16) -> Self {
+        Self {
+            cols: cols.clamp(1, 1024),
+            rows: rows.clamp(1, 512),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalStatus {
     Disconnected,
@@ -642,6 +654,16 @@ mod tests {
         assert_eq!(
             buffer.end_offset() - buffer.bytes().len() as u64,
             total - buffer.bytes().len() as u64
+        );
+    }
+
+    #[test]
+    fn measured_terminal_size_follows_the_window() {
+        assert_eq!(TerminalSize::from_measured(32, 10), TerminalSize { cols: 32, rows: 10 });
+        assert_eq!(TerminalSize::from_measured(0, 0), TerminalSize { cols: 1, rows: 1 });
+        assert_eq!(
+            TerminalSize::from_measured(4000, 2000),
+            TerminalSize { cols: 1024, rows: 512 }
         );
     }
 
