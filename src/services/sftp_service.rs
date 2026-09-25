@@ -28,6 +28,10 @@ use std::os::unix::fs::PermissionsExt;
 const REMOTE_TEXT_PREVIEW_LIMIT: u64 = 1024 * 1024;
 const ENCODED_CHAR_SCAN: u64 = 8;
 const TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const REMOTE_LINK_KEPT: &str =
+    "远程已有同名链接，没有改动它指向的文件。若要替换这个链接，请改用覆盖。";
+const LOCAL_LINK_KEPT: &str =
+    "本地已有同名链接，没有改动它指向的文件。若要替换这个链接，请改用覆盖。";
 const LIBSSH2_ERROR_FILE: i32 = -16;
 const LIBSSH2_ERROR_EAGAIN: i32 = -37;
 
@@ -934,20 +938,24 @@ where
         .as_ref()
         .is_some_and(|metadata| metadata.is_dir())
     {
-        ensure_remote_dir(sftp, Path::new(&remote_path))?;
-        upload_dir_recursive(
-            sftp,
-            local_path,
-            &remote_path,
-            total,
-            &mut transferred,
-            cancel,
-            conflict,
-            &mut on_progress,
-        )
-        .context("failed to upload directory")?;
-        if let Some(metadata) = root_metadata.as_ref() {
-            preserve_remote_metadata(sftp, Path::new(&remote_path), metadata);
+        if open_remote_upload_dir(sftp, Path::new(&remote_path), conflict)? {
+            upload_dir_recursive(
+                sftp,
+                local_path,
+                &remote_path,
+                total,
+                &mut transferred,
+                cancel,
+                conflict,
+                &mut on_progress,
+            )
+            .context("failed to upload directory")?;
+            if let Some(metadata) = root_metadata.as_ref() {
+                preserve_remote_metadata(sftp, Path::new(&remote_path), metadata);
+            }
+        } else {
+            transferred = total;
+            on_progress(transferred, total);
         }
     } else {
         upload_single_file(
@@ -1056,21 +1064,24 @@ where
         )
         .context("failed to download symlink")?;
     } else if stat.is_dir() {
-        fs::create_dir_all(&local_path)
-            .with_context(|| format!("failed to create {}", local_path.display()))?;
-        download_dir_recursive(
-            sftp,
-            &remote_path_text,
-            &local_path,
-            total,
-            &mut transferred,
-            cancel,
-            conflict,
-            &mut on_progress,
-        )
-        .context("failed to download directory")?;
-        preserve_local_permissions(&local_path, stat.perm);
-        preserve_local_times(&local_path, stat.atime, stat.mtime);
+        if open_local_download_dir(&local_path, conflict)? {
+            download_dir_recursive(
+                sftp,
+                &remote_path_text,
+                &local_path,
+                total,
+                &mut transferred,
+                cancel,
+                conflict,
+                &mut on_progress,
+            )
+            .context("failed to download directory")?;
+            preserve_local_permissions(&local_path, stat.perm);
+            preserve_local_times(&local_path, stat.atime, stat.mtime);
+        } else {
+            transferred = total;
+            on_progress(transferred, total);
+        }
     } else {
         download_single_file(
             sftp,
@@ -1504,7 +1515,10 @@ where
             )?;
         } else if metadata.is_dir() {
             let remote_path = resolve_remote_child_path(sftp, remote_dir, &remote_name, conflict)?;
-            ensure_remote_dir(sftp, Path::new(&remote_path))?;
+            if !open_remote_upload_dir(sftp, Path::new(&remote_path), conflict)? {
+                add_skipped_local_tree(&local_path, transferred, total, &cancel, on_progress)?;
+                continue;
+            }
             upload_dir_recursive(
                 sftp,
                 &local_path,
@@ -1741,8 +1755,11 @@ where
             bail!("transfer cancelled");
         }
         let local_path = resolve_local_path(&local_path, conflict)?;
-        fs::create_dir_all(&local_path)
-            .with_context(|| format!("failed to create {}", local_path.display()))?;
+        if !open_local_download_dir(&local_path, conflict)? {
+            let skipped = remote_total_size(sftp, Path::new(&remote_child), &cancel)?;
+            note_skipped_bytes(transferred, total, skipped, on_progress);
+            continue;
+        }
         download_dir_recursive(
             sftp,
             &remote_child,
@@ -1929,11 +1946,16 @@ fn replace_remote_link_for_write(
     if !stat.file_type().is_symlink() {
         return Ok(());
     }
-    if matches!(conflict, TransferConflictStrategy::Resume) {
-        bail!("远程已有同名链接，没有改动它指向的文件。若要替换这个链接，请改用覆盖。");
+    match directory_link_action(conflict) {
+        DirectoryLinkAction::Replace => {
+            sftp.unlink(path)
+                .with_context(|| format!("failed to replace remote link {}", path.display()))?;
+        }
+        DirectoryLinkAction::Skip | DirectoryLinkAction::Refuse => {
+            bail!(REMOTE_LINK_KEPT);
+        }
     }
-    sftp.unlink(path)
-        .with_context(|| format!("failed to replace remote link {}", path.display()))
+    Ok(())
 }
 
 fn replace_local_link_for_write(path: &Path, conflict: TransferConflictStrategy) -> Result<()> {
@@ -1943,14 +1965,128 @@ fn replace_local_link_for_write(path: &Path, conflict: TransferConflictStrategy)
     if !local_path_is_link(path, &metadata) {
         return Ok(());
     }
-    if matches!(conflict, TransferConflictStrategy::Resume) {
-        bail!("本地已有同名链接，没有改动它指向的文件。若要替换这个链接，请改用覆盖。");
+    match directory_link_action(conflict) {
+        DirectoryLinkAction::Replace => {
+            remove_local_link(path)
+                .with_context(|| format!("failed to replace {}", path.display()))?;
+        }
+        DirectoryLinkAction::Skip | DirectoryLinkAction::Refuse => {
+            bail!(LOCAL_LINK_KEPT);
+        }
     }
-    remove_local_link(path).with_context(|| format!("failed to replace {}", path.display()))
+    Ok(())
 }
 
 fn remove_local_link(path: &Path) -> std::io::Result<()> {
     fs::remove_file(path).or_else(|_| fs::remove_dir(path))
+}
+
+fn remote_path_is_link(sftp: &ssh2::Sftp, path: &Path) -> bool {
+    sftp.lstat(path)
+        .ok()
+        .is_some_and(|stat| stat.file_type().is_symlink())
+}
+
+fn open_remote_upload_dir(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    conflict: TransferConflictStrategy,
+) -> Result<bool> {
+    if remote_path_is_link(sftp, path)
+        && matches!(directory_link_action(conflict), DirectoryLinkAction::Skip)
+    {
+        return Ok(false);
+    }
+    replace_remote_link_for_write(sftp, path, conflict)?;
+    ensure_remote_dir(sftp, path)?;
+    Ok(true)
+}
+
+fn open_local_download_dir(path: &Path, conflict: TransferConflictStrategy) -> Result<bool> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if local_path_is_link(path, &metadata)
+            && matches!(directory_link_action(conflict), DirectoryLinkAction::Skip)
+        {
+            return Ok(false);
+        }
+    }
+    replace_local_link_for_write(path, conflict)?;
+    ensure_local_dir(path)?;
+    Ok(true)
+}
+
+fn ensure_local_dir(path: &Path) -> Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.is_dir() && !local_path_is_link(path, &metadata) {
+            return Ok(());
+        }
+        bail!(
+            "local path exists and is not a directory: {}",
+            path.display()
+        );
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("failed to stat {}", path.display()))?;
+            if metadata.is_dir() && !local_path_is_link(path, &metadata) {
+                Ok(())
+            } else {
+                bail!(
+                    "local path exists and is not a directory: {}",
+                    path.display()
+                )
+            }
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to create {}", path.display())),
+    }
+}
+
+fn note_skipped_bytes<F>(transferred: &mut u64, total: u64, size: u64, on_progress: &mut F)
+where
+    F: FnMut(u64, u64),
+{
+    *transferred = transferred.saturating_add(size).min(total);
+    on_progress(*transferred, total);
+}
+
+fn add_skipped_local_tree<F>(
+    path: &Path,
+    transferred: &mut u64,
+    total: u64,
+    cancel: &AtomicBool,
+    on_progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(u64, u64),
+{
+    let size = local_total_size(path, cancel)?;
+    note_skipped_bytes(transferred, total, size, on_progress);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryLinkAction {
+    Skip,
+    Refuse,
+    Replace,
+}
+
+fn directory_link_action(conflict: TransferConflictStrategy) -> DirectoryLinkAction {
+    match conflict {
+        TransferConflictStrategy::Skip => DirectoryLinkAction::Skip,
+        TransferConflictStrategy::Resume => DirectoryLinkAction::Refuse,
+        TransferConflictStrategy::Overwrite | TransferConflictStrategy::Rename => {
+            DirectoryLinkAction::Replace
+        }
+    }
 }
 
 fn remove_local_existing_path(path: &Path) -> std::io::Result<()> {
@@ -1983,8 +2119,9 @@ fn split_file_name(name: &str) -> (String, String) {
 }
 
 fn ensure_remote_dir(sftp: &ssh2::Sftp, path: &Path) -> Result<()> {
-    if let Ok(stat) = sftp.stat(path) {
-        if stat.is_dir() {
+    // lstat: a link to a directory is not the directory itself.
+    if let Ok(stat) = sftp.lstat(path) {
+        if stat.is_dir() && !stat.file_type().is_symlink() {
             return Ok(());
         }
         bail!(
@@ -2484,5 +2621,131 @@ mod text_boundary_tests {
         bytes.pop();
         trim_partial_text_suffix(&mut bytes, "utf-8");
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), "你");
+    }
+}
+
+#[cfg(test)]
+mod directory_link_tests {
+    use super::{
+        directory_link_action, ensure_local_dir, local_path_is_link, open_local_download_dir,
+        DirectoryLinkAction,
+    };
+    use crate::core::sftp::TransferConflictStrategy;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn resume_keeps_a_directory_link_and_overwrite_replaces_it() {
+        assert_eq!(
+            directory_link_action(TransferConflictStrategy::Resume),
+            DirectoryLinkAction::Refuse
+        );
+        assert_eq!(
+            directory_link_action(TransferConflictStrategy::Skip),
+            DirectoryLinkAction::Skip
+        );
+        assert_eq!(
+            directory_link_action(TransferConflictStrategy::Overwrite),
+            DirectoryLinkAction::Replace
+        );
+        assert_eq!(
+            directory_link_action(TransferConflictStrategy::Rename),
+            DirectoryLinkAction::Replace
+        );
+    }
+
+    #[test]
+    fn ensure_local_dir_reuses_a_real_directory_and_rejects_a_file() {
+        let root = scratch_dir("plain");
+        let _cleanup = Cleanup(root.clone());
+        let dir = root.join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        ensure_local_dir(&dir).unwrap();
+        let file = root.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let error = ensure_local_dir(&file).unwrap_err();
+        assert!(error.to_string().contains("not a directory"));
+    }
+
+    #[test]
+    fn download_directory_does_not_enter_an_existing_link() {
+        let root = scratch_dir("link");
+        let _cleanup = Cleanup(root.clone());
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), b"keep").unwrap();
+        let link = root.join("link");
+        make_directory_link(&target, &link);
+        let metadata = std::fs::symlink_metadata(&link).unwrap();
+        assert!(local_path_is_link(&link, &metadata));
+
+        let error = ensure_local_dir(&link).unwrap_err();
+        assert!(error.to_string().contains("not a directory"));
+        assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"keep");
+
+        assert!(!open_local_download_dir(&link, TransferConflictStrategy::Skip).unwrap());
+        assert!(local_path_is_link(
+            &link,
+            &std::fs::symlink_metadata(&link).unwrap()
+        ));
+
+        let error = open_local_download_dir(&link, TransferConflictStrategy::Resume).unwrap_err();
+        assert!(error.to_string().contains("\u{94fe}\u{63a5}"));
+        assert!(local_path_is_link(
+            &link,
+            &std::fs::symlink_metadata(&link).unwrap()
+        ));
+
+        assert!(open_local_download_dir(&link, TransferConflictStrategy::Overwrite).unwrap());
+        let replaced = std::fs::symlink_metadata(&link).unwrap();
+        assert!(!local_path_is_link(&link, &replaced));
+        assert!(replaced.is_dir());
+        assert!(std::fs::read_dir(&link).unwrap().next().is_none());
+        assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn make_directory_link(target: &Path, link: &Path) {
+        if super::create_local_symlink(target, link).is_ok() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg(format!(
+                    "mklink /J \"{}\" \"{}\"",
+                    link.display(),
+                    target.display()
+                ))
+                .status()
+                .expect("start mklink");
+            assert!(status.success(), "could not create a directory junction");
+            return;
+        }
+        #[cfg(not(windows))]
+        panic!("could not create a directory link");
+    }
+
+    struct Cleanup(PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let link = self.0.join("link");
+            let _ = std::fs::remove_file(&link);
+            let _ = std::fs::remove_dir(&link);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
