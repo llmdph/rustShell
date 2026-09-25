@@ -152,10 +152,24 @@ pub fn local_home() -> String {
 }
 
 pub fn local_parent(path: &str) -> Option<String> {
+    if unc_without_share(path) {
+        return None;
+    }
     Path::new(path)
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(|parent| parent.display().to_string())
+}
+
+fn unc_without_share(path: &str) -> bool {
+    let trimmed = path.trim().trim_end_matches(['\\', '/']);
+    let Some(rest) = trimmed
+        .strip_prefix("\\\\")
+        .or_else(|| trimmed.strip_prefix("//"))
+    else {
+        return false;
+    };
+    !rest.is_empty() && !rest.contains('\\') && !rest.contains('/')
 }
 
 pub fn local_mkdir(parent: &str, name: &str) -> std::io::Result<()> {
@@ -1068,6 +1082,20 @@ mod tests {
         assert_eq!(remote_parent_path("/a"), "/");
         assert_eq!(remote_parent_path("/"), "/");
         assert_eq!(remote_parent_path("rel"), ".");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_parent_stays_on_a_unc_root() {
+        assert_eq!(local_parent(r"C:\Windows").as_deref(), Some(r"C:\"));
+        assert_eq!(local_parent(r"C:\"), None);
+        assert_eq!(
+            local_parent(r"\\server\share\folder").as_deref(),
+            Some(r"\\server\share\")
+        );
+        assert_eq!(local_parent(r"\\server\share"), None);
+        assert_eq!(local_parent(r"\\server"), None);
+        assert_eq!(local_parent(r"\\server\"), None);
     }
 
     #[test]

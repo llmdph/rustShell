@@ -9892,6 +9892,8 @@ function localParentPath(path: string) {
   const trimmed = path.trim().replace(/[\\/]+$/g, "");
   if (!trimmed) return ".";
   if (/^[A-Za-z]:$/.test(trimmed)) return `${trimmed}\\`;
+  if (/^\\\\[^\\]+$/.test(trimmed) || /^\/\/[^/]+$/.test(trimmed)) return trimmed;
+  if (/^\\\\[^\\]+\\[^\\]+$/.test(trimmed) || /^\/\/[^/]+\/[^/]+$/.test(trimmed)) return trimmed;
   const slash = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
   if (slash < 0) return ".";
   if (slash === 0) return trimmed[0];
