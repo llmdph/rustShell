@@ -2129,7 +2129,10 @@ fn directory_link_action(conflict: TransferConflictStrategy) -> DirectoryLinkAct
 
 fn remove_local_existing_path(path: &Path) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+    if local_path_is_link(path, &metadata) {
+        return remove_local_link(path);
+    }
+    if metadata.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "本地目标是目录，不能用符号链接覆盖",
@@ -2739,6 +2742,28 @@ mod directory_link_tests {
         assert!(replaced.is_dir());
         assert!(std::fs::read_dir(&link).unwrap().next().is_none());
         assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn replacing_a_directory_link_removes_only_the_link() {
+        let root = scratch_dir("replace-link");
+        let _cleanup = Cleanup(root.clone());
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), b"keep").unwrap();
+        let link = root.join("link");
+        make_directory_link(&target, &link);
+
+        super::remove_local_existing_path(&link).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"keep");
+
+        let dir = root.join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        let error = super::remove_local_existing_path(&dir).unwrap_err();
+        assert!(error.to_string().contains("目录"));
+        assert!(dir.is_dir());
     }
 
     fn scratch_dir(name: &str) -> PathBuf {
