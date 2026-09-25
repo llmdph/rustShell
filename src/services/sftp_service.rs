@@ -1061,14 +1061,14 @@ fn replace_remote_file(
         let _ = sftp.unlink(&temp);
         return Err(error);
     }
-    if let Err(error) = sftp.rename(path, &backup) {
+    if let Err(error) = sftp.rename(path, &backup, None) {
         let _ = sftp.unlink(&temp);
         return Err(error).with_context(|| {
             format!("failed to preserve remote file {}", path.display())
         });
     }
-    if let Err(error) = sftp.rename(&temp, path) {
-        let restored = sftp.rename(&backup, path);
+    if let Err(error) = sftp.rename(&temp, path, None) {
+        let restored = sftp.rename(&backup, path, None);
         let _ = sftp.unlink(&temp);
         if restored.is_err() {
             bail!("保存失败：原文件已改为备份，但新内容没有就位");
