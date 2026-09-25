@@ -193,10 +193,23 @@ pub fn local_create_symlink(parent: &str, name: &str, target: &str) -> std::io::
 }
 
 pub fn local_remove(path: &str, is_dir: bool) -> std::io::Result<()> {
+    let target = Path::new(path);
+    if let Ok(metadata) = fs::symlink_metadata(target) {
+        if local_path_is_link(target, &metadata) {
+            return remove_local_link(target);
+        }
+    }
     if is_dir {
         fs::remove_dir_all(path)
     } else {
         fs::remove_file(path)
+    }
+}
+
+fn remove_local_link(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) => fs::remove_dir(path).or(Err(error)),
     }
 }
 
@@ -818,5 +831,57 @@ mod tests {
         assert!(validate_file_name("a/b").is_err());
         assert!(validate_file_name("a\\b").is_err());
         assert!(validate_file_name("..").is_err());
+    }
+
+    #[test]
+    fn deleting_a_directory_link_keeps_the_folder_it_points_to() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-dir-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let link = self.0.join("link");
+                let _ = std::fs::remove_file(&link);
+                let _ = std::fs::remove_dir(&link);
+                let _ = std::fs::remove_file(self.0.join("target").join("keep.txt"));
+                let _ = std::fs::remove_dir(self.0.join("target"));
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), b"keep").unwrap();
+        let link = root.join("link");
+        make_directory_link(&target, &link);
+
+        local_remove(&link.display().to_string(), false).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    fn make_directory_link(target: &std::path::Path, link: &std::path::Path) {
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .status()
+                .expect("start mklink");
+            assert!(status.success(), "could not create a directory junction");
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).unwrap();
+        }
     }
 }
