@@ -696,7 +696,6 @@ export default function App() {
     const setPrimary = side === "local" ? setSelectedLocal : setSelectedRemote;
     const setPaths = side === "local" ? setSelectedLocalPaths : setSelectedRemotePaths;
     const anchorRef = side === "local" ? localSelectionAnchorRef : remoteSelectionAnchorRef;
-    setPrimary(file);
 
     if (event.shiftKey && anchorRef.current) {
       const anchorIndex = files.findIndex((item) => item.path === anchorRef.current);
@@ -704,17 +703,36 @@ export default function App() {
       if (anchorIndex >= 0 && currentIndex >= 0) {
         const start = Math.min(anchorIndex, currentIndex);
         const end = Math.max(anchorIndex, currentIndex);
+        setPrimary(file);
         setPaths(files.slice(start, end + 1).map((item) => item.path));
         return;
       }
     }
 
     if (event.ctrlKey || event.metaKey) {
-      setPaths((current) => togglePath(current, file.path));
-      anchorRef.current = file.path;
+      setPaths((current) => {
+        const next = togglePath(current, file.path);
+        if (!next.includes(file.path)) {
+          let fallback: FileEntry | null = null;
+          for (let index = next.length - 1; index >= 0; index -= 1) {
+            const match = files.find((item) => item.path === next[index]);
+            if (match) {
+              fallback = match;
+              break;
+            }
+          }
+          setPrimary(fallback);
+          anchorRef.current = fallback?.path ?? null;
+        } else {
+          setPrimary(file);
+          anchorRef.current = file.path;
+        }
+        return next;
+      });
       return;
     }
 
+    setPrimary(file);
     setPaths([file.path]);
     anchorRef.current = file.path;
   };
@@ -9398,8 +9416,7 @@ function scpRemotePrefix(profile: Profile) {
 
 function togglePath(paths: string[], path: string) {
   if (paths.includes(path)) {
-    const next = paths.filter((item) => item !== path);
-    return next.length > 0 ? next : [path];
+    return paths.filter((item) => item !== path);
   }
   return [...paths, path];
 }
