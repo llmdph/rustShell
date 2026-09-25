@@ -412,30 +412,11 @@ impl SftpConnection {
             .unwrap_or(0o644)
             & 0o7777;
         let bytes = encode_text_bytes(content, charset)?;
-        let mut file = self
-            .sftp
-            .open_mode(
-                path,
-                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
-                mode as i32,
-                OpenType::File,
-            )
-            .with_context(|| {
-                format!("failed to open remote file for writing {}", path.display())
-            })?;
-        file.write_all(&bytes)
-            .with_context(|| format!("failed to write remote file {}", path.display()))?;
-        file.flush().ok();
-        drop(file);
-        if let Some(previous) = previous {
-            if previous.uid.is_some() || previous.gid.is_some() {
-                let _ = chown_one(&self.sftp, path, previous.uid, previous.gid);
-            }
-            if let Some(mode) = previous.perm {
-                let _ = set_remote_permissions(&self.sftp, path, mode);
-            }
-        }
-        Ok(())
+        let Some(previous) = previous else {
+            write_new_remote_file(&self.sftp, path, &bytes, mode)?;
+            return Ok(());
+        };
+        replace_remote_file(&self.sftp, path, &bytes, mode, &previous)
     }
 
     pub fn file_sha256(&self, path: &str) -> Result<String> {
@@ -1027,6 +1008,93 @@ fn connect(profile: &SessionProfile, password: Option<&str>) -> Result<ssh2::Ses
     ssh::establish(profile, password).map_err(|error| anyhow!(error.to_string()))
 }
 
+
+
+fn write_new_remote_file(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<()> {
+    let mut file = sftp
+        .open_mode(
+            path,
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            mode as i32,
+            OpenType::File,
+        )
+        .with_context(|| format!("failed to open remote file for writing {}", path.display()))?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let wrote = file
+            .write(&bytes[offset..])
+            .with_context(|| format!("failed to write remote file {}", path.display()))?;
+        if wrote == 0 {
+            bail!("保存中断，没有写入新的数据");
+        }
+        offset += wrote;
+    }
+    file.flush().ok();
+    Ok(())
+}
+
+fn replace_remote_file(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    previous: &ssh2::FileStat,
+) -> Result<()> {
+    let temp = remote_sibling_path(path, "rustshell-new")?;
+    let backup = remote_sibling_path(path, "rustshell-bak")?;
+    if sftp.lstat(&temp).is_ok() || sftp.lstat(&backup).is_ok() {
+        bail!("保存失败：同目录下有未完成的临时文件，原文件未改动");
+    }
+    if let Err(error) = write_new_remote_file(sftp, &temp, bytes, mode) {
+        let _ = sftp.unlink(&temp);
+        return Err(error);
+    }
+    if let Err(error) = sftp.rename(path, &backup) {
+        let _ = sftp.unlink(&temp);
+        return Err(error).with_context(|| {
+            format!("failed to preserve remote file {}", path.display())
+        });
+    }
+    if let Err(error) = sftp.rename(&temp, path) {
+        let restored = sftp.rename(&backup, path);
+        let _ = sftp.unlink(&temp);
+        if restored.is_err() {
+            bail!("保存失败：原文件已改为备份，但新内容没有就位");
+        }
+        return Err(error).with_context(|| {
+            format!("failed to replace remote file {}", path.display())
+        });
+    }
+    let _ = sftp.unlink(&backup);
+    if previous.uid.is_some() || previous.gid.is_some() {
+        let _ = chown_one(sftp, path, previous.uid, previous.gid);
+    }
+    if let Some(mode) = previous.perm {
+        let _ = set_remote_permissions(sftp, path, mode);
+    }
+    Ok(())
+}
+
+fn remote_sibling_path(path: &Path, suffix: &str) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("remote file name is missing"))?
+        .to_string_lossy();
+    let parent = path
+        .parent()
+        .map(remote_path_text)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ".".to_owned());
+    Ok(PathBuf::from(remote_child_path(
+        &parent,
+        &format!("{name}.{suffix}"),
+    )))
+}
 
 fn copy_until_eof<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<()> {
     let mut buffer = [0_u8; 64 * 1024];

@@ -347,16 +347,33 @@ pub fn local_write_text_file(path: &str, content: &str) -> std::io::Result<()> {
             "不能编辑目录",
         ));
     }
-    let previous_mode = fs::metadata(path)
-        .ok()
-        .map(|metadata| local_mode(&metadata));
-    let mut file = fs::File::create(path)?;
-    file.write_all(content.as_bytes())?;
-    file.flush()?;
-    drop(file);
-    if let Some(mode) = previous_mode {
-        let _ = set_local_permissions(path, mode);
+    let previous_mode = local_mode(&link_metadata);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "无法确定文件名")
+    })?;
+    let temp = parent.join(format!(".{}.rustshell-tmp", file_name.to_string_lossy()));
+    if fs::symlink_metadata(&temp).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "保存失败：同目录下有未完成的临时文件，原文件未改动",
+        ));
     }
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    let _ = set_local_permissions(path, previous_mode);
     Ok(())
 }
 
