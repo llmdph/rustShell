@@ -4746,6 +4746,7 @@ export default function App() {
               side="local"
               title="本地"
               path={localPath}
+              scrollKey={`${localPath}\0${localFilter}\0${localSearch?.query ?? ""}\0${compareDirectories ? compareView : "all"}`}
               files={visibleLocalFiles}
               compareMarks={compareDirectories ? directoryCompare.local : emptyCompareMarks}
               selected={visibleSelectedLocal}
@@ -5092,6 +5093,7 @@ export default function App() {
                 side="remote"
                 title="远程"
                 path={remotePath}
+                scrollKey={`${remotePath}\0${remoteFilter}\0${remoteSearch?.query ?? ""}\0${compareDirectories ? compareView : "all"}`}
                 files={visibleRemoteFiles}
                 compareMarks={compareDirectories ? directoryCompare.remote : emptyCompareMarks}
                 selected={visibleSelectedRemote}
@@ -6428,6 +6430,7 @@ function FilePane({
   side,
   title,
   path,
+  scrollKey,
   files,
   compareMarks,
   selected,
@@ -6471,6 +6474,7 @@ function FilePane({
   side: FileSide;
   title: string;
   path: string;
+  scrollKey: string;
   files: FileEntry[];
   compareMarks: Map<string, FileCompareMark>;
   selected: FileEntry | null;
@@ -6651,6 +6655,7 @@ function FilePane({
       {notice}
       <FileList
         files={files}
+        scrollKey={scrollKey}
         compareMarks={compareMarks}
         selected={selected}
         selectedPaths={selectedPaths}
@@ -6889,6 +6894,7 @@ const FILE_ROW_OVERSCAN = 10;
 
 function FileList({
   files,
+  scrollKey,
   compareMarks,
   selected,
   selectedPaths,
@@ -6907,6 +6913,7 @@ function FileList({
   onContextMenu
 }: {
   files: FileEntry[];
+  scrollKey: string;
   compareMarks: Map<string, FileCompareMark>;
   selected: FileEntry | null;
   selectedPaths: string[];
@@ -6954,12 +6961,11 @@ function FileList({
     };
   }, [updateRange, virtual, files.length]);
 
-  const listIdentity = `${files.length}\0${files[0]?.path ?? ""}\0${files[files.length - 1]?.path ?? ""}`;
   useEffect(() => {
     const node = listRef.current;
     if (node) node.scrollTop = 0;
     setRange({ start: 0, end: 40 });
-  }, [listIdentity]);
+  }, [scrollKey]);
 
   const revealedSelectionRef = useRef("");
   const selectedPath = selected?.path ?? "";
