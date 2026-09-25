@@ -1396,14 +1396,14 @@ where
 {
     let metadata = fs::metadata(local_path)
         .with_context(|| format!("failed to stat {}", local_path.display()))?;
-    if matches!(conflict, TransferConflictStrategy::Skip) && sftp.stat(remote_path).is_ok() {
+    if matches!(conflict, TransferConflictStrategy::Skip) && sftp.lstat(remote_path).is_ok() {
         *transferred += metadata.len();
         on_progress(*transferred, total);
         return Ok(());
     }
-
     let mut local = File::open(local_path)
         .with_context(|| format!("failed to open {}", local_path.display()))?;
+    replace_remote_link_for_write(sftp, remote_path, conflict)?;
     let mut remote = if matches!(conflict, TransferConflictStrategy::Resume) {
         if let Ok(stat) = sftp.stat(remote_path) {
             match choose_resume(stat.size, Some(metadata.len())) {
@@ -1546,7 +1546,7 @@ fn download_single_file<F>(
 where
     F: FnMut(u64, u64),
 {
-    if matches!(conflict, TransferConflictStrategy::Skip) && local_path.exists() {
+    if matches!(conflict, TransferConflictStrategy::Skip) && local_path_exists(local_path) {
         let size = sftp
             .stat(remote_path)
             .ok()
@@ -1556,10 +1556,10 @@ where
         on_progress(*transferred, total);
         return Ok(());
     }
-
     let stat = sftp
         .stat(remote_path)
         .with_context(|| format!("failed to stat remote file {}", remote_path.display()))?;
+    replace_local_link_for_write(local_path, conflict)?;
     let (mut remote, mut local) =
         if matches!(conflict, TransferConflictStrategy::Resume) && local_path.exists() {
             let local_size = fs::metadata(local_path)
@@ -1915,6 +1915,42 @@ fn resolve_local_path(path: &Path, conflict: TransferConflictStrategy) -> Result
 
 fn local_path_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
+}
+
+
+fn replace_remote_link_for_write(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    conflict: TransferConflictStrategy,
+) -> Result<()> {
+    let Ok(stat) = sftp.lstat(path) else {
+        return Ok(());
+    };
+    if !stat.file_type().is_symlink() {
+        return Ok(());
+    }
+    if matches!(conflict, TransferConflictStrategy::Resume) {
+        bail!("远程已有同名链接，没有改动它指向的文件。若要替换这个链接，请改用覆盖。");
+    }
+    sftp.unlink(path)
+        .with_context(|| format!("failed to replace remote link {}", path.display()))
+}
+
+fn replace_local_link_for_write(path: &Path, conflict: TransferConflictStrategy) -> Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if !local_path_is_link(path, &metadata) {
+        return Ok(());
+    }
+    if matches!(conflict, TransferConflictStrategy::Resume) {
+        bail!("本地已有同名链接，没有改动它指向的文件。若要替换这个链接，请改用覆盖。");
+    }
+    remove_local_link(path).with_context(|| format!("failed to replace {}", path.display()))
+}
+
+fn remove_local_link(path: &Path) -> std::io::Result<()> {
+    fs::remove_file(path).or_else(|_| fs::remove_dir(path))
 }
 
 fn remove_local_existing_path(path: &Path) -> std::io::Result<()> {
