@@ -2125,6 +2125,8 @@ fn system_ssh_remote_home(profile: &SessionProfile) -> Result<String, String> {
 }
 
 fn system_ssh_list_dir(profile: &SessionProfile, path: &str) -> Result<DirListing, String> {
+    // Names may contain tabs and newlines. Each record is hex-encoded on one
+    // line so head can still stop the listing at the cap.
     let command = format!(
         r#"
 dir={dir}
@@ -2148,7 +2150,8 @@ for path do
   perm=$(stat -c %a "$path" 2>/dev/null || echo 0)
   uid=$(stat -c %u "$path" 2>/dev/null || echo 0)
   gid=$(stat -c %g "$path" 2>/dev/null || echo 0)
-  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$name" "$path" "$kind" "$size" "$mtime" "$perm" "$uid" "$gid" "$target"
+  printf "%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0" "$name" "$path" "$kind" "$size" "$mtime" "$perm" "$uid" "$gid" "$target" | od -An -v -tx1 | tr -cd "0-9a-fA-F"
+  printf "\n"
 done
 ' sh {{}} + | head -n {extra}
 "#,
@@ -2215,11 +2218,20 @@ fn system_ssh_output(profile: &SessionProfile, remote_command: &str) -> Result<S
 }
 
 fn parse_system_ssh_entry(line: &str) -> Option<FileEntry> {
-    let fields = line.splitn(9, '\t').collect::<Vec<_>>();
+    let bytes = decode_hex_bytes(line)?;
+    let mut fields = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != 0 {
+            continue;
+        }
+        fields.push(String::from_utf8(bytes[start..index].to_vec()).ok()?);
+        start = index + 1;
+    }
     if fields.len() < 8 {
         return None;
     }
-    let file_type = fields[2].to_owned();
+    let file_type = fields[2].clone();
     let is_dir = file_type == "directory";
     let size = fields[3].parse::<u64>().unwrap_or_default();
     let mtime = fields[4].parse::<i64>().unwrap_or_default().max(0);
@@ -2235,8 +2247,8 @@ fn parse_system_ssh_entry(line: &str) -> Option<FileEntry> {
         .filter(|value| !value.is_empty());
 
     Some(FileEntry {
-        name: fields[0].to_owned(),
-        path: fields[1].to_owned(),
+        name: fields[0].clone(),
+        path: fields[1].clone(),
         size,
         modified_at,
         is_dir,
@@ -2246,6 +2258,32 @@ fn parse_system_ssh_entry(line: &str) -> Option<FileEntry> {
         uid,
         gid,
     })
+}
+
+fn decode_hex_bytes(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    if text.is_empty() || text.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(text.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        let high = hex_nibble(bytes[index])?;
+        let low = hex_nibble(bytes[index + 1])?;
+        decoded.push((high << 4) | low);
+        index += 2;
+    }
+    Some(decoded)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn shell_quote(value: &str) -> String {
@@ -2692,4 +2730,93 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
 
 fn to_string(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod system_ssh_listing_tests {
+    use super::parse_system_ssh_entry;
+
+    fn listing_line(fields: &[&str]) -> String {
+        let mut bytes = Vec::new();
+        for field in fields {
+            bytes.extend(field.as_bytes());
+            bytes.push(0);
+        }
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn plain_name_keeps_its_fields() {
+        let entry = parse_system_ssh_entry(&listing_line(&[
+            "readme",
+            "/tmp/readme",
+            "file",
+            "4",
+            "10",
+            "644",
+            "1",
+            "2",
+            "",
+        ]))
+        .unwrap();
+        assert_eq!(entry.name, "readme");
+        assert_eq!(entry.path, "/tmp/readme");
+        assert_eq!(entry.file_type, "file");
+        assert_eq!(entry.size, 4);
+        assert_eq!(entry.permissions, Some(0o644));
+        assert_eq!(entry.uid, Some(1));
+        assert_eq!(entry.gid, Some(2));
+        assert!(entry.link_target.is_none());
+        assert!(!entry.is_dir);
+    }
+
+    #[test]
+    fn tab_and_newline_in_a_name_stay_in_the_name() {
+        let entry = parse_system_ssh_entry(&listing_line(&[
+            "weird\tname\na",
+            "/tmp/weird\tname\na",
+            "symlink",
+            "10",
+            "1700000000",
+            "777",
+            "3",
+            "4",
+            "target\tthere",
+        ]))
+        .unwrap();
+        assert_eq!(entry.name, "weird\tname\na");
+        assert_eq!(entry.path, "/tmp/weird\tname\na");
+        assert_eq!(entry.file_type, "symlink");
+        assert!(!entry.is_dir);
+        assert_eq!(entry.size, 10);
+        assert_eq!(entry.link_target.as_deref(), Some("target\tthere"));
+        assert_eq!(entry.uid, Some(3));
+        assert_eq!(entry.gid, Some(4));
+    }
+
+    #[test]
+    fn directory_kind_is_a_directory() {
+        let entry = parse_system_ssh_entry(&listing_line(&[
+            "docs",
+            "/tmp/docs",
+            "directory",
+            "0",
+            "0",
+            "755",
+            "0",
+            "0",
+            "",
+        ]))
+        .unwrap();
+        assert!(entry.is_dir);
+        assert_eq!(entry.file_type, "directory");
+        assert_eq!(entry.permissions, Some(0o755));
+    }
+
+    #[test]
+    fn short_or_corrupt_line_is_ignored() {
+        assert!(parse_system_ssh_entry("only-a-name").is_none());
+        assert!(parse_system_ssh_entry("zz").is_none());
+        assert!(parse_system_ssh_entry("0").is_none());
+    }
 }
