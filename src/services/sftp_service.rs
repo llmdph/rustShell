@@ -243,9 +243,20 @@ impl SftpConnection {
 
     pub fn rename_path(&self, path: &str, new_name: &str) -> Result<String> {
         validate_remote_name(new_name)?;
+        let source_name = Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if source_name == new_name {
+            return Ok(path.to_owned());
+        }
         let target = remote_child_path(&remote_parent_path(path), new_name);
         let target_path = Path::new(&target);
         if self.sftp.lstat(target_path).is_ok() {
+            if remote_name_change_is_case_only(&self.sftp, path, &source_name, new_name)? {
+                rename_remote_case_only(&self.sftp, path, &target)?;
+                return Ok(target);
+            }
             bail!("remote target already exists: {}", target);
         }
         self.sftp
@@ -2827,6 +2838,72 @@ fn validate_owner_change(uid: Option<u32>, gid: Option<u32>) -> Result<()> {
     Ok(())
 }
 
+fn remote_name_change_is_case_only(
+    sftp: &ssh2::Sftp,
+    path: &str,
+    source_name: &str,
+    new_name: &str,
+) -> Result<bool> {
+    if source_name.is_empty() || source_name.to_lowercase() != new_name.to_lowercase() {
+        return Ok(false);
+    }
+    let parent = remote_parent_path(path);
+    let folded = new_name.to_lowercase();
+    let mut matched = Vec::new();
+    visit_remote_entries(sftp, Path::new(&parent), None, |path_buf, _stat| {
+        let name = path_buf
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.to_lowercase() == folded {
+            matched.push(name);
+            if matched.len() > 1 {
+                return false;
+            }
+        }
+        true
+    })?;
+    let matched_refs: Vec<&str> = matched.iter().map(String::as_str).collect();
+    Ok(only_case_variant_is_source(
+        source_name,
+        new_name,
+        &matched_refs,
+    ))
+}
+
+fn only_case_variant_is_source(source_name: &str, new_name: &str, folded_matches: &[&str]) -> bool {
+    !source_name.is_empty()
+        && source_name != new_name
+        && source_name.to_lowercase() == new_name.to_lowercase()
+        && folded_matches.len() == 1
+        && folded_matches[0].to_lowercase() == new_name.to_lowercase()
+}
+
+fn rename_remote_case_only(sftp: &ssh2::Sftp, path: &str, target: &str) -> Result<()> {
+    let parent = remote_parent_path(path);
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp = remote_child_path(
+        &parent,
+        &format!(".{}.{}.rename-tmp", std::process::id(), nanos),
+    );
+    let temp_path = Path::new(&temp);
+    if sftp.lstat(temp_path).is_ok() {
+        bail!("重命名失败：同目录下有未完成的临时文件，原文件未改动");
+    }
+    sftp.rename(Path::new(path), temp_path, None)
+        .with_context(|| format!("failed to rename {} to {}", path, temp))?;
+    if let Err(error) = sftp.rename(temp_path, Path::new(target), None) {
+        if sftp.rename(temp_path, Path::new(path), None).is_err() {
+            bail!("重命名没有完成，文件暂时改成了临时名字，请再改回原来的名字");
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn validate_remote_name(name: &str) -> Result<()> {
     if name.trim().is_empty() || name.contains('/') || name == "." || name == ".." {
         bail!("remote file name is invalid");
@@ -3216,5 +3293,32 @@ mod local_size_tests {
             allow_list_access(&self.0.join("locked"));
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod case_rename_tests {
+    use super::only_case_variant_is_source;
+
+    #[test]
+    fn one_folded_name_can_change_case() {
+        assert!(only_case_variant_is_source(
+            "Readme.TXT",
+            "readme.txt",
+            &["Readme.TXT"]
+        ));
+        assert!(only_case_variant_is_source(
+            "readme.txt",
+            "README.txt",
+            &["Readme.TXT"]
+        ));
+        assert!(!only_case_variant_is_source(
+            "Readme.TXT",
+            "readme.txt",
+            &["Readme.TXT", "readme.txt"]
+        ));
+        assert!(!only_case_variant_is_source("Readme.TXT", "other.txt", &["other.txt"]));
+        assert!(!only_case_variant_is_source("Readme.TXT", "Readme.TXT", &["Readme.TXT"]));
+        assert!(!only_case_variant_is_source("Readme.TXT", "readme.txt", &[]));
     }
 }

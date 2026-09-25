@@ -1020,17 +1020,53 @@ fn set_local_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
 pub fn local_rename(path: &str, new_name: &str) -> std::io::Result<()> {
     validate_file_name(new_name)?;
     let source = PathBuf::from(path);
-    let target = source
-        .parent()
-        .map(|parent| parent.join(new_name))
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "无法确定父目录"))?;
+    let parent = source.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "无法确定父目录",
+        )
+    })?;
+    let target = parent.join(new_name);
+    if source.file_name().is_some_and(|name| name == std::ffi::OsStr::new(new_name)) {
+        return Ok(());
+    }
     if local_path_exists(&target) {
+        if source != target {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "目标已存在",
+            ));
+        }
+        return rename_local_case_only(&source, &target);
+    }
+    fs::rename(source, target)
+}
+
+fn rename_local_case_only(source: &Path, target: &Path) -> std::io::Result<()> {
+    let parent = source.parent().unwrap_or(Path::new("."));
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp = parent.join(format!(
+        ".{}.{}.rename-tmp",
+        std::process::id(),
+        nanos
+    ));
+    if local_path_exists(&temp) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            "目标已存在",
+            "重命名失败：同目录下有未完成的临时文件，原文件未改动",
         ));
     }
-    fs::rename(&source, target)
+    fs::rename(source, &temp)?;
+    if let Err(error) = fs::rename(&temp, target) {
+        if fs::rename(&temp, source).is_err() {
+            return Err(std::io::Error::new(error.kind(), "重命名没有完成，文件暂时改成了临时名字，请再改回原来的名字"));
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> std::io::Result<()> {
@@ -1419,6 +1455,68 @@ mod tests {
             assert!(local_write_text_file(&legacy, "\u{1f600}").is_err());
             assert_eq!(std::fs::read(&legacy_path).unwrap(), before);
         }
+    }
+
+
+    #[test]
+    fn local_rename_keeps_a_different_existing_file() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-rename-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let file = root.join("Readme.TXT");
+        std::fs::write(&file, b"keep").unwrap();
+        let path = file.display().to_string();
+        local_rename(&path, "Readme.TXT").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+        std::fs::write(root.join("other.txt"), b"other").unwrap();
+        assert!(local_rename(&path, "other.txt").is_err());
+        assert_eq!(std::fs::read(root.join("other.txt")).unwrap(), b"other");
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_rename_changes_only_letter_case() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-rename-case-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let file = root.join("Readme.TXT");
+        std::fs::write(&file, b"keep").unwrap();
+        local_rename(&file.display().to_string(), "readme.txt").unwrap();
+        let names: Vec<_> = list_local_dir(&root.display().to_string())
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, vec!["readme.txt".to_owned()]);
+        assert_eq!(std::fs::read(root.join("readme.txt")).unwrap(), b"keep");
     }
 
     #[cfg(windows)]
