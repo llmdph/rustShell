@@ -3119,8 +3119,8 @@ export default function App() {
       return;
     }
     const targetModeByPath = new Map(targetModes.map((item) => [item.target.path, item.mode as number]));
-    const originalMtime = Math.floor(new Date(propertiesTarget.modifiedAt).getTime() / 1000);
-    const shouldTouch = mtime != null && (multiple || mtime !== originalMtime);
+    const loadedMtimeText = commonEntryValue(targets, (target) => formatDateTimeLocal(target.modifiedAt));
+    const shouldTouch = mtime != null && mtime !== loadedMtimeText;
     const shouldChown =
       propertiesSide === "remote" &&
       (multiple
@@ -8116,6 +8116,7 @@ function PropertiesDialog({
       <FormRow label="修改时间">
         <input
           type="datetime-local"
+          step="1"
           value={mtime}
           onChange={(event) => onMtime(event.target.value)}
           title={multiple ? "留空不修改" : undefined}
@@ -10445,7 +10446,7 @@ function formatDateTimeLocal(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime()) || date.getTime() <= 0) return "";
   const pad = (part: number) => String(part).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function touchTimestamp(value: string) {
