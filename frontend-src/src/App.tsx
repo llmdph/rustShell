@@ -1019,16 +1019,11 @@ export default function App() {
   const refreshTransfers = useCallback(async () => {
     if (!hasTauriRuntime()) return;
     try {
-      const [nextTransfers, nextHistory] = await Promise.all([api.listTransfers(), api.listTransferHistory()]);
+      const nextTransfers = await api.listTransfers();
       transfersRef.current = nextTransfers;
-      transferHistoryRef.current = nextHistory;
       setTransfers((current) => (sameTransferList(current, nextTransfers) ? current : nextTransfers));
-      setTransferHistory((current) => (sameTransferList(current, nextHistory) ? current : nextHistory));
     } catch {
-      transfersRef.current = [];
-      transferHistoryRef.current = [];
-      setTransfers((current) => (current.length === 0 ? current : []));
-      setTransferHistory((current) => (current.length === 0 ? current : []));
+      // Keep the last queue. A failed poll is not an empty transfer list.
     }
   }, []);
 
@@ -1215,6 +1210,14 @@ export default function App() {
   }, [refreshRemoteFiles, remoteBrowserReady, remoteHomeReady]);
 
   useEffect(() => {
+    if (!hasTauriRuntime()) return;
+    api.listTransferHistory().then((next) => {
+      transferHistoryRef.current = next;
+      setTransferHistory((current) => (sameTransferList(current, next) ? current : next));
+    }).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
     let stopped = false;
     let timer = 0;
     const loop = async () => {
@@ -1254,7 +1257,14 @@ export default function App() {
   useEffect(() => {
     const previous = transferStatusRef.current;
     const completed = transfers.filter((transfer) => previous.get(transfer.id) === "running" && transfer.status === "done");
+    const settled = transfers.some((transfer) => previous.get(transfer.id) === "running" && transfer.status !== "running");
     transferStatusRef.current = new Map(transfers.map((transfer) => [transfer.id, transfer.status]));
+    if (settled && hasTauriRuntime()) {
+      api.listTransferHistory().then((next) => {
+        transferHistoryRef.current = next;
+        setTransferHistory((current) => (sameTransferList(current, next) ? current : next));
+      }).catch(() => undefined);
+    }
     if (completed.length === 0) return;
 
     refreshLocalFiles();
