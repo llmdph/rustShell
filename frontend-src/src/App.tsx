@@ -3073,7 +3073,10 @@ export default function App() {
   const startWindowDrag = async (event: MouseEvent<HTMLElement>) => {
     if (!hasTauriRuntime() || event.button !== 0) return;
     if (event.target instanceof Element && event.target.closest(windowDragExcludeSelector)) return;
-    event.preventDefault();
+    if (event.detail > 1) {
+      await getCurrentWindow().toggleMaximize().catch(() => undefined);
+      return;
+    }
     await getCurrentWindow().startDragging().catch(() => undefined);
   };
 
