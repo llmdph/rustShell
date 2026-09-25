@@ -2844,7 +2844,7 @@ fn copy_remote_path(
     target: &Path,
     is_dir_hint: bool,
 ) -> Result<()> {
-    copy_remote_path_inner(sftp, source, target, is_dir_hint, true)
+    copy_remote_path_inner(sftp, source, target, is_dir_hint, true, None)
 }
 
 fn copy_remote_path_inner(
@@ -2853,18 +2853,25 @@ fn copy_remote_path_inner(
     target: &Path,
     is_dir_hint: bool,
     strict: bool,
+    known: Option<ssh2::FileStat>,
 ) -> Result<()> {
     if sftp.lstat(target).is_ok() {
         bail!("remote target already exists: {}", target.display());
     }
 
-    let stat = match sftp.lstat(source) {
-        Ok(stat) => stat,
-        Err(error) if strict => {
-            return Err(error)
-                .with_context(|| format!("failed to stat remote path {}", source.display()));
+    // A directory listing already carried size, type, and time. Asking again
+    // costs a round trip for every file in the folder.
+    let stat = if let Some(stat) = known.and_then(trusted_listing_stat) {
+        stat
+    } else {
+        match sftp.lstat(source) {
+            Ok(stat) => stat,
+            Err(error) if strict => {
+                return Err(error)
+                    .with_context(|| format!("failed to stat remote path {}", source.display()));
+            }
+            Err(_) => return Ok(()),
         }
-        Err(_) => return Ok(()),
     };
 
     if stat.file_type().is_symlink() {
@@ -2897,12 +2904,19 @@ fn copy_remote_path_inner(
                 return Ok(());
             }
         };
-        for (child, _) in children {
+        for (child, child_stat) in children {
             let Some(name) = child.file_name() else {
                 continue;
             };
             let child_target = remote_child_path(&remote_path_text(target), &name.to_string_lossy());
-            copy_remote_path_inner(sftp, &child, Path::new(&child_target), false, false)?;
+            copy_remote_path_inner(
+                sftp,
+                &child,
+                Path::new(&child_target),
+                false,
+                false,
+                Some(child_stat),
+            )?;
         }
         preserve_remote_owner(sftp, target, stat.uid, stat.gid);
         preserve_remote_mode_and_times(sftp, target, stat.perm, stat.atime, stat.mtime);
