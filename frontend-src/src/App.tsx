@@ -7031,14 +7031,24 @@ function FileList({
   const updateRange = useCallback(() => {
     const node = listRef.current;
     if (!node) return;
-    const bodyTop = Math.max(0, node.scrollTop - FILE_ROW_HEIGHT);
-    const start = Math.max(0, Math.floor(bodyTop / FILE_ROW_HEIGHT) - FILE_ROW_OVERSCAN);
+    let scrollTop = node.scrollTop;
+    if (virtual) {
+      const maxScroll = Math.max(0, FILE_ROW_HEIGHT * (files.length + 1) - node.clientHeight);
+      if (scrollTop > maxScroll) {
+        scrollTop = maxScroll;
+        node.scrollTop = maxScroll;
+      }
+    }
+    const bodyTop = Math.max(0, scrollTop - FILE_ROW_HEIGHT);
+    const start = files.length === 0
+      ? 0
+      : Math.min(files.length - 1, Math.max(0, Math.floor(bodyTop / FILE_ROW_HEIGHT) - FILE_ROW_OVERSCAN));
     const end = Math.min(
       files.length,
-      Math.ceil((bodyTop + node.clientHeight) / FILE_ROW_HEIGHT) + FILE_ROW_OVERSCAN
+      Math.max(start, Math.ceil((bodyTop + node.clientHeight) / FILE_ROW_HEIGHT) + FILE_ROW_OVERSCAN)
     );
     setRange((current) => (current.start === start && current.end === end ? current : { start, end }));
-  }, [files.length]);
+  }, [files.length, virtual]);
 
   useEffect(() => {
     updateRange();
