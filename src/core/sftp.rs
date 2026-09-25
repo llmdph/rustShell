@@ -1084,15 +1084,36 @@ pub fn local_rename(path: &str, new_name: &str) -> std::io::Result<()> {
         return Ok(());
     }
     if local_path_exists(&target) {
-        if source != target {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "目标已存在",
-            ));
+        // Path equality is case-sensitive, but Windows still reports the new
+        // letter case as an existing file. That is the same file, not a conflict.
+        if local_rename_is_case_only(&source, &target) {
+            return rename_local_case_only(&source, &target);
         }
-        return rename_local_case_only(&source, &target);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "目标已存在",
+        ));
     }
     fs::rename(source, target)
+}
+
+
+fn local_rename_is_case_only(source: &Path, target: &Path) -> bool {
+    let (Some(source_name), Some(target_name)) = (source.file_name(), target.file_name()) else {
+        return false;
+    };
+    if source_name == target_name {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        source_name.to_string_lossy().to_lowercase()
+            == target_name.to_string_lossy().to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn rename_local_case_only(source: &Path, target: &Path) -> std::io::Result<()> {
