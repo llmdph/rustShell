@@ -308,7 +308,7 @@ impl SftpConnection {
         Ok(path)
     }
 
-    pub fn read_text_file(&self, path: &str) -> Result<RemoteTextFile> {
+    pub fn read_text_file(&self, path: &str, charset: &str) -> Result<RemoteTextFile> {
         let stat = self
             .sftp
             .lstat(Path::new(path))
@@ -334,9 +334,10 @@ impl SftpConnection {
         let truncated = bytes.len() as u64 > REMOTE_TEXT_PREVIEW_LIMIT;
         if truncated {
             bytes.truncate(REMOTE_TEXT_PREVIEW_LIMIT as usize);
+            trim_partial_text_suffix(&mut bytes, charset);
         }
         let is_binary = bytes.iter().any(|byte| *byte == 0);
-        let content = String::from_utf8_lossy(&bytes).to_string();
+        let content = decode_text_bytes(&bytes, charset);
 
         Ok(RemoteTextFile {
             path: path.to_owned(),
@@ -347,7 +348,7 @@ impl SftpConnection {
         })
     }
 
-    pub fn read_text_file_tail(&self, path: &str) -> Result<RemoteTextFile> {
+    pub fn read_text_file_tail(&self, path: &str, charset: &str) -> Result<RemoteTextFile> {
         let stat = self
             .sftp
             .lstat(Path::new(path))
@@ -372,8 +373,11 @@ impl SftpConnection {
             .take(REMOTE_TEXT_PREVIEW_LIMIT)
             .read_to_end(&mut bytes)
             .with_context(|| format!("failed to read remote file {}", path))?;
+        if start > 0 {
+            trim_partial_text_prefix(&mut bytes, charset);
+        }
         let is_binary = bytes.iter().any(|byte| *byte == 0);
-        let content = String::from_utf8_lossy(&bytes).to_string();
+        let content = decode_text_bytes(&bytes, charset);
 
         Ok(RemoteTextFile {
             path: path.to_owned(),
@@ -384,7 +388,7 @@ impl SftpConnection {
         })
     }
 
-    pub fn write_text_file(&self, path: &str, content: &str) -> Result<()> {
+    pub fn write_text_file(&self, path: &str, content: &str, charset: &str) -> Result<()> {
         let path = Path::new(path);
         let previous = self.sftp.lstat(path).ok();
         if previous
@@ -401,6 +405,7 @@ impl SftpConnection {
             .and_then(|stat| stat.perm)
             .unwrap_or(0o644)
             & 0o7777;
+        let bytes = encode_text_bytes(content, charset)?;
         let mut file = self
             .sftp
             .open_mode(
@@ -412,7 +417,7 @@ impl SftpConnection {
             .with_context(|| {
                 format!("failed to open remote file for writing {}", path.display())
             })?;
-        file.write_all(content.as_bytes())
+        file.write_all(&bytes)
             .with_context(|| format!("failed to write remote file {}", path.display()))?;
         file.flush().ok();
         drop(file);
@@ -534,6 +539,82 @@ fn search_remote_recursive(
         }
     }
     Ok(())
+}
+
+
+fn text_encoding(charset: &str) -> &'static encoding_rs::Encoding {
+    encoding_rs::Encoding::for_label(charset.trim().as_bytes()).unwrap_or(encoding_rs::UTF_8)
+}
+
+fn decode_text_bytes(bytes: &[u8], charset: &str) -> String {
+    let (text, _, _) = text_encoding(charset).decode(bytes);
+    text.into_owned()
+}
+
+fn encode_text_bytes(text: &str, charset: &str) -> Result<Vec<u8>> {
+    let (bytes, _, unmappable) = text_encoding(charset).encode(text);
+    if unmappable {
+        bail!("当前字符集无法保存文本中的部分字符");
+    }
+    Ok(bytes.into_owned())
+}
+
+fn is_utf8_charset(charset: &str) -> bool {
+    let value = charset.trim().to_ascii_lowercase();
+    value.is_empty() || value == "utf-8" || value == "utf8"
+}
+
+fn trim_partial_text_suffix(bytes: &mut Vec<u8>, charset: &str) {
+    if is_utf8_charset(charset) {
+        trim_partial_utf8_suffix(bytes);
+    }
+}
+
+fn trim_partial_text_prefix(bytes: &mut Vec<u8>, charset: &str) {
+    if !is_utf8_charset(charset) || bytes.is_empty() {
+        return;
+    }
+    let mut index = 0;
+    while index < bytes.len() && bytes[index] & 0b1100_0000 == 0b1000_0000 {
+        index += 1;
+    }
+    if index > 0 {
+        bytes.drain(..index);
+    }
+}
+
+fn trim_partial_utf8_suffix(bytes: &mut Vec<u8>) {
+    if bytes.is_empty() {
+        return;
+    }
+    let mut index = bytes.len() - 1;
+    let mut continuations = 0usize;
+    loop {
+        let byte = bytes[index];
+        if byte & 0b1100_0000 != 0b1000_0000 {
+            let needed = match byte {
+                0x00..=0x7F => 1,
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF7 => 4,
+                _ => 1,
+            };
+            if continuations + 1 < needed {
+                bytes.truncate(index);
+            }
+            return;
+        }
+        if index == 0 {
+            bytes.clear();
+            return;
+        }
+        index -= 1;
+        continuations += 1;
+        if continuations >= 3 {
+            bytes.truncate(index);
+            return;
+        }
+    }
 }
 
 fn entry_matches_query(entry: &FileEntry, query: &str) -> bool {

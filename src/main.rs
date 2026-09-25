@@ -1464,7 +1464,7 @@ async fn read_remote_file(
             request.password.as_deref(),
             &state,
             false,
-            |connection| connection.read_text_file(&request.path),
+            |connection| connection.read_text_file(&request.path, &context.profile.charset),
         )
     })
     .await
@@ -1482,7 +1482,7 @@ async fn read_remote_file_tail(
             request.password.as_deref(),
             &state,
             false,
-            |connection| connection.read_text_file_tail(&request.path),
+            |connection| connection.read_text_file_tail(&request.path, &context.profile.charset),
         )
     })
     .await
@@ -1497,7 +1497,7 @@ async fn write_remote_file(request: RemoteWriteFileRequest, app: AppHandle) -> R
             request.password.as_deref(),
             &state,
             false,
-            |connection| connection.write_text_file(&request.path, &request.content),
+            |connection| connection.write_text_file(&request.path, &request.content, &context.profile.charset),
         )
     })
     .await

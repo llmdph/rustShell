@@ -1289,7 +1289,7 @@ pub fn native_remote_read_text(
     }
 
     match open_remote_connection(selector, password) {
-        Ok((_, connection)) => match connection.read_text_file(target_path) {
+        Ok((_, connection)) => match connection.read_text_file(target_path, &remote_text_charset(selector, password)) {
             Ok(file) => NativeRemoteTextPreview {
                 path: file.path,
                 summary: text_file_segment_summary(
@@ -1318,7 +1318,7 @@ pub fn native_remote_read_text_tail(
     }
 
     match open_remote_connection(selector, password) {
-        Ok((_, connection)) => match connection.read_text_file_tail(target_path) {
+        Ok((_, connection)) => match connection.read_text_file_tail(target_path, &remote_text_charset(selector, password)) {
             Ok(file) => NativeRemoteTextPreview {
                 path: file.path,
                 summary: text_file_segment_summary(
@@ -1348,7 +1348,7 @@ pub fn native_remote_write_text(
     }
 
     match open_remote_connection(selector, password) {
-        Ok((_, connection)) => match connection.write_text_file(target_path, content) {
+        Ok((_, connection)) => match connection.write_text_file(target_path, content, &remote_text_charset(selector, password)) {
             Ok(()) => native_remote_read_text(selector, password, target_path),
             Err(error) => remote_text_error(target_path, format!("写入失败: {}", error)),
         },
@@ -2055,6 +2055,20 @@ fn find_remote_profile<'a>(
             && (profile.name.eq_ignore_ascii_case(selector)
                 || profile.id.to_string().starts_with(selector))
     })
+}
+
+
+fn remote_text_charset(selector: &str, password: Option<&str>) -> String {
+    resolve_remote_profile_secret(selector, password)
+        .map(|(profile, _)| {
+            let charset = profile.charset.trim();
+            if charset.is_empty() {
+                "UTF-8".to_owned()
+            } else {
+                charset.to_owned()
+            }
+        })
+        .unwrap_or_else(|_| "UTF-8".to_owned())
 }
 
 fn open_remote_connection(
