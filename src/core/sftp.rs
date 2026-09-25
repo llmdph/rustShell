@@ -6,6 +6,7 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 #[cfg(unix)]
@@ -475,7 +476,7 @@ fn local_entry_from_path(path_buf: PathBuf, metadata: fs::Metadata) -> FileEntry
     let modified_at = metadata
         .modified()
         .map(DateTime::<Utc>::from)
-        .unwrap_or_else(|_| Utc::now());
+        .unwrap_or_else(|_| DateTime::<Utc>::from(SystemTime::UNIX_EPOCH));
     let is_symlink = metadata.file_type().is_symlink();
     let link_target = if is_symlink {
         fs::read_link(&path_buf)

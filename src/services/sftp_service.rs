@@ -573,7 +573,7 @@ fn entry_from_stat(sftp: &ssh2::Sftp, path_buf: PathBuf, stat: ssh2::FileStat) -
             SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(seconds))
         })
         .map(chrono::DateTime::<chrono::Utc>::from)
-        .unwrap_or_else(chrono::Utc::now);
+        .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from(SystemTime::UNIX_EPOCH));
 
     FileEntry {
         name,
