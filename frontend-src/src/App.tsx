@@ -551,9 +551,9 @@ export default function App() {
   const directoryCompare = useMemo(
     () =>
       compareDirectories
-        ? buildDirectoryCompare(baseVisibleLocalFiles, baseVisibleRemoteFiles)
+        ? buildDirectoryCompare(baseVisibleLocalFiles, baseVisibleRemoteFiles, localPath, remotePath)
         : emptyDirectoryCompare,
-    [baseVisibleLocalFiles, baseVisibleRemoteFiles, compareDirectories]
+    [baseVisibleLocalFiles, baseVisibleRemoteFiles, compareDirectories, localPath, remotePath]
   );
   const visibleLocalFiles = useMemo(
     () => filterCompareView(baseVisibleLocalFiles, directoryCompare.local, compareDirectories ? compareView : "all"),
@@ -813,11 +813,11 @@ export default function App() {
   };
 
   const selectComparedPairs = (kind: FileCompareKind) => {
-    const remoteByName = new Map(baseVisibleRemoteFiles.map((entry) => [entry.name, entry]));
+    const remoteByName = new Map(baseVisibleRemoteFiles.map((entry) => [directoryEntryKey("remote", remotePath, entry), entry]));
     const pairs = baseVisibleLocalFiles
       .map((local) => {
         const mark = directoryCompare.local.get(local.path);
-        const remote = remoteByName.get(local.name) ?? null;
+        const remote = remoteByName.get(directoryEntryKey("local", localPath, local)) ?? null;
         return mark?.kind === kind && remote ? { local, remote } : null;
       })
       .filter((pair): pair is { local: FileEntry; remote: FileEntry } => Boolean(pair));
@@ -836,7 +836,7 @@ export default function App() {
 
   const copyDirectoryCompareCsv = async () => {
     if (directoryCompareCount === 0) return;
-    const text = directoryCompareCsv(baseVisibleLocalFiles, baseVisibleRemoteFiles, directoryCompare);
+    const text = directoryCompareCsv(localPath, remotePath, baseVisibleLocalFiles, baseVisibleRemoteFiles, directoryCompare);
     try {
       await navigator.clipboard.writeText(text);
       pushToast("success", "目录对比 CSV 已复制");
@@ -847,7 +847,7 @@ export default function App() {
 
   const downloadDirectoryCompareCsv = () => {
     if (directoryCompareCount === 0) return;
-    downloadTextFile(directoryCompareCsvName(), directoryCompareCsv(baseVisibleLocalFiles, baseVisibleRemoteFiles, directoryCompare), "text/csv;charset=utf-8");
+    downloadTextFile(directoryCompareCsvName(), directoryCompareCsv(localPath, remotePath, baseVisibleLocalFiles, baseVisibleRemoteFiles, directoryCompare), "text/csv;charset=utf-8");
     pushToast("success", "目录对比 CSV 已下载");
   };
 
@@ -870,7 +870,7 @@ export default function App() {
 
   const copyDirectoryCompareDiffCsv = async () => {
     if (directoryCompareDiffCount === 0) return;
-    const text = directoryCompareCsv(baseVisibleLocalFiles, baseVisibleRemoteFiles, directoryCompare, { includeSame: false });
+    const text = directoryCompareCsv(localPath, remotePath, baseVisibleLocalFiles, baseVisibleRemoteFiles, directoryCompare, { includeSame: false });
     try {
       await navigator.clipboard.writeText(text);
       pushToast("success", "目录差异 CSV 已复制");
@@ -883,7 +883,7 @@ export default function App() {
     if (directoryCompareDiffCount === 0) return;
     downloadTextFile(
       directoryCompareCsvName("diff"),
-      directoryCompareCsv(baseVisibleLocalFiles, baseVisibleRemoteFiles, directoryCompare, { includeSame: false }),
+      directoryCompareCsv(localPath, remotePath, baseVisibleLocalFiles, baseVisibleRemoteFiles, directoryCompare, { includeSame: false }),
       "text/csv;charset=utf-8"
     );
     pushToast("success", "目录差异 CSV 已下载");
@@ -3708,8 +3708,8 @@ export default function App() {
 
   const syncComparedMetadata = async (direction: "upload" | "download") => {
     if (!activeProfile || isLocalProtocol(activeProfile.protocol)) return;
-    const localByName = new Map(baseVisibleLocalFiles.map((file) => [file.name, file]));
-    const remoteByName = new Map(baseVisibleRemoteFiles.map((file) => [file.name, file]));
+    const localByName = new Map(baseVisibleLocalFiles.map((file) => [directoryEntryKey("local", localPath, file), file]));
+    const remoteByName = new Map(baseVisibleRemoteFiles.map((file) => [directoryEntryKey("remote", remotePath, file), file]));
     const pairs = [...localByName.entries()]
       .map(([name, local]) => ({ local, remote: remoteByName.get(name) }))
       .filter(({ local, remote }) => remote && directoryCompare.local.get(local.path)?.kind === "different") as Array<{
@@ -9277,12 +9277,23 @@ function filterCompareView(files: FileEntry[], marks: Map<string, FileCompareMar
   });
 }
 
-function buildDirectoryCompare(localFiles: FileEntry[], remoteFiles: FileEntry[]): DirectoryCompare {
+function directoryEntryKey(side: FileSide, root: string, file: FileEntry) {
+  const relative = relativePathForSide(side, root, file.path);
+  if (!relative || relative === "." || relative === file.path) return file.name;
+  return relative.replace(/\\/g, "/");
+}
+
+function buildDirectoryCompare(
+  localFiles: FileEntry[],
+  remoteFiles: FileEntry[],
+  localRoot: string,
+  remoteRoot: string
+): DirectoryCompare {
   const local = new Map<string, FileCompareMark>();
   const remote = new Map<string, FileCompareMark>();
   const summary = { same: 0, different: 0, onlyLocal: 0, onlyRemote: 0 };
-  const localByName = new Map(localFiles.map((file) => [file.name, file]));
-  const remoteByName = new Map(remoteFiles.map((file) => [file.name, file]));
+  const localByName = new Map(localFiles.map((file) => [directoryEntryKey("local", localRoot, file), file]));
+  const remoteByName = new Map(remoteFiles.map((file) => [directoryEntryKey("remote", remoteRoot, file), file]));
   const names = new Set([...localByName.keys(), ...remoteByName.keys()]);
 
   for (const name of names) {
@@ -10069,14 +10080,16 @@ function deleteConfirmJson(side: FileSide, entries: FileEntry[]) {
 }
 
 function directoryCompareCsv(
+  localRoot: string,
+  remoteRoot: string,
   localFiles: FileEntry[],
   remoteFiles: FileEntry[],
   compare: DirectoryCompare,
   options: { includeSame?: boolean } = {}
 ) {
   const includeSame = options.includeSame ?? true;
-  const localByName = new Map(localFiles.map((file) => [file.name, file]));
-  const remoteByName = new Map(remoteFiles.map((file) => [file.name, file]));
+  const localByName = new Map(localFiles.map((file) => [directoryEntryKey("local", localRoot, file), file]));
+  const remoteByName = new Map(remoteFiles.map((file) => [directoryEntryKey("remote", remoteRoot, file), file]));
   const names = [...new Set([...localByName.keys(), ...remoteByName.keys()])].filter((name) => {
     if (includeSame) return true;
     const local = localByName.get(name) ?? null;
@@ -10135,8 +10148,8 @@ function directoryCompareJson(
   remoteFiles: FileEntry[],
   compare: DirectoryCompare
 ) {
-  const localByName = new Map(localFiles.map((file) => [file.name, file]));
-  const remoteByName = new Map(remoteFiles.map((file) => [file.name, file]));
+  const localByName = new Map(localFiles.map((file) => [directoryEntryKey("local", localRoot, file), file]));
+  const remoteByName = new Map(remoteFiles.map((file) => [directoryEntryKey("remote", remoteRoot, file), file]));
   const names = [...new Set([...localByName.keys(), ...remoteByName.keys()])].sort((left, right) =>
     left.localeCompare(right, "zh-Hans-CN")
   );
