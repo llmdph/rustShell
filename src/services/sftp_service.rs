@@ -2961,24 +2961,55 @@ fn chmod_one(sftp: &ssh2::Sftp, path: &Path, mode: u32) -> Result<()> {
     set_remote_permissions(sftp, path, mode)
 }
 
-fn chmod_recursive(sftp: &ssh2::Sftp, path: &Path, mode: u32) -> Result<()> {
-    chmod_recursive_inner(sftp, path, mode, true)
+fn listing_stat_with_type(stat: ssh2::FileStat) -> Option<ssh2::FileStat> {
+    if stat.perm.is_some() {
+        Some(stat)
+    } else {
+        None
+    }
 }
 
-fn chmod_recursive_inner(sftp: &ssh2::Sftp, path: &Path, mode: u32, strict: bool) -> Result<()> {
-    if strict {
-        chmod_one(sftp, path, mode)?;
-    } else if chmod_one(sftp, path, mode).is_err() {
+fn remote_stat_for_update(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    known: Option<ssh2::FileStat>,
+    strict: bool,
+) -> Result<Option<ssh2::FileStat>> {
+    if let Some(stat) = known.and_then(listing_stat_with_type) {
+        return Ok(Some(stat));
+    }
+    match sftp.lstat(path) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(error) if strict => Err(error).with_context(|| {
+            format!("failed to stat remote path {}", path.display())
+        }),
+        Err(_) => Ok(None),
+    }
+}
+
+fn chmod_recursive(sftp: &ssh2::Sftp, path: &Path, mode: u32) -> Result<()> {
+    chmod_recursive_inner(sftp, path, mode, true, None)
+}
+
+fn chmod_recursive_inner(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    mode: u32,
+    strict: bool,
+    known: Option<ssh2::FileStat>,
+) -> Result<()> {
+    let Some(stat) = remote_stat_for_update(sftp, path, known, strict)? else {
+        return Ok(());
+    };
+    if stat.file_type().is_symlink() {
         return Ok(());
     }
-    let stat = match sftp.lstat(path) {
-        Ok(stat) => stat,
-        Err(error) if strict => {
-            return Err(error).with_context(|| format!("failed to stat remote path {}", path.display()));
-        }
-        Err(_) => return Ok(()),
-    };
-    if !stat.is_dir() || stat.file_type().is_symlink() {
+    if strict {
+        set_remote_permissions(sftp, path, mode)?;
+    } else if set_remote_permissions(sftp, path, mode).is_err() {
+        return Ok(());
+    }
+    if !stat.is_dir() {
         return Ok(());
     }
 
@@ -2987,8 +3018,8 @@ fn chmod_recursive_inner(sftp: &ssh2::Sftp, path: &Path, mode: u32, strict: bool
         Err(error) if strict => return Err(error),
         Err(_) => return Ok(()),
     };
-    for (child, _) in children {
-        chmod_recursive_inner(sftp, &child, mode, false)?;
+    for (child, child_stat) in children {
+        chmod_recursive_inner(sftp, &child, mode, false, Some(child_stat))?;
     }
     Ok(())
 }
@@ -3000,6 +3031,15 @@ fn chown_one(sftp: &ssh2::Sftp, path: &Path, uid: Option<u32>, gid: Option<u32>)
     if stat.file_type().is_symlink() {
         return Ok(());
     }
+    chown_one_stat(sftp, path, uid, gid)
+}
+
+fn chown_one_stat(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<()> {
     sftp.setstat(
         path,
         ssh2::FileStat {
@@ -3020,7 +3060,7 @@ fn chown_recursive(
     uid: Option<u32>,
     gid: Option<u32>,
 ) -> Result<()> {
-    chown_recursive_inner(sftp, path, uid, gid, true)
+    chown_recursive_inner(sftp, path, uid, gid, true, None)
 }
 
 fn chown_recursive_inner(
@@ -3029,20 +3069,20 @@ fn chown_recursive_inner(
     uid: Option<u32>,
     gid: Option<u32>,
     strict: bool,
+    known: Option<ssh2::FileStat>,
 ) -> Result<()> {
-    if strict {
-        chown_one(sftp, path, uid, gid)?;
-    } else if chown_one(sftp, path, uid, gid).is_err() {
+    let Some(stat) = remote_stat_for_update(sftp, path, known, strict)? else {
+        return Ok(());
+    };
+    if stat.file_type().is_symlink() {
         return Ok(());
     }
-    let stat = match sftp.lstat(path) {
-        Ok(stat) => stat,
-        Err(error) if strict => {
-            return Err(error).with_context(|| format!("failed to stat remote path {}", path.display()));
-        }
-        Err(_) => return Ok(()),
-    };
-    if !stat.is_dir() || stat.file_type().is_symlink() {
+    if strict {
+        chown_one_stat(sftp, path, uid, gid)?;
+    } else if chown_one_stat(sftp, path, uid, gid).is_err() {
+        return Ok(());
+    }
+    if !stat.is_dir() {
         return Ok(());
     }
 
@@ -3051,8 +3091,8 @@ fn chown_recursive_inner(
         Err(error) if strict => return Err(error),
         Err(_) => return Ok(()),
     };
-    for (child, _) in children {
-        chown_recursive_inner(sftp, &child, uid, gid, false)?;
+    for (child, child_stat) in children {
+        chown_recursive_inner(sftp, &child, uid, gid, false, Some(child_stat))?;
     }
     Ok(())
 }
@@ -3092,23 +3132,30 @@ fn touch_one(sftp: &ssh2::Sftp, path: &Path, mtime: u64) -> Result<()> {
 }
 
 fn touch_recursive(sftp: &ssh2::Sftp, path: &Path, mtime: u64) -> Result<()> {
-    touch_recursive_inner(sftp, path, mtime, true)
+    touch_recursive_inner(sftp, path, mtime, true, None)
 }
 
-fn touch_recursive_inner(sftp: &ssh2::Sftp, path: &Path, mtime: u64, strict: bool) -> Result<()> {
-    if strict {
-        touch_one(sftp, path, mtime)?;
-    } else if touch_one(sftp, path, mtime).is_err() {
+fn touch_recursive_inner(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    mtime: u64,
+    strict: bool,
+    known: Option<ssh2::FileStat>,
+) -> Result<()> {
+    let Some(stat) = remote_stat_for_update(sftp, path, known, strict)? else {
+        return Ok(());
+    };
+    if stat.file_type().is_symlink() {
         return Ok(());
     }
-    let stat = match sftp.lstat(path) {
-        Ok(stat) => stat,
-        Err(error) if strict => {
-            return Err(error).with_context(|| format!("failed to stat remote path {}", path.display()));
-        }
-        Err(_) => return Ok(()),
-    };
-    if !stat.is_dir() || stat.file_type().is_symlink() {
+    let updated = set_remote_times(sftp, path, None, Some(mtime))
+        .with_context(|| format!("failed to update modified time for {}", path.display()));
+    if strict {
+        updated?;
+    } else if updated.is_err() {
+        return Ok(());
+    }
+    if !stat.is_dir() {
         return Ok(());
     }
 
@@ -3117,8 +3164,8 @@ fn touch_recursive_inner(sftp: &ssh2::Sftp, path: &Path, mtime: u64, strict: boo
         Err(error) if strict => return Err(error),
         Err(_) => return Ok(()),
     };
-    for (child, _) in children {
-        touch_recursive_inner(sftp, &child, mtime, false)?;
+    for (child, child_stat) in children {
+        touch_recursive_inner(sftp, &child, mtime, false, Some(child_stat))?;
     }
     Ok(())
 }
@@ -3719,5 +3766,28 @@ mod remote_attribute_tests {
     #[test]
     fn nothing_to_preserve_makes_no_update() {
         assert!(remote_mode_and_times(None, None, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod listing_stat_tests {
+    use super::listing_stat_with_type;
+
+    #[test]
+    fn a_listing_without_a_type_is_not_reused() {
+        let bare = ssh2::FileStat {
+            size: Some(1),
+            uid: None,
+            gid: None,
+            perm: None,
+            atime: None,
+            mtime: None,
+        };
+        assert!(listing_stat_with_type(bare).is_none());
+        let typed = ssh2::FileStat {
+            perm: Some(0o100644),
+            ..bare
+        };
+        assert_eq!(listing_stat_with_type(typed).and_then(|stat| stat.perm), Some(0o100644));
     }
 }
