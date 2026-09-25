@@ -1883,7 +1883,11 @@ where
         if fail_if_unreadable {
             return Err(error);
         }
-        return Ok(());
+        // The listing stopped early. Keep names already read instead of
+        // leaving this folder empty.
+        if files.is_empty() && directories.is_empty() {
+            return Ok(());
+        }
     }
     if cancel.load(Ordering::Relaxed) {
         bail!("transfer cancelled");
