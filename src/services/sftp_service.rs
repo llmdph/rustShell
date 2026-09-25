@@ -1039,6 +1039,7 @@ where
             &mut transferred,
             cancel,
             conflict,
+            None,
             &mut on_progress,
         )
         .context("failed to upload file")?;
@@ -1493,6 +1494,7 @@ fn upload_single_file<F>(
     transferred: &mut u64,
     cancel: Arc<AtomicBool>,
     conflict: TransferConflictStrategy,
+    mut opened: Option<File>,
     on_progress: &mut F,
 ) -> Result<()>
 where
@@ -1505,8 +1507,11 @@ where
         on_progress(*transferred, total);
         return Ok(());
     }
-    let mut local = File::open(local_path)
-        .with_context(|| format!("failed to open {}", local_path.display()))?;
+    let mut local = match opened {
+        Some(file) => file,
+        None => File::open(local_path)
+            .with_context(|| format!("failed to open {}", local_path.display()))?,
+    };
     replace_remote_link_for_write(sftp, remote_path, conflict)?;
     let mut remote = if matches!(conflict, TransferConflictStrategy::Resume) {
         if let Ok(stat) = sftp.stat(remote_path) {
@@ -1652,10 +1657,15 @@ where
             )?;
             preserve_remote_metadata(sftp, Path::new(&remote_path), &metadata);
         } else if metadata.is_file() {
-            if fs::File::open(&local_path).is_err() {
-                note_skipped_bytes(transferred, total, metadata.len(), on_progress);
-                continue;
-            }
+            // Keep this handle for the copy. A second open can fail on a busy
+            // file and stop the rest of the folder.
+            let opened = match File::open(&local_path) {
+                Ok(file) => file,
+                Err(_) => {
+                    note_skipped_bytes(transferred, total, metadata.len(), on_progress);
+                    continue;
+                }
+            };
             let remote_path = remote_child_for_conflict(
                 sftp,
                 remote_dir,
@@ -1671,6 +1681,7 @@ where
                 transferred,
                 cancel.clone(),
                 conflict,
+                Some(opened),
                 on_progress,
             )?;
         }
