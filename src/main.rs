@@ -533,9 +533,12 @@ async fn save_profile(
 }
 
 #[tauri::command]
-fn export_profiles(state: State<'_, AppRuntime>) -> Result<String, String> {
+async fn export_profiles(app: AppHandle) -> Result<String, String> {
+    blocking(move || {
+        let state = app.state::<AppRuntime>();
     let profiles = lock(&state.profiles)?;
     serde_json::to_string_pretty(&*profiles).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
@@ -922,103 +925,141 @@ async fn close_terminal(terminal_id: String, app: AppHandle) -> Result<(), Strin
 }
 
 #[tauri::command]
-fn list_local_dir(path: String) -> Result<Vec<FileEntry>, String> {
+async fn list_local_dir(path: String) -> Result<Vec<FileEntry>, String> {
+    blocking(move || {
     read_local_dir(&path).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn search_local(request: LocalSearchRequest) -> Result<Vec<FileEntry>, String> {
+async fn search_local(request: LocalSearchRequest) -> Result<Vec<FileEntry>, String> {
+    blocking(move || {
     search_local_impl(
         &request.root,
         &request.query,
         request.max_results.unwrap_or(200),
     )
     .map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn local_home() -> Result<String, String> {
+async fn local_home() -> Result<String, String> {
+    blocking(move || {
     Ok(read_local_home())
+    }).await
 }
 
 #[tauri::command]
-fn local_parent(path: String) -> Result<Option<String>, String> {
+async fn local_parent(path: String) -> Result<Option<String>, String> {
+    blocking(move || {
     Ok(read_local_parent(&path))
+    }).await
 }
 
 #[tauri::command]
-fn open_local_path(request: LocalOpenRequest) -> Result<(), String> {
+async fn open_local_path(request: LocalOpenRequest) -> Result<(), String> {
+    blocking(move || {
     open_local_path_impl(&request.path, request.reveal).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn create_local_dir(request: LocalMkdirRequest) -> Result<(), String> {
+async fn create_local_dir(request: LocalMkdirRequest) -> Result<(), String> {
+    blocking(move || {
     create_local_dir_impl(&request.parent, &request.name).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn create_local_file(request: LocalCreateFileRequest) -> Result<String, String> {
+async fn create_local_file(request: LocalCreateFileRequest) -> Result<String, String> {
+    blocking(move || {
     create_local_file_impl(&request.parent, &request.name).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn create_local_symlink(request: LocalSymlinkRequest) -> Result<String, String> {
+async fn create_local_symlink(request: LocalSymlinkRequest) -> Result<String, String> {
+    blocking(move || {
     create_local_symlink_impl(&request.parent, &request.name, &request.target).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn remove_local_path(request: LocalRemoveRequest) -> Result<(), String> {
+async fn remove_local_path(request: LocalRemoveRequest) -> Result<(), String> {
+    blocking(move || {
     remove_local_path_impl(&request.path, request.is_dir).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn duplicate_local_path(request: LocalDuplicateRequest) -> Result<String, String> {
+async fn duplicate_local_path(request: LocalDuplicateRequest) -> Result<String, String> {
+    blocking(move || {
     duplicate_local_path_impl(&request.path, &request.new_name).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn move_local_path(request: LocalMoveRequest) -> Result<String, String> {
+async fn move_local_path(request: LocalMoveRequest) -> Result<String, String> {
+    blocking(move || {
     move_local_path_impl(&request.path, &request.target_path).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn touch_local_path(request: LocalTouchRequest) -> Result<(), String> {
+async fn touch_local_path(request: LocalTouchRequest) -> Result<(), String> {
+    blocking(move || {
     touch_local_path_impl(&request.path, request.mtime, request.recursive).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn chmod_local_path(request: LocalChmodRequest) -> Result<(), String> {
+async fn chmod_local_path(request: LocalChmodRequest) -> Result<(), String> {
+    blocking(move || {
     chmod_local_path_impl(&request.path, request.mode, request.recursive).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn local_path_stats(request: LocalPathStatsRequest) -> Result<LocalPathStats, String> {
+async fn local_path_stats(request: LocalPathStatsRequest) -> Result<LocalPathStats, String> {
+    blocking(move || {
     local_path_stats_impl(&request.path).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn read_local_file(request: LocalReadFileRequest) -> Result<LocalTextFile, String> {
+async fn read_local_file(request: LocalReadFileRequest) -> Result<LocalTextFile, String> {
+    blocking(move || {
     read_local_file_impl(&request.path).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn read_local_file_tail(request: LocalReadFileRequest) -> Result<LocalTextFile, String> {
+async fn read_local_file_tail(request: LocalReadFileRequest) -> Result<LocalTextFile, String> {
+    blocking(move || {
     read_local_file_tail_impl(&request.path).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn write_local_file(request: LocalWriteFileRequest) -> Result<(), String> {
+async fn write_local_file(request: LocalWriteFileRequest) -> Result<(), String> {
+    blocking(move || {
     write_local_file_impl(&request.path, &request.content).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn local_file_sha256(request: LocalReadFileRequest) -> Result<String, String> {
+async fn local_file_sha256(request: LocalReadFileRequest) -> Result<String, String> {
+    blocking(move || {
     local_file_sha256_impl(&request.path).map_err(to_string)
+    }).await
 }
 
 #[tauri::command]
-fn rename_local_path(request: LocalRenameRequest) -> Result<(), String> {
+async fn rename_local_path(request: LocalRenameRequest) -> Result<(), String> {
+    blocking(move || {
     rename_local_path_impl(&request.path, &request.new_name).map_err(to_string)
+    }).await
 }
 
 fn pooled_sftp<T, F>(
@@ -1607,17 +1648,22 @@ fn start_transfer_with_attempts(
 }
 
 #[tauri::command]
-fn list_transfers(state: State<'_, AppRuntime>) -> Result<Vec<TransferView>, String> {
+async fn list_transfers(app: AppHandle) -> Result<Vec<TransferView>, String> {
+    blocking(move || {
+        let state = app.state::<AppRuntime>();
     let mut transfers = lock(&state.transfers)?;
     for task in transfers.values() {
         record_transfer_history(task);
     }
     prune_finished_transfer_tasks(&mut transfers);
     Ok(transfers.values().map(snapshot_transfer).collect())
+    }).await
 }
 
 #[tauri::command]
-fn cancel_transfer(transfer_id: String, state: State<'_, AppRuntime>) -> Result<(), String> {
+async fn cancel_transfer(transfer_id: String, app: AppHandle) -> Result<(), String> {
+    blocking(move || {
+        let state = app.state::<AppRuntime>();
     let id = parse_uuid(&transfer_id)?;
     let transfers = lock(&state.transfers)?;
     let task = transfers
@@ -1625,6 +1671,7 @@ fn cancel_transfer(transfer_id: String, state: State<'_, AppRuntime>) -> Result<
         .ok_or_else(|| "传输任务不存在".to_owned())?;
     task.cancel.store(true, Ordering::Relaxed);
     Ok(())
+    }).await
 }
 
 #[tauri::command]
@@ -1675,7 +1722,9 @@ async fn retry_transfer(transfer_id: String, app: AppHandle) -> Result<TransferV
 }
 
 #[tauri::command]
-fn clear_finished_transfers(state: State<'_, AppRuntime>) -> Result<Vec<TransferView>, String> {
+async fn clear_finished_transfers(app: AppHandle) -> Result<Vec<TransferView>, String> {
+    blocking(move || {
+        let state = app.state::<AppRuntime>();
     let mut transfers = lock(&state.transfers)?;
     transfers.retain(|_, task| {
         let status = lock_poison_ok(&task.state).status.clone();
@@ -1690,13 +1739,16 @@ fn clear_finished_transfers(state: State<'_, AppRuntime>) -> Result<Vec<Transfer
         .values()
         .map(snapshot_transfer_and_record)
         .collect())
+    }).await
 }
 
 #[tauri::command]
-fn remove_transfer(
+async fn remove_transfer(
     transfer_id: String,
-    state: State<'_, AppRuntime>,
+    app: AppHandle,
 ) -> Result<Vec<TransferView>, String> {
+    blocking(move || {
+        let state = app.state::<AppRuntime>();
     let id = parse_uuid(&transfer_id)?;
     let mut transfers = lock(&state.transfers)?;
     let task = transfers
@@ -1711,17 +1763,22 @@ fn remove_transfer(
         .values()
         .map(snapshot_transfer_and_record)
         .collect())
+    }).await
 }
 
 #[tauri::command]
-fn list_transfer_history() -> Result<Vec<TransferView>, String> {
+async fn list_transfer_history() -> Result<Vec<TransferView>, String> {
+    blocking(move || {
     Ok(storage::load_transfer_history())
+    }).await
 }
 
 #[tauri::command]
-fn clear_transfer_history() -> Result<Vec<TransferView>, String> {
+async fn clear_transfer_history() -> Result<Vec<TransferView>, String> {
+    blocking(move || {
     storage::clear_transfer_history().map_err(to_string)?;
     Ok(Vec::new())
+    }).await
 }
 
 #[tauri::command]
