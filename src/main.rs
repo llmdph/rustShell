@@ -2145,11 +2145,19 @@ for path do
   else
     kind=file
   fi
-  size=$(stat -c %s "$path" 2>/dev/null || echo 0)
-  mtime=$(stat -c %Y "$path" 2>/dev/null || echo 0)
-  perm=$(stat -c %a "$path" 2>/dev/null || echo 0)
-  uid=$(stat -c %u "$path" 2>/dev/null || echo 0)
-  gid=$(stat -c %g "$path" 2>/dev/null || echo 0)
+  size=0
+  mtime=0
+  perm=0
+  uid=0
+  gid=0
+  if info=$(stat -c '%s %Y %a %u %g' "$path" 2>/dev/null); then
+    set -- $info
+    size=$1
+    mtime=$2
+    perm=$3
+    uid=$4
+    gid=$5
+  fi
   printf "%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0" "$name" "$path" "$kind" "$size" "$mtime" "$perm" "$uid" "$gid" "$target" | od -An -v -tx1 | tr -cd "0-9a-fA-F"
   printf "\n"
 done
