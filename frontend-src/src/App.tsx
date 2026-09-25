@@ -6264,6 +6264,7 @@ function XtermView({
 
     let idleRounds = 0;
     let failures = 0;
+    let closedRounds = 0;
     const drainLoop = async () => {
       let nextDelay = 40;
       try {
@@ -6295,6 +6296,14 @@ function XtermView({
           const base = activeRef.current ? 30 : 80;
           const cap = activeRef.current ? 120 : 400;
           nextDelay = Math.min(cap, base * 2 ** Math.min(idleRounds - 1, 3));
+        }
+        // Text can still arrive just after the shell exits. After several
+        // empty updates, the session is finished and does not need another check.
+        if (!drain.output && (drain.status === "disconnected" || drain.status === "failed")) {
+          closedRounds += 1;
+          if (closedRounds >= 20) stopped = true;
+        } else {
+          closedRounds = 0;
         }
       } catch (error) {
         const message = String(error);
