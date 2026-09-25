@@ -2208,10 +2208,22 @@ where
             );
         }
     } else {
+        let mut raw_entries = Vec::new();
         let visited = visit_remote_entries(sftp, Path::new(remote_dir), None, |remote_path, stat| {
             if cancel.load(Ordering::Relaxed) {
                 return false;
             }
+            raw_entries.push((remote_path, stat));
+            true
+        });
+        if cancel.load(Ordering::Relaxed) {
+            bail!("transfer cancelled");
+        }
+        for (remote_path, stat) in raw_entries {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("transfer cancelled");
+            }
+            let stat = resolve_remote_listing_stat(sftp, &remote_path, stat);
             queue_remote_download_entry(
                 &mut files,
                 &mut directories,
@@ -2219,8 +2231,7 @@ where
                 stat,
                 local_dir,
             );
-            true
-        });
+        }
         if let Err(error) = visited {
             if cancel.load(Ordering::Relaxed) {
                 bail!("transfer cancelled");
@@ -2465,10 +2476,22 @@ fn measure_remote_tree(
     let mut total = 0_u64;
     let mut entries = Vec::new();
     let mut directories = Vec::new();
+    let mut raw_entries = Vec::new();
     visit_remote_entries(sftp, path, None, |child, child_stat| {
         if cancel.load(Ordering::Relaxed) {
             return false;
         }
+        raw_entries.push((child, child_stat));
+        true
+    })?;
+    // Finish reading the names before asking for a type. Without permissions
+    // every name looks like a file, so a folder would be saved without the
+    // files inside it.
+    for (child, child_stat) in raw_entries {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("transfer cancelled");
+        }
+        let child_stat = resolve_remote_listing_stat(sftp, &child, child_stat);
         if !child_stat.file_type().is_symlink() {
             if child_stat.is_dir() {
                 directories.push((child.clone(), child_stat.clone()));
@@ -2477,8 +2500,7 @@ fn measure_remote_tree(
             }
         }
         entries.push((child, child_stat));
-        true
-    })?;
+    }
     // A cancelled walk must not be reused. The names read so far are dropped.
     if cancel.load(Ordering::Relaxed) {
         bail!("transfer cancelled");
@@ -3515,6 +3537,17 @@ fn chmod_one(sftp: &ssh2::Sftp, path: &Path, mode: u32) -> Result<()> {
         return Ok(());
     }
     set_remote_permissions(sftp, path, mode)
+}
+
+fn resolve_remote_listing_stat(
+    sftp: &ssh2::Sftp,
+    path: &Path,
+    stat: ssh2::FileStat,
+) -> ssh2::FileStat {
+    if stat.perm.is_some() {
+        return stat;
+    }
+    sftp.lstat(path).unwrap_or(stat)
 }
 
 fn listing_stat_with_type(stat: ssh2::FileStat) -> Option<ssh2::FileStat> {
