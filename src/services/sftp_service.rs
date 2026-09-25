@@ -26,6 +26,7 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 const REMOTE_TEXT_PREVIEW_LIMIT: u64 = 1024 * 1024;
+const ENCODED_CHAR_SCAN: u64 = 8;
 const TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const LIBSSH2_ERROR_FILE: i32 = -16;
 const LIBSSH2_ERROR_EAGAIN: i32 = -37;
@@ -367,19 +368,25 @@ impl SftpConnection {
 
         let size = stat.size.unwrap_or_default();
         let start = size.saturating_sub(REMOTE_TEXT_PREVIEW_LIMIT);
+        let lookbehind = if start > 0 && !is_utf8_charset(charset) {
+            start.min(ENCODED_CHAR_SCAN)
+        } else {
+            0
+        };
+        let probe = start - lookbehind;
         let mut file = self
             .sftp
             .open(Path::new(path))
             .with_context(|| format!("failed to open remote file {}", path))?;
-        file.seek(SeekFrom::Start(start))
+        file.seek(SeekFrom::Start(probe))
             .with_context(|| format!("failed to seek remote file {}", path))?;
         let mut bytes = Vec::new();
         std::io::Read::by_ref(&mut file)
-            .take(REMOTE_TEXT_PREVIEW_LIMIT)
+            .take(REMOTE_TEXT_PREVIEW_LIMIT + lookbehind)
             .read_to_end(&mut bytes)
             .with_context(|| format!("failed to read remote file {}", path))?;
         if start > 0 {
-            trim_partial_text_prefix(&mut bytes, charset);
+            trim_partial_text_prefix(&mut bytes, charset, lookbehind as usize);
         }
         let is_binary = bytes.iter().any(|byte| *byte == 0);
         let content = decode_text_bytes(&bytes, charset);
@@ -646,20 +653,86 @@ fn is_utf8_charset(charset: &str) -> bool {
 fn trim_partial_text_suffix(bytes: &mut Vec<u8>, charset: &str) {
     if is_utf8_charset(charset) {
         trim_partial_utf8_suffix(bytes);
+        return;
+    }
+    trim_partial_encoded_suffix(bytes, text_encoding(charset));
+}
+
+fn trim_partial_text_prefix(bytes: &mut Vec<u8>, charset: &str, cut_at: usize) {
+    if bytes.is_empty() {
+        return;
+    }
+    if is_utf8_charset(charset) {
+        let mut index = 0;
+        while index < bytes.len() && bytes[index] & 0b1100_0000 == 0b1000_0000 {
+            index += 1;
+        }
+        if index > 0 {
+            bytes.drain(..index);
+        }
+        return;
+    }
+    trim_partial_encoded_prefix(bytes, text_encoding(charset), cut_at);
+}
+
+fn trim_partial_encoded_suffix(bytes: &mut Vec<u8>, encoding: &'static encoding_rs::Encoding) {
+    let floor = bytes.len().saturating_sub(ENCODED_CHAR_SCAN as usize);
+    while bytes.len() > floor && encoded_tail_is_partial(bytes, encoding) {
+        bytes.pop();
     }
 }
 
-fn trim_partial_text_prefix(bytes: &mut Vec<u8>, charset: &str) {
-    if !is_utf8_charset(charset) || bytes.is_empty() {
+fn trim_partial_encoded_prefix(
+    bytes: &mut Vec<u8>,
+    encoding: &'static encoding_rs::Encoding,
+    cut_at: usize,
+) {
+    if cut_at == 0 || cut_at >= bytes.len() {
         return;
     }
-    let mut index = 0;
-    while index < bytes.len() && bytes[index] & 0b1100_0000 == 0b1000_0000 {
-        index += 1;
+    let last = (cut_at + ENCODED_CHAR_SCAN as usize).min(bytes.len());
+    let mut keep_from = last;
+    for boundary in cut_at..=last {
+        if !encoded_tail_is_partial(&bytes[..boundary], encoding) {
+            keep_from = boundary;
+            break;
+        }
     }
-    if index > 0 {
-        bytes.drain(..index);
+    if keep_from > 0 {
+        bytes.drain(..keep_from);
     }
+}
+
+fn encoded_tail_is_partial(bytes: &[u8], encoding: &'static encoding_rs::Encoding) -> bool {
+    !bytes.is_empty()
+        && decode_text_for_boundary(bytes, encoding, true)
+            != decode_text_for_boundary(bytes, encoding, false)
+}
+
+fn decode_text_for_boundary(
+    bytes: &[u8],
+    encoding: &'static encoding_rs::Encoding,
+    last: bool,
+) -> String {
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    let mut output = String::new();
+    let mut offset = 0usize;
+    loop {
+        let remaining = bytes.len().saturating_sub(offset);
+        let needed = decoder
+            .max_utf8_buffer_length(remaining)
+            .unwrap_or(remaining.saturating_mul(4).saturating_add(32));
+        output.reserve(needed.max(8));
+        let (result, read, _) = decoder.decode_to_string(&bytes[offset..], &mut output, last);
+        if read == 0 {
+            break;
+        }
+        offset += read;
+        if matches!(result, encoding_rs::CoderResult::InputEmpty) || offset >= bytes.len() {
+            break;
+        }
+    }
+    output
 }
 
 fn trim_partial_utf8_suffix(bytes: &mut Vec<u8>) {
@@ -2327,5 +2400,53 @@ mod resume_choice_tests {
             choose_resume(Some(8), None),
             ResumeChoice::SizeUnknown
         ));
+    }
+}
+
+#[cfg(test)]
+mod text_boundary_tests {
+    use super::{trim_partial_text_prefix, trim_partial_text_suffix};
+
+    fn gbk_bytes(text: &str) -> Vec<u8> {
+        let (bytes, _, unmappable) = encoding_rs::GBK.encode(text);
+        assert!(!unmappable);
+        bytes.into_owned()
+    }
+
+    #[test]
+    fn gbk_head_preview_drops_a_split_ending() {
+        let full = gbk_bytes("甲乙丙");
+        assert_eq!(full.len(), 6);
+        let mut head = full[..5].to_vec();
+        trim_partial_text_suffix(&mut head, "gbk");
+        let (text, _, errors) = encoding_rs::GBK.decode(&head);
+        assert!(!errors);
+        assert_eq!(text, "甲乙");
+    }
+
+    #[test]
+    fn gbk_tail_preview_starts_on_the_next_character() {
+        let full = gbk_bytes("甲乙丙");
+        let mut window = full[2..].to_vec();
+        trim_partial_text_prefix(&mut window, "gbk", 1);
+        let (text, _, errors) = encoding_rs::GBK.decode(&window);
+        assert!(!errors);
+        assert_eq!(text, "丙");
+    }
+
+    #[test]
+    fn complete_gbk_text_is_not_trimmed() {
+        let full = gbk_bytes("甲乙丙");
+        let mut bytes = full.clone();
+        trim_partial_text_suffix(&mut bytes, "gbk");
+        assert_eq!(bytes, full);
+    }
+
+    #[test]
+    fn utf8_preview_still_drops_a_split_ending() {
+        let mut bytes = "你好".as_bytes().to_vec();
+        bytes.pop();
+        trim_partial_text_suffix(&mut bytes, "utf-8");
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "你");
     }
 }
