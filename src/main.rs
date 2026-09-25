@@ -1088,18 +1088,18 @@ async fn list_remote_dir(request: SftpRequest, app: AppHandle) -> Result<Vec<Fil
             &state,
             false,
         )?;
-        let result = context.pool.with(
+        let result = context.pool.with_detail(
             &context.profile,
             context.password.as_deref(),
             |connection| connection.list_dir(&request.path),
         );
         match result {
             Ok(entries) => Ok(entries),
-            Err(error) if matches!(context.profile.auth, AuthProfile::KeyFile { .. }) => {
+            Err(error) if error.is_connect() && matches!(context.profile.auth, AuthProfile::KeyFile { .. }) => {
                 system_ssh_list_dir(&context.profile, &request.path)
                     .map_err(|fallback| format!("{}；OpenSSH fallback 失败: {}", error, fallback))
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.to_string()),
         }
     })
     .await
@@ -1115,18 +1115,18 @@ async fn remote_home(request: RemoteHomeRequest, app: AppHandle) -> Result<Strin
             &state,
             false,
         )?;
-        let result = context.pool.with(
+        let result = context.pool.with_detail(
             &context.profile,
             context.password.as_deref(),
             |connection| connection.home_dir(),
         );
         match result {
             Ok(home) => Ok(home),
-            Err(error) if matches!(context.profile.auth, AuthProfile::KeyFile { .. }) => {
+            Err(error) if error.is_connect() && matches!(context.profile.auth, AuthProfile::KeyFile { .. }) => {
                 system_ssh_remote_home(&context.profile)
                     .map_err(|fallback| format!("{}；OpenSSH fallback 失败: {}", error, fallback))
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.to_string()),
         }
     })
     .await
@@ -1155,7 +1155,7 @@ async fn server_status(
             SERVER_STATUS_COMMAND,
         ) {
             Ok(output) => output,
-            Err(error) if matches!(context.profile.auth, AuthProfile::KeyFile { .. }) => {
+            Err(error) if error.is_connect() && matches!(context.profile.auth, AuthProfile::KeyFile { .. }) => {
                 system_ssh_output(&context.profile, SERVER_STATUS_COMMAND)
                     .map_err(|fallback| format!("{}；OpenSSH fallback 失败: {}", error, fallback))?
             }
