@@ -3365,7 +3365,7 @@ fn copy_remote_path(
     target: &Path,
     is_dir_hint: bool,
 ) -> Result<()> {
-    copy_remote_path_inner(sftp, source, target, is_dir_hint, true, None)
+    copy_remote_path_inner(sftp, source, target, is_dir_hint, true, None, false)
 }
 
 fn copy_remote_path_inner(
@@ -3375,8 +3375,11 @@ fn copy_remote_path_inner(
     is_dir_hint: bool,
     strict: bool,
     known: Option<ssh2::FileStat>,
+    fresh_target: bool,
 ) -> Result<()> {
-    if sftp.lstat(target).is_ok() {
+    // A folder created below is empty. Checking every new child is a round
+    // trip whose answer is no. The original target is still checked.
+    if !fresh_target && sftp.lstat(target).is_ok() {
         bail!("remote target already exists: {}", target.display());
     }
 
@@ -3425,11 +3428,22 @@ fn copy_remote_path_inner(
                 return Ok(());
             }
         };
+        let mut created_names = HashSet::new();
+        let mut created_folded = HashSet::new();
         for (child, child_stat) in children {
             let Some(name) = child.file_name() else {
                 continue;
             };
-            let child_target = remote_child_path(&remote_path_text(target), &name.to_string_lossy());
+            let name_owned = name.to_string_lossy().into_owned();
+            let child_target = remote_child_path(&remote_path_text(target), &name_owned);
+            let folded = name_owned.to_lowercase();
+            let duplicate = !created_names.insert(name_owned);
+            let case_collision = !created_folded.insert(folded);
+            // A repeated name, or one that differs only by letter case, can
+            // land on a file this copy already created.
+            if (duplicate || case_collision) && sftp.lstat(Path::new(&child_target)).is_ok() {
+                bail!("remote target already exists: {}", child_target);
+            }
             copy_remote_path_inner(
                 sftp,
                 &child,
@@ -3437,6 +3451,7 @@ fn copy_remote_path_inner(
                 false,
                 false,
                 Some(child_stat),
+                true,
             )?;
         }
         preserve_remote_owner(sftp, target, stat.uid, stat.gid);
