@@ -204,8 +204,10 @@ impl SftpPool {
 /// Drop idle slots, then oldest-first until we are back under the cap.
 ///
 /// Retired sessions are returned to the caller so their SSH shutdown happens
-/// after the map lock is released. A slot whose `try_lock` fails is busy on
-/// another thread, so it is left alone.
+/// after the map lock is released. A slot stays when its mutex is busy or
+/// another caller already holds the `Arc`. Removing that slot would let the
+/// current request finish on an orphaned connection and force the next request
+/// to connect again.
 fn prune(
     slots: &mut HashMap<Uuid, Arc<Mutex<SftpSlot>>>,
     keep: Uuid,
@@ -216,16 +218,11 @@ fn prune(
         if *id == keep {
             return true;
         }
-        match slot.try_lock() {
-            Ok(guard) => {
-                if now.duration_since(guard.last_used) <= IDLE_TIMEOUT {
-                    true
-                } else {
-                    retired.push(Arc::clone(slot));
-                    false
-                }
-            }
-            Err(_) => true,
+        if is_idle(slot, now) {
+            retired.push(Arc::clone(slot));
+            false
+        } else {
+            true
         }
     });
 
@@ -234,18 +231,43 @@ fn prune(
         let mut candidates: Vec<(Uuid, Instant)> = slots
             .iter()
             .filter(|(id, _)| **id != keep)
-            .filter_map(|(id, slot)| slot.try_lock().ok().map(|guard| (*id, guard.last_used)))
+            .filter_map(|(id, slot)| free_last_used(slot).map(|last_used| (*id, last_used)))
             .collect();
         candidates.sort_by_key(|(_, last_used)| *last_used);
 
-        for (id, _) in candidates.into_iter().take(overflow) {
+        let mut removed = 0usize;
+        for (id, _) in candidates {
+            if removed >= overflow {
+                break;
+            }
+            let Some(slot) = slots.get(&id) else {
+                continue;
+            };
+            if free_last_used(slot).is_none() {
+                continue;
+            }
             if let Some(slot) = slots.remove(&id) {
                 retired.push(slot);
+                removed += 1;
             }
         }
     }
 
     retired
+}
+
+/// `Some` when nobody else holds this slot and its mutex is free.
+fn free_last_used(slot: &Arc<Mutex<SftpSlot>>) -> Option<Instant> {
+    if Arc::strong_count(slot) > 1 {
+        return None;
+    }
+    slot.try_lock().ok().map(|guard| guard.last_used)
+}
+
+fn is_idle(slot: &Arc<Mutex<SftpSlot>>, now: Instant) -> bool {
+    free_last_used(slot).is_some_and(|last_used| {
+        now.saturating_duration_since(last_used) > IDLE_TIMEOUT
+    })
 }
 
 fn is_transport_error(error: &anyhow::Error) -> bool {
@@ -272,4 +294,70 @@ fn lock_map<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn lock_slot(slot: &Arc<Mutex<SftpSlot>>) -> MutexGuard<'_, SftpSlot> {
     slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot_used_at(last_used: Instant) -> Arc<Mutex<SftpSlot>> {
+        Arc::new(Mutex::new(SftpSlot {
+            connection: None,
+            last_used,
+        }))
+    }
+
+    #[test]
+    fn prune_keeps_a_session_another_caller_already_holds() {
+        let start = Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .expect("monotonic clock");
+        let mut slots = HashMap::new();
+        let keep = Uuid::new_v4();
+        slots.insert(keep, slot_used_at(start + Duration::from_secs(20)));
+
+        let held_id = Uuid::new_v4();
+        let held = slot_used_at(start);
+        let _caller = Arc::clone(&held);
+        slots.insert(held_id, held);
+
+        let mut removable = Vec::new();
+        for offset in 1..MAX_SESSIONS {
+            let id = Uuid::new_v4();
+            removable.push(id);
+            slots.insert(id, slot_used_at(start + Duration::from_secs(offset as u64)));
+        }
+        assert!(slots.len() > MAX_SESSIONS);
+
+        let retired = prune(&mut slots, keep);
+        assert!(slots.contains_key(&held_id));
+        assert!(slots.contains_key(&keep));
+        assert_eq!(retired.len(), 1);
+        assert!(!slots.contains_key(&removable[0]));
+    }
+
+    #[test]
+    fn prune_drops_an_idle_session_but_not_one_still_held() {
+        let now = Instant::now();
+        let idle_at = now
+            .checked_sub(IDLE_TIMEOUT + Duration::from_secs(5))
+            .expect("monotonic clock");
+        let mut slots = HashMap::new();
+        let keep = Uuid::new_v4();
+        slots.insert(keep, slot_used_at(now));
+
+        let held_id = Uuid::new_v4();
+        let held = slot_used_at(idle_at);
+        let _caller = Arc::clone(&held);
+        slots.insert(held_id, held);
+
+        let idle_id = Uuid::new_v4();
+        slots.insert(idle_id, slot_used_at(idle_at));
+
+        let retired = prune(&mut slots, keep);
+        assert!(slots.contains_key(&held_id));
+        assert!(slots.contains_key(&keep));
+        assert!(!slots.contains_key(&idle_id));
+        assert_eq!(retired.len(), 1);
+    }
 }
