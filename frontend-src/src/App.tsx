@@ -821,14 +821,11 @@ export default function App() {
   };
 
   const selectComparedPairs = (kind: FileCompareKind) => {
-    const remoteByName = new Map(baseVisibleRemoteFiles.map((entry) => [directoryEntryKey("remote", remotePath, entry), entry]));
-    const pairs = baseVisibleLocalFiles
-      .map((local) => {
-        const mark = directoryCompare.local.get(local.path);
-        const remote = remoteByName.get(directoryEntryKey("local", localPath, local)) ?? null;
-        return mark?.kind === kind && remote ? { local, remote } : null;
-      })
-      .filter((pair): pair is { local: FileEntry; remote: FileEntry } => Boolean(pair));
+    const pairs = matchDirectoryEntries(baseVisibleLocalFiles, baseVisibleRemoteFiles, localPath, remotePath)
+      .filter((match): match is { key: string; local: FileEntry; remote: FileEntry } =>
+        Boolean(match.local && match.remote && directoryCompare.local.get(match.local.path)?.kind === kind)
+      )
+      .map((match) => ({ local: match.local, remote: match.remote }));
     if (pairs.length === 0) {
       pushToast("info", "没有可选择的双侧对比项");
       return;
@@ -3810,14 +3807,11 @@ export default function App() {
 
   const syncComparedMetadata = async (direction: "upload" | "download") => {
     if (!activeProfile || isLocalProtocol(activeProfile.protocol)) return;
-    const localByName = new Map(baseVisibleLocalFiles.map((file) => [directoryEntryKey("local", localPath, file), file]));
-    const remoteByName = new Map(baseVisibleRemoteFiles.map((file) => [directoryEntryKey("remote", remotePath, file), file]));
-    const pairs = [...localByName.entries()]
-      .map(([name, local]) => ({ local, remote: remoteByName.get(name) }))
-      .filter(({ local, remote }) => remote && directoryCompare.local.get(local.path)?.kind === "different") as Array<{
-        local: FileEntry;
-        remote: FileEntry;
-      }>;
+    const pairs = matchDirectoryEntries(baseVisibleLocalFiles, baseVisibleRemoteFiles, localPath, remotePath)
+      .filter((match): match is { key: string; local: FileEntry; remote: FileEntry } =>
+        Boolean(match.local && match.remote && directoryCompare.local.get(match.local.path)?.kind === "different")
+      )
+      .map((match) => ({ local: match.local, remote: match.remote }));
     const targets = pairs.filter(({ local, remote }) => local.fileType !== "symlink" && remote.fileType !== "symlink");
     if (targets.length === 0) {
       pushToast("info", "没有可同步的元数据差异");
@@ -9524,6 +9518,61 @@ function directoryEntryKey(side: FileSide, root: string, file: FileEntry) {
   return file.name;
 }
 
+function matchDirectoryEntries(
+  localFiles: FileEntry[],
+  remoteFiles: FileEntry[],
+  localRoot: string,
+  remoteRoot: string
+) {
+  const localEntries = localFiles.map((file) => ({ file, key: directoryEntryKey("local", localRoot, file) }));
+  const remoteEntries = remoteFiles.map((file) => ({ file, key: directoryEntryKey("remote", remoteRoot, file) }));
+  const localByKey = new Map(localEntries.map((entry) => [entry.key, entry]));
+  const remoteByKey = new Map(remoteEntries.map((entry) => [entry.key, entry]));
+  const matches: Array<{ key: string; local: FileEntry | null; remote: FileEntry | null }> = [];
+  const usedLocal = new Set<string>();
+  const usedRemote = new Set<string>();
+
+  for (const [key, local] of localByKey) {
+    const remote = remoteByKey.get(key);
+    if (!remote) continue;
+    matches.push({ key, local: local.file, remote: remote.file });
+    usedLocal.add(local.file.path);
+    usedRemote.add(remote.file.path);
+  }
+
+  const localLeft = localEntries.filter((entry) => !usedLocal.has(entry.file.path));
+  const remoteLeft = remoteEntries.filter((entry) => !usedRemote.has(entry.file.path));
+  const localFold = groupDirectoryEntries(localLeft);
+  const remoteFold = groupDirectoryEntries(remoteLeft);
+  for (const fold of new Set([...localFold.keys(), ...remoteFold.keys()])) {
+    const left = localFold.get(fold) ?? [];
+    const right = remoteFold.get(fold) ?? [];
+    if (left.length !== 1 || right.length !== 1) continue;
+    matches.push({ key: left[0].key, local: left[0].file, remote: right[0].file });
+    usedLocal.add(left[0].file.path);
+    usedRemote.add(right[0].file.path);
+  }
+
+  for (const entry of localEntries) {
+    if (!usedLocal.has(entry.file.path)) matches.push({ key: entry.key, local: entry.file, remote: null });
+  }
+  for (const entry of remoteEntries) {
+    if (!usedRemote.has(entry.file.path)) matches.push({ key: entry.key, local: null, remote: entry.file });
+  }
+  return matches;
+}
+
+function groupDirectoryEntries(entries: Array<{ file: FileEntry; key: string }>) {
+  const groups = new Map<string, Array<{ file: FileEntry; key: string }>>();
+  for (const entry of entries) {
+    const fold = entry.key.toLowerCase();
+    const group = groups.get(fold);
+    if (group) group.push(entry);
+    else groups.set(fold, [entry]);
+  }
+  return groups;
+}
+
 function buildDirectoryCompare(
   localFiles: FileEntry[],
   remoteFiles: FileEntry[],
@@ -9533,32 +9582,24 @@ function buildDirectoryCompare(
   const local = new Map<string, FileCompareMark>();
   const remote = new Map<string, FileCompareMark>();
   const summary = { same: 0, different: 0, onlyLocal: 0, onlyRemote: 0 };
-  const localByName = new Map(localFiles.map((file) => [directoryEntryKey("local", localRoot, file), file]));
-  const remoteByName = new Map(remoteFiles.map((file) => [directoryEntryKey("remote", remoteRoot, file), file]));
-  const names = new Set([...localByName.keys(), ...remoteByName.keys()]);
 
-  for (const name of names) {
-    const left = localByName.get(name);
-    const right = remoteByName.get(name);
-    if (left && !right) {
-      local.set(left.path, { kind: "only-local", detail: "远程不存在" });
+  for (const match of matchDirectoryEntries(localFiles, remoteFiles, localRoot, remoteRoot)) {
+    if (match.local && match.remote) {
+      const mark = compareFilePair(match.local, match.remote);
+      local.set(match.local.path, mark);
+      remote.set(match.remote.path, mark);
+      if (mark.kind === "same") summary.same += 1;
+      else summary.different += 1;
+      continue;
+    }
+    if (match.local) {
+      local.set(match.local.path, { kind: "only-local", detail: "远程不存在" });
       summary.onlyLocal += 1;
       continue;
     }
-    if (!left && right) {
-      remote.set(right.path, { kind: "only-remote", detail: "本地不存在" });
+    if (match.remote) {
+      remote.set(match.remote.path, { kind: "only-remote", detail: "本地不存在" });
       summary.onlyRemote += 1;
-      continue;
-    }
-    if (!left || !right) continue;
-
-    const mark = compareFilePair(left, right);
-    local.set(left.path, mark);
-    remote.set(right.path, mark);
-    if (mark.kind === "same") {
-      summary.same += 1;
-    } else {
-      summary.different += 1;
     }
   }
 
@@ -10356,13 +10397,9 @@ function directoryCompareCsv(
   options: { includeSame?: boolean } = {}
 ) {
   const includeSame = options.includeSame ?? true;
-  const localByName = new Map(localFiles.map((file) => [directoryEntryKey("local", localRoot, file), file]));
-  const remoteByName = new Map(remoteFiles.map((file) => [directoryEntryKey("remote", remoteRoot, file), file]));
-  const names = [...new Set([...localByName.keys(), ...remoteByName.keys()])].filter((name) => {
+  const matches = matchDirectoryEntries(localFiles, remoteFiles, localRoot, remoteRoot).filter((match) => {
     if (includeSame) return true;
-    const local = localByName.get(name) ?? null;
-    const remote = remoteByName.get(name) ?? null;
-    const mark = local ? compare.local.get(local.path) : remote ? compare.remote.get(remote.path) : null;
+    const mark = match.local ? compare.local.get(match.local.path) : match.remote ? compare.remote.get(match.remote.path) : null;
     return Boolean(mark && mark.kind !== "same");
   });
   const rows = [
@@ -10383,12 +10420,12 @@ function directoryCompareCsv(
       "local_modified",
       "remote_modified"
     ],
-    ...names.map((name) => {
-      const local = localByName.get(name) ?? null;
-      const remote = remoteByName.get(name) ?? null;
+    ...matches.map((match) => {
+      const local = match.local;
+      const remote = match.remote;
       const mark = local ? compare.local.get(local.path) : remote ? compare.remote.get(remote.path) : null;
       return [
-        name,
+        match.key,
         mark ? compareKindLabel(mark.kind) : "-",
         mark?.detail ?? "-",
         local?.path ?? "",
@@ -10416,10 +10453,8 @@ function directoryCompareJson(
   remoteFiles: FileEntry[],
   compare: DirectoryCompare
 ) {
-  const localByName = new Map(localFiles.map((file) => [directoryEntryKey("local", localRoot, file), file]));
-  const remoteByName = new Map(remoteFiles.map((file) => [directoryEntryKey("remote", remoteRoot, file), file]));
-  const names = [...new Set([...localByName.keys(), ...remoteByName.keys()])].sort((left, right) =>
-    left.localeCompare(right, "zh-Hans-CN")
+  const matches = matchDirectoryEntries(localFiles, remoteFiles, localRoot, remoteRoot).sort((left, right) =>
+    left.key.localeCompare(right.key, "zh-Hans-CN")
   );
   return JSON.stringify(
     {
@@ -10427,12 +10462,12 @@ function directoryCompareJson(
       localRoot,
       remoteRoot,
       summary: compare.summary,
-      items: names.map((name) => {
-        const local = localByName.get(name) ?? null;
-        const remote = remoteByName.get(name) ?? null;
+      items: matches.map((match) => {
+        const local = match.local;
+        const remote = match.remote;
         const mark = local ? compare.local.get(local.path) : remote ? compare.remote.get(remote.path) : null;
         return {
-          name,
+          name: match.key,
           status: mark?.kind ?? "different",
           statusLabel: mark ? compareKindLabel(mark.kind) : "-",
           detail: mark?.detail ?? "",
