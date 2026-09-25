@@ -2707,10 +2707,10 @@ export default function App() {
   const duplicateLocalSelected = async () => {
     const entries = visibleSelectedLocalEntries;
     if (entries.length === 0) return;
-    const occupiedNames = new Set(localFiles.map((file) => file.name));
+    const occupiedNames = new Set(localFiles.map((file) => file.name.toLowerCase()));
     const targets = entries.map((entry) => {
-      const name = uniqueDuplicateName(entry.name, occupiedNames);
-      occupiedNames.add(name);
+      const name = uniqueDuplicateName(entry.name, occupiedNames, true);
+      occupiedNames.add(name.toLowerCase());
       return { entry, name };
     });
 
@@ -10073,9 +10073,10 @@ function duplicateName(name: string) {
   return `${name} copy`;
 }
 
-function uniqueDuplicateName(name: string, occupiedNames: Set<string>) {
+function uniqueDuplicateName(name: string, occupiedNames: Set<string>, caseInsensitive = false) {
+  const taken = (value: string) => occupiedNames.has(caseInsensitive ? value.toLowerCase() : value);
   let candidate = duplicateName(name);
-  if (!occupiedNames.has(candidate)) return candidate;
+  if (!taken(candidate)) return candidate;
 
   const dot = name.lastIndexOf(".");
   const base = dot > 0 ? name.slice(0, dot) : name;
@@ -10084,7 +10085,7 @@ function uniqueDuplicateName(name: string, occupiedNames: Set<string>) {
   do {
     candidate = `${base} copy ${index}${ext}`;
     index += 1;
-  } while (occupiedNames.has(candidate));
+  } while (taken(candidate));
   return candidate;
 }
 
