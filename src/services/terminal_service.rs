@@ -229,6 +229,41 @@ fn send_pty_output(
     }
 }
 
+
+enum PtyCommandWait {
+    Command(TerminalCommand),
+    Exited(i32),
+    Closed,
+}
+
+/// Block for the next keystroke, but notice when the shell has already exited.
+/// Waiting only on the command channel left a finished shell looking connected.
+fn wait_pty_command(
+    command_rx: &Receiver<TerminalCommand>,
+    child: &mut dyn portable_pty::Child,
+) -> PtyCommandWait {
+    loop {
+        match command_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(command) => return PtyCommandWait::Command(command),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return PtyCommandWait::Closed;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if let Some(code) = pty_exit_code(child) {
+                    return PtyCommandWait::Exited(code);
+                }
+            }
+        }
+    }
+}
+
+fn pty_exit_code(child: &mut dyn portable_pty::Child) -> Option<i32> {
+    match portable_pty::Child::try_wait(child) {
+        Ok(Some(status)) => Some(status.exit_code() as i32),
+        _ => None,
+    }
+}
+
 fn run_local_shell(
     _profile: SessionProfile,
     local_shell: Option<String>,
@@ -276,30 +311,47 @@ fn run_local_shell(
     spawn_pty_output_reader(reader, event_tx.clone()).context("failed to spawn PTY reader")?;
 
     let master = pair.master;
-    while let Ok(command) = command_rx.recv() {
-        match command {
-            TerminalCommand::Write(bytes) => {
-                writer.write_all(&bytes).context("failed to write PTY")?;
+    let mut exit_code = None;
+    loop {
+        match wait_pty_command(&command_rx, child.as_mut()) {
+            PtyCommandWait::Command(TerminalCommand::Write(bytes)) => {
+                if let Err(error) = writer.write_all(&bytes) {
+                    if let Some(code) = pty_exit_code(child.as_mut()) {
+                        exit_code = Some(code);
+                        break;
+                    }
+                    return Err(error).context("failed to write PTY");
+                }
                 writer.flush().ok();
             }
-            TerminalCommand::Resize(next_size) => {
-                master
-                    .resize(PtySize {
-                        rows: next_size.rows,
-                        cols: next_size.cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                    .context("failed to resize PTY")?;
+            PtyCommandWait::Command(TerminalCommand::Resize(next_size)) => {
+                if let Err(error) = master.resize(PtySize {
+                    rows: next_size.rows,
+                    cols: next_size.cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                }) {
+                    if let Some(code) = pty_exit_code(child.as_mut()) {
+                        exit_code = Some(code);
+                        break;
+                    }
+                    return Err(error).context("failed to resize PTY");
+                }
             }
-            TerminalCommand::Shutdown => break,
+            PtyCommandWait::Command(TerminalCommand::Shutdown) | PtyCommandWait::Closed => break,
+            PtyCommandWait::Exited(code) => {
+                exit_code = Some(code);
+                break;
+            }
         }
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    if exit_code.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     event_tx
-        .send(TerminalEvent::Disconnected { exit_code: None })
+        .send(TerminalEvent::Disconnected { exit_code })
         .ok();
     Ok(())
 }
@@ -369,30 +421,49 @@ fn run_system_ssh_shell(
     spawn_pty_output_reader(reader, event_tx.clone()).context("failed to spawn SSH PTY reader")?;
 
     let master = pair.master;
-    while let Ok(command) = command_rx.recv() {
-        match command {
-            TerminalCommand::Write(bytes) => {
-                writer
-                    .write_all(&bytes)
-                    .context("failed to write SSH PTY")?;
+    let mut exit_code = None;
+    let mut child_exited = false;
+    loop {
+        match wait_pty_command(&command_rx, child.as_mut()) {
+            PtyCommandWait::Command(TerminalCommand::Write(bytes)) => {
+                if let Err(error) = writer.write_all(&bytes) {
+                    if let Some(code) = pty_exit_code(child.as_mut()) {
+                        exit_code = Some(code);
+                        child_exited = true;
+                        break;
+                    }
+                    return Err(error).context("failed to write SSH PTY");
+                }
                 writer.flush().ok();
             }
-            TerminalCommand::Resize(next_size) => {
-                master
-                    .resize(PtySize {
-                        rows: next_size.rows,
-                        cols: next_size.cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                    .context("failed to resize SSH PTY")?;
+            PtyCommandWait::Command(TerminalCommand::Resize(next_size)) => {
+                if let Err(error) = master.resize(PtySize {
+                    rows: next_size.rows,
+                    cols: next_size.cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                }) {
+                    if let Some(code) = pty_exit_code(child.as_mut()) {
+                        exit_code = Some(code);
+                        child_exited = true;
+                        break;
+                    }
+                    return Err(error).context("failed to resize SSH PTY");
+                }
             }
-            TerminalCommand::Shutdown => break,
+            PtyCommandWait::Command(TerminalCommand::Shutdown) | PtyCommandWait::Closed => break,
+            PtyCommandWait::Exited(code) => {
+                exit_code = Some(code);
+                child_exited = true;
+                break;
+            }
         }
     }
 
-    let _ = child.kill();
-    let exit_code = child.wait().ok().map(|status| status.exit_code() as i32);
+    if !child_exited {
+        let _ = child.kill();
+        exit_code = child.wait().ok().map(|status| status.exit_code() as i32);
+    }
     event_tx
         .send(TerminalEvent::Disconnected { exit_code })
         .ok();
