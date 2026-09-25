@@ -104,12 +104,15 @@ impl HistoryBuffer {
         }
     }
 
-    pub fn push(&mut self, bytes: &[u8]) {
+    pub fn push(&mut self, bytes: &[u8], charset: &str) {
         self.data.extend_from_slice(bytes);
         if self.data.len() > self.cap {
-            let drop = self.data.len() - self.cap;
-            self.data.drain(..drop);
-            self.start_offset += drop as u64;
+            let drop_at = self.data.len() - self.cap;
+            let drop_n = align_terminal_cut(&self.data, drop_at, charset).min(self.data.len());
+            if drop_n > 0 {
+                self.data.drain(..drop_n);
+                self.start_offset += drop_n as u64;
+            }
             if self.data.capacity() > self.cap * 2 {
                 self.data.shrink_to(self.cap);
             }
@@ -226,7 +229,7 @@ impl TerminalModel {
                     self.host_key_issue = None;
                 }
                 TerminalEvent::Output(bytes) => {
-                    self.history.push(&bytes);
+                    self.history.push(&bytes, &self.profile.charset);
                     if let Some(path) = self.detect_current_directory(&bytes) {
                         self.current_directory = Some(path);
                     }
@@ -264,8 +267,15 @@ impl TerminalModel {
     fn push_pending_output(&mut self, bytes: &[u8]) {
         self.pending_output.extend_from_slice(bytes);
         if self.pending_output.len() > TERMINAL_PENDING_CAP {
-            let drop = self.pending_output.len() - TERMINAL_PENDING_CAP;
-            self.pending_output.drain(..drop);
+            let drop_at = self.pending_output.len() - TERMINAL_PENDING_CAP;
+            let drop_n = align_terminal_cut(&self.pending_output, drop_at, &self.profile.charset)
+                .min(self.pending_output.len());
+            if drop_n > 0 {
+                self.pending_output.drain(..drop_n);
+                // Unread bytes were discarded, including any continuation the
+                // decoder was waiting on. Start clean at the aligned boundary.
+                self.output_decoder = terminal_encoding(&self.profile.charset).new_decoder();
+            }
             if self.pending_output.capacity() > TERMINAL_PENDING_CAP * 2 {
                 self.pending_output.shrink_to(TERMINAL_PENDING_CAP);
             }
@@ -433,6 +443,74 @@ fn encode_terminal_text(charset: &str, text: &str) -> Vec<u8> {
     bytes.into_owned()
 }
 
+/// Move a trim point forward so the kept bytes start on a character boundary.
+fn align_terminal_cut(data: &[u8], drop_at: usize, charset: &str) -> usize {
+    if drop_at >= data.len() {
+        return data.len();
+    }
+    if is_utf8_charset(charset) {
+        return skip_utf8_continuation(data, drop_at);
+    }
+    if is_gbk_charset(charset) {
+        let four_byte = is_gb18030_charset(charset);
+        let mut index = 0;
+        while index < drop_at && index < data.len() {
+            let step = cjk_char_len(&data[index..], four_byte);
+            if step == 0 {
+                break;
+            }
+            index += step;
+        }
+        return index.min(data.len());
+    }
+    drop_at
+}
+
+fn is_utf8_charset(charset: &str) -> bool {
+    terminal_encoding(charset) == UTF_8
+}
+
+fn is_gbk_charset(charset: &str) -> bool {
+    let name = terminal_encoding(charset).name();
+    name.eq_ignore_ascii_case("gbk") || name.eq_ignore_ascii_case("gb18030")
+}
+
+fn is_gb18030_charset(charset: &str) -> bool {
+    terminal_encoding(charset)
+        .name()
+        .eq_ignore_ascii_case("gb18030")
+}
+
+fn skip_utf8_continuation(data: &[u8], drop_at: usize) -> usize {
+    let mut index = drop_at;
+    let limit = data.len().min(drop_at.saturating_add(3));
+    while index < limit && data[index] & 0b1100_0000 == 0b1000_0000 {
+        index += 1;
+    }
+    index
+}
+
+fn cjk_char_len(bytes: &[u8], four_byte: bool) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let first = bytes[0];
+    if first <= 0x7F || !(0x81..=0xFE).contains(&first) {
+        return 1;
+    }
+    if bytes.len() == 1 {
+        return 1;
+    }
+    let second = bytes[1];
+    if (0x40..=0x7E).contains(&second) || (0x80..=0xFE).contains(&second) {
+        return 2;
+    }
+    if four_byte && (0x30..=0x39).contains(&second) {
+        return 4.min(bytes.len());
+    }
+    1
+}
+
 impl TerminalHandle {
     pub fn new(
         profile: &SessionProfile,
@@ -488,14 +566,14 @@ mod tests {
         let mut buffer = HistoryBuffer::new(64 * 1024);
         assert_eq!(buffer.end_offset(), 0);
 
-        buffer.push(b"hello");
+        buffer.push(b"hello", "UTF-8");
         assert_eq!(buffer.end_offset(), 5);
         assert_eq!(buffer.bytes(), b"hello");
 
         // Push past capacity to force trimming.
         let chunk = vec![b'x'; 32 * 1024];
         for _ in 0..8 {
-            buffer.push(&chunk);
+            buffer.push(&chunk, "UTF-8");
         }
         let total = 5 + 8 * chunk.len() as u64;
         assert_eq!(buffer.end_offset(), total);
@@ -523,5 +601,79 @@ mod tests {
 
         assert_eq!(decode_terminal_stream(&mut decoder, &bytes[..1]), "");
         assert_eq!(decode_terminal_stream(&mut decoder, &bytes[1..]), "中");
+    }
+
+    fn model_with_charset(
+        charset: &str,
+    ) -> (TerminalModel, crossbeam_channel::Sender<TerminalEvent>) {
+        let mut profile = crate::core::session::SessionProfile::new_ssh("t", "g", "h", "u");
+        profile.charset = charset.to_owned();
+        let mut model = TerminalModel::new(profile, TerminalSize::default());
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let (command_tx, _command_rx) = crossbeam_channel::unbounded();
+        model.attach(RunningTerminal {
+            command_tx,
+            event_rx,
+        });
+        (model, event_tx)
+    }
+
+    #[test]
+    fn history_trim_keeps_utf8_and_gbk_character_boundaries() {
+        let mut utf8 = HistoryBuffer::new(64 * 1024);
+        let mut bytes = vec![b'a'];
+        bytes.extend_from_slice("\u{4e2d}".as_bytes());
+        bytes.resize(64 * 1024 + 2, b'b');
+        utf8.push(&bytes, "UTF-8");
+        let kept = utf8.bytes();
+        assert!(kept.len() <= 64 * 1024);
+        assert!(std::str::from_utf8(kept).is_ok());
+        assert!(kept.iter().all(|byte| *byte == b'b'));
+
+        let mut gbk = HistoryBuffer::new(64 * 1024);
+        let encoded = encode_terminal_text("GBK", "\u{4e2d}");
+        assert_eq!(encoded.len(), 2);
+        let mut bytes = vec![b'a'];
+        bytes.extend_from_slice(&encoded);
+        bytes.resize(64 * 1024 + 2, b'b');
+        gbk.push(&bytes, "GBK");
+        let text = decode_terminal_bytes("GBK", gbk.bytes());
+        assert!(!text.contains('\u{FFFD}'));
+        assert!(text.chars().all(|ch| ch == 'b'));
+
+        let mut gb18030 = HistoryBuffer::new(64 * 1024);
+        let encoded = encode_terminal_text("gb18030", "\u{1F600}");
+        assert!(encoded.len() > 1);
+        let mut bytes = vec![b'a'];
+        bytes.extend_from_slice(&encoded);
+        bytes.resize(64 * 1024 + 2, b'b');
+        gb18030.push(&bytes, "GB18030");
+        let text = decode_terminal_bytes("GB18030", gb18030.bytes());
+        assert!(!text.contains('\u{FFFD}'));
+        assert!(text.chars().all(|ch| ch == 'b'));
+    }
+
+    #[test]
+    fn pending_trim_does_not_resume_mid_character() {
+        let (mut model, event_tx) = model_with_charset("UTF-8");
+        event_tx
+            .send(TerminalEvent::Output(vec![0xE4]))
+            .unwrap();
+        assert_eq!(model.drain_output(), "");
+
+        let mut bytes = vec![b'a'];
+        bytes.extend_from_slice("\u{4e2d}".as_bytes());
+        bytes.resize(TERMINAL_PENDING_CAP + 2, b'b');
+        event_tx.send(TerminalEvent::Output(bytes)).unwrap();
+        let trimmed = model.drain_output();
+        assert!(
+            trimmed.chars().all(|ch| ch == 'b'),
+            "trimmed output was {trimmed:?}"
+        );
+
+        event_tx
+            .send(TerminalEvent::Output("\u{4e2d}".as_bytes().to_vec()))
+            .unwrap();
+        assert_eq!(model.drain_output(), "\u{4e2d}");
     }
 }
