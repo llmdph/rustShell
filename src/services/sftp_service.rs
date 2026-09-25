@@ -24,6 +24,7 @@ use std::os::unix::fs::PermissionsExt;
 
 const REMOTE_TEXT_PREVIEW_LIMIT: u64 = 1024 * 1024;
 const REMOTE_DIR_ENTRY_LIMIT: usize = 10_000;
+const TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const LIBSSH2_ERROR_FILE: i32 = -16;
 const LIBSSH2_ERROR_EAGAIN: i32 = -37;
 
@@ -1054,8 +1055,12 @@ where
     F: FnMut(u64, u64),
 {
     let mut buffer = [0_u8; 64 * 1024];
+    let mut last_progress = Instant::now()
+        .checked_sub(TRANSFER_PROGRESS_INTERVAL)
+        .unwrap_or_else(Instant::now);
     loop {
         if cancel.load(Ordering::Relaxed) {
+            on_progress(*transferred, total);
             bail!("transfer cancelled");
         }
 
@@ -1065,8 +1070,13 @@ where
         }
         writer.write_all(&buffer[..read])?;
         *transferred += read as u64;
-        on_progress(*transferred, total);
+        let now = Instant::now();
+        if now.duration_since(last_progress) >= TRANSFER_PROGRESS_INTERVAL {
+            on_progress(*transferred, total);
+            last_progress = now;
+        }
     }
+    on_progress(*transferred, total);
     writer.flush().ok();
     Ok(())
 }
