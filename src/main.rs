@@ -410,6 +410,8 @@ struct StartTransferRequest {
     #[serde(default)]
     conflict_strategy: TransferConflictStrategy,
     password: Option<String>,
+    #[serde(default)]
+    destination_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -461,6 +463,7 @@ struct TransferTask {
     conflict_strategy: TransferConflictStrategy,
     source: String,
     target: String,
+    destination_name: Option<String>,
     cancel: Arc<AtomicBool>,
     state: Arc<Mutex<TransferState>>,
 }
@@ -1306,6 +1309,7 @@ async fn upload_file(request: TransferRequest, app: AppHandle) -> Result<(), Str
                     &request.local_path,
                     &request.remote_path,
                     TransferConflictStrategy::Overwrite,
+                    None,
                     Arc::new(AtomicBool::new(false)),
                     |_, _| {},
                 )
@@ -1331,6 +1335,7 @@ async fn download_file(request: TransferRequest, app: AppHandle) -> Result<Strin
                     &request.remote_path,
                     &request.local_path,
                     TransferConflictStrategy::Overwrite,
+                    None,
                     Arc::new(AtomicBool::new(false)),
                     |_, _| {},
                 )
@@ -1639,6 +1644,7 @@ fn start_transfer_with_attempts(
         conflict_strategy: request.conflict_strategy,
         source,
         target,
+        destination_name: request.destination_name.clone(),
         cancel: cancel.clone(),
         state: transfer_state.clone(),
     };
@@ -1646,6 +1652,7 @@ fn start_transfer_with_attempts(
     let worker_profile = profile.clone();
     let worker_local_path = request.local_path.clone();
     let worker_remote_path = request.remote_path.clone();
+    let worker_destination_name = request.destination_name.clone();
     let worker_direction = request.direction;
     let worker_conflict = request.conflict_strategy;
     let worker_profile_id = profile.id;
@@ -1687,6 +1694,7 @@ fn start_transfer_with_attempts(
                         &worker_local_path,
                         &worker_remote_path,
                         worker_conflict,
+                        worker_destination_name.as_deref(),
                         cancel.clone(),
                         &mut on_progress,
                     )
@@ -1696,6 +1704,7 @@ fn start_transfer_with_attempts(
                         &worker_remote_path,
                         &worker_local_path,
                         worker_conflict,
+                        worker_destination_name.as_deref(),
                         cancel.clone(),
                         &mut on_progress,
                     )
@@ -1787,7 +1796,7 @@ async fn retry_transfer(transfer_id: String, app: AppHandle) -> Result<TransferV
     blocking(move || {
         let state = app.state::<AppRuntime>();
         let id = parse_uuid(&transfer_id)?;
-        let (profile_id, direction, conflict_strategy, local_path, remote_path, attempts) = {
+        let (profile_id, direction, conflict_strategy, local_path, remote_path, destination_name, attempts) = {
             let transfers = lock(&state.transfers)?;
             let task = transfers
                 .get(&id)
@@ -1809,6 +1818,7 @@ async fn retry_transfer(transfer_id: String, app: AppHandle) -> Result<TransferV
                 task.conflict_strategy,
                 local_path,
                 remote_path,
+                task.destination_name.clone(),
                 attempts,
             )
         };
@@ -1821,6 +1831,7 @@ async fn retry_transfer(transfer_id: String, app: AppHandle) -> Result<TransferV
                 remote_path,
                 conflict_strategy,
                 password: None,
+                destination_name,
             },
             state,
             attempts,

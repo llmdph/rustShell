@@ -392,10 +392,19 @@ export const api = {
     localPath: string,
     remotePath: string,
     conflictStrategy: TransferConflictStrategy,
-    password?: string | null
+    password?: string | null,
+    destinationName?: string | null
   ) =>
     invoke<TransferView>("start_transfer", {
-      request: { profileId, direction, localPath, remotePath, conflictStrategy, password: password || null }
+      request: {
+        profileId,
+        direction,
+        localPath,
+        remotePath,
+        conflictStrategy,
+        password: password || null,
+        destinationName: destinationName || null
+      }
     }),
   listTransfers: () => invoke<TransferView[]>("list_transfers"),
   listTransferHistory: () => invoke<TransferView[]>("list_transfer_history"),

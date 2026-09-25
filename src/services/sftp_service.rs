@@ -936,7 +936,15 @@ where
 {
     let session = connect(profile, password)?;
     let sftp = session.sftp().context("failed to start SFTP subsystem")?;
-    upload_with_sftp(&sftp, local_path, remote_dir, conflict, cancel, on_progress)
+    upload_with_sftp(
+        &sftp,
+        local_path,
+        remote_dir,
+        conflict,
+        None,
+        cancel,
+        on_progress,
+    )
 }
 
 /// Upload over an already-open SFTP channel.
@@ -949,6 +957,7 @@ pub fn upload_with_sftp<F>(
     local_path: &str,
     remote_dir: &str,
     conflict: TransferConflictStrategy,
+    destination_name: Option<&str>,
     cancel: Arc<AtomicBool>,
     mut on_progress: F,
 ) -> Result<String>
@@ -956,10 +965,14 @@ where
     F: FnMut(u64, u64),
 {
     let local_path = Path::new(local_path);
-    let file_name = local_path
-        .file_name()
-        .ok_or_else(|| anyhow!("local file name is missing"))?
-        .to_string_lossy();
+    let file_name = match preferred_transfer_name(destination_name)? {
+        Some(name) => name,
+        None => local_path
+            .file_name()
+            .ok_or_else(|| anyhow!("local file name is missing"))?
+            .to_string_lossy()
+            .into_owned(),
+    };
     let remote_path = resolve_remote_child_path(sftp, remote_dir, &file_name, conflict)?;
 
     let total = local_total_size(local_path, &cancel)?;
@@ -1073,7 +1086,15 @@ where
 {
     let session = connect(profile, password)?;
     let sftp = session.sftp().context("failed to start SFTP subsystem")?;
-    download_with_sftp(&sftp, remote_path, local_dir, conflict, cancel, on_progress)
+    download_with_sftp(
+        &sftp,
+        remote_path,
+        local_dir,
+        conflict,
+        None,
+        cancel,
+        on_progress,
+    )
 }
 
 /// Download over an already-open SFTP channel. See [`upload_with_sftp`].
@@ -1082,16 +1103,22 @@ pub fn download_with_sftp<F>(
     remote_path: &str,
     local_dir: &str,
     conflict: TransferConflictStrategy,
+    destination_name: Option<&str>,
     cancel: Arc<AtomicBool>,
     mut on_progress: F,
 ) -> Result<PathBuf>
 where
     F: FnMut(u64, u64),
 {
-    let file_name = Path::new(remote_path)
-        .file_name()
-        .ok_or_else(|| anyhow!("remote file name is missing"))?;
-    let local_path = resolve_local_child_path(Path::new(local_dir), file_name, conflict)?;
+    let file_name = match preferred_transfer_name(destination_name)? {
+        Some(name) => name,
+        None => Path::new(remote_path)
+            .file_name()
+            .ok_or_else(|| anyhow!("remote file name is missing"))?
+            .to_string_lossy()
+            .into_owned(),
+    };
+    let local_path = resolve_local_child_path(Path::new(local_dir), Path::new(&file_name).as_os_str(), conflict)?;
     let remote_path_text = remote_path.to_owned();
     let remote_path = Path::new(&remote_path_text);
     let stat = sftp
@@ -2277,6 +2304,19 @@ fn create_local_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
         .or_else(|_| std::os::windows::fs::symlink_dir(target, link))
 }
 
+fn preferred_transfer_name(requested: Option<&str>) -> Result<Option<String>> {
+    let Some(name) = requested.map(str::trim).filter(|name| !name.is_empty()) else {
+        return Ok(None);
+    };
+    if name == "."
+        || name == ".."
+        || name.chars().any(|ch| ch == '/' || ch == '\\' || ch == '\0')
+    {
+        bail!("transfer name is invalid");
+    }
+    Ok(Some(name.to_owned()))
+}
+
 fn split_file_name(name: &str) -> (String, String) {
     match name.rfind('.') {
         Some(index) if index > 0 => (name[..index].to_owned(), name[index..].to_owned()),
@@ -2810,6 +2850,29 @@ fn validate_remote_relative_dir_path(path: &str) -> Result<Vec<&str>> {
         segments.push(segment);
     }
     Ok(segments)
+}
+
+#[cfg(test)]
+mod preferred_transfer_name_tests {
+    use super::preferred_transfer_name;
+
+    #[test]
+    fn keeps_a_single_file_name() {
+        assert_eq!(
+            preferred_transfer_name(Some(" readme.md ")).unwrap().as_deref(),
+            Some("readme.md")
+        );
+        assert_eq!(preferred_transfer_name(None).unwrap(), None);
+        assert_eq!(preferred_transfer_name(Some("  ")).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_a_path_instead_of_a_name() {
+        assert!(preferred_transfer_name(Some("a/b")).is_err());
+        assert!(preferred_transfer_name(Some(r"a\b")).is_err());
+        assert!(preferred_transfer_name(Some("..")).is_err());
+        assert!(preferred_transfer_name(Some(".")).is_err());
+    }
 }
 
 #[cfg(test)]

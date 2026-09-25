@@ -3669,10 +3669,27 @@ export default function App() {
     let started = 0;
     for (const item of plan.items) {
       try {
+        const destinationName = pathBaseName(item.target);
         if (plan.direction === "upload") {
-          await api.startTransfer(activeProfile.id, "upload", item.source || item.entry.path, remoteParentPath(item.target), conflict, passwordForActive);
+          await api.startTransfer(
+            activeProfile.id,
+            "upload",
+            item.source || item.entry.path,
+            remoteParentPath(item.target),
+            conflict,
+            passwordForActive,
+            destinationName
+          );
         } else {
-          await api.startTransfer(activeProfile.id, "download", localParentPath(item.target), item.source || item.entry.path, conflict, passwordForActive);
+          await api.startTransfer(
+            activeProfile.id,
+            "download",
+            localParentPath(item.target),
+            item.source || item.entry.path,
+            conflict,
+            passwordForActive,
+            destinationName
+          );
         }
         started += 1;
       } catch (error) {
@@ -3769,6 +3786,12 @@ export default function App() {
           ? "下载仅远程项目"
           : "下载目录差异";
     const marks = direction === "upload" ? directoryCompare.local : directoryCompare.remote;
+    const pairedBySource = new Map<string, FileEntry>();
+    for (const match of matchDirectoryEntries(baseVisibleLocalFiles, baseVisibleRemoteFiles, localPath, remotePath)) {
+      if (!match.local || !match.remote) continue;
+      if (direction === "upload") pairedBySource.set(match.local.path, match.remote);
+      else pairedBySource.set(match.remote.path, match.local);
+    }
     setSyncPlan({
       direction,
       mode: "transfer",
@@ -3777,14 +3800,18 @@ export default function App() {
       title,
       items: entries.map((entry) => {
         const mark = marks.get(entry.path);
-        const relativeName = transferRelativeName(direction === "upload" ? "local" : "remote", direction === "upload" ? localPath : remotePath, entry);
+        const paired = pairedBySource.get(entry.path);
+        const relativeName = paired
+          ? transferRelativeName(direction === "upload" ? "remote" : "local", direction === "upload" ? remotePath : localPath, paired)
+          : transferRelativeName(direction === "upload" ? "local" : "remote", direction === "upload" ? localPath : remotePath, entry);
         return {
           entry,
           action: mark?.kind === "different" ? "overwrite" : "create",
           name: relativeName,
           source: entry.path,
-          target:
-            direction === "upload"
+          target: paired
+            ? paired.path
+            : direction === "upload"
               ? joinRemotePath(remotePath || ".", relativeName)
               : joinLocalPath(localPath || ".", relativeName),
           detail: mark?.detail ?? compareKindLabel(mark?.kind ?? "different")
