@@ -910,6 +910,7 @@ fn entry_from_stat(
         .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from(SystemTime::UNIX_EPOCH));
 
     FileEntry {
+        hidden: crate::core::sftp::name_is_hidden(&name),
         name,
         path: remote_path_text(&path_buf),
         size,
@@ -920,7 +921,6 @@ fn entry_from_stat(
         permissions: stat.perm.map(|perm| perm & 0o7777),
         uid: stat.uid,
         gid: stat.gid,
-        hidden: crate::core::sftp::name_is_hidden(&name),
     }
 }
 
@@ -3961,7 +3961,7 @@ fn rename_remote_case_only(sftp: &ssh2::Sftp, path: &str, target: &str) -> Resul
         if sftp.rename(temp_path, Path::new(path), None).is_err() {
             bail!("重命名没有完成，文件暂时改成了临时名字，请再改回原来的名字");
         }
-        return Err(error);
+        return Err(error.into());
     }
     Ok(())
 }

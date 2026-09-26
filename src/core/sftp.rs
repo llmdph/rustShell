@@ -386,7 +386,7 @@ fn local_move_lands_inside(source: &Path, destination: &Path) -> bool {
     }
     let mut prefix = source;
     if !prefix.ends_with("\\") {
-        prefix.push("\\");
+        prefix.push('\\');
     }
     destination.starts_with(&prefix)
 }
@@ -2209,7 +2209,7 @@ mod tests {
         std::fs::write(&source, b"keep").unwrap();
 
         let error = local_move(&source.display().to_string(), &link.display().to_string()).unwrap_err();
-        assert!(error.to_string().contains("\u94fe\u63a5"));
+        assert!(error.to_string().contains("\u{94fe}\u{63a5}"));
         assert_eq!(std::fs::read(&source).unwrap(), b"keep");
         assert!(!real.join("keep.txt").exists());
 
@@ -2220,7 +2220,7 @@ mod tests {
         let child = tree.join("child");
         std::fs::create_dir_all(&child).unwrap();
         let error = local_move(&tree.display().to_string(), &child.display().to_string()).unwrap_err();
-        assert!(error.to_string().contains("\u81ea\u5df1"));
+        assert!(error.to_string().contains("\u{81ea}\u{5df1}"));
         assert!(child.is_dir());
         assert!(tree.is_dir());
     }

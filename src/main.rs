@@ -2732,7 +2732,7 @@ fn spawn_gui_command(mut command: Command) -> std::io::Result<()> {
     // These helpers stay running after the folder is shown. Waiting would hold
     // the action until that window closes, and Explorer's exit code is not a
     // reliable success flag.
-    let child = command.spawn()?;
+    let mut child = command.spawn()?;
     let _ = thread::Builder::new()
         .name("open-local-path".to_owned())
         .spawn(move || {
