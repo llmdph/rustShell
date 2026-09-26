@@ -113,6 +113,7 @@ button:disabled {
 }
 
 .app-shell {
+  position: relative;
   --bg: #05070b;
   --chrome: #070b11;
   --panel: #0e141d;
@@ -164,6 +165,58 @@ button:disabled {
   --warn: #d97706;
 }
 
+.app-shell.is-maximized,
+.file-window-shell.is-maximized {
+  border-radius: 0;
+}
+
+.window-resize {
+  position: absolute;
+  z-index: 160;
+  user-select: none;
+  -webkit-app-region: no-drag;
+}
+
+.app-shell.is-maximized .window-resize {
+  display: none;
+}
+
+.window-resize.n,
+.window-resize.s {
+  left: 10px;
+  right: 10px;
+  height: 6px;
+  cursor: ns-resize;
+}
+
+.window-resize.n { top: 0; }
+.window-resize.s { bottom: 0; }
+
+.window-resize.e,
+.window-resize.w {
+  top: 10px;
+  bottom: 10px;
+  width: 6px;
+  cursor: ew-resize;
+}
+
+.window-resize.e { right: 0; }
+.window-resize.w { left: 0; }
+
+.window-resize.nw,
+.window-resize.ne,
+.window-resize.sw,
+.window-resize.se {
+  width: 10px;
+  height: 10px;
+  z-index: 161;
+}
+
+.window-resize.nw { top: 0; left: 0; cursor: nwse-resize; }
+.window-resize.ne { top: 0; right: 0; cursor: nesw-resize; }
+.window-resize.sw { bottom: 0; left: 0; cursor: nesw-resize; }
+.window-resize.se { bottom: 0; right: 0; cursor: nwse-resize; }
+
 .topbar {
   position: relative;
   z-index: 120;
@@ -179,7 +232,6 @@ button:disabled {
     0 10px 28px rgba(0, 0, 0, 0.24);
   backdrop-filter: blur(12px);
   user-select: none;
-  -webkit-app-region: drag;
 }
 
 .brand {
@@ -358,7 +410,6 @@ button:disabled {
   border-bottom: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
   backdrop-filter: blur(12px);
   user-select: none;
-  -webkit-app-region: drag;
 }
 
 .titlebar {
@@ -1746,7 +1797,6 @@ select:disabled {
 
 .file-window-workspace .file-panel-heading {
   user-select: none;
-  -webkit-app-region: drag;
 }
 
 .file-window-workspace .file-panel-heading button,

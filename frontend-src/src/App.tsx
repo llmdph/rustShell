@@ -279,6 +279,7 @@ export default function App() {
     };
   }, []);
   const isFileManagerWindow = fileWindowParams.isFileManagerWindow;
+  const [windowMaximized, setWindowMaximized] = useState(false);
   const busRef = useRef(new EventBus<AppEvents>());
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [tabs, setTabs] = useState<TerminalView[]>([]);
@@ -3210,7 +3211,10 @@ export default function App() {
     try {
       const appWindow = getCurrentWindow();
       if (action === "minimize") await appWindow.minimize();
-      if (action === "maximize") await appWindow.toggleMaximize();
+      if (action === "maximize") {
+        await appWindow.toggleMaximize();
+        setWindowMaximized(await appWindow.isMaximized());
+      }
       if (action === "close") await appWindow.close();
     } catch (error) {
       const message = `窗口操作失败: ${String(error)}`;
@@ -3218,6 +3222,29 @@ export default function App() {
       pushToast("error", message);
     }
   };
+
+  useEffect(() => {
+    if (!hasTauriRuntime()) return;
+    const appWindow = getCurrentWindow();
+    let disposed = false;
+    let unlisten = () => {};
+    const syncMaximized = () => {
+      void appWindow.isMaximized().then((maximized) => {
+        if (!disposed) setWindowMaximized(maximized);
+      }).catch(() => undefined);
+    };
+    syncMaximized();
+    void appWindow.onResized(() => {
+      syncMaximized();
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
 
   useEffect(() => {
     if (!tabContextMenu) return;
@@ -4469,7 +4496,7 @@ export default function App() {
     }
   ];
   const windowControls = (
-    <div className="window-controls" aria-label="窗口控制" onMouseDown={(event) => event.stopPropagation()}>
+    <div className="window-controls" data-tauri-drag-region="false" aria-label="窗口控制" onMouseDown={(event) => event.stopPropagation()}>
       <button title="最小化" onClick={() => void runWindowAction("minimize")}>
         <Minus size={14} />
       </button>
@@ -4482,8 +4509,24 @@ export default function App() {
     </div>
   );
 
+  const resizeWindow = (direction: "North" | "South" | "East" | "West" | "NorthEast" | "NorthWest" | "SouthEast" | "SouthWest") =>
+    (event: MouseEvent<HTMLDivElement>) => {
+      if (!hasTauriRuntime() || event.button !== 0 || windowMaximized) return;
+      event.preventDefault();
+      event.stopPropagation();
+      void getCurrentWindow().startResizeDragging(direction).catch(() => undefined);
+    };
+
   return (
-    <div className={`app-shell ${isFileManagerWindow ? "file-window-shell" : ""}`}>
+    <div className={`app-shell${isFileManagerWindow ? " file-window-shell" : ""}${windowMaximized ? " is-maximized" : ""}`}>
+      <div className="window-resize n" data-tauri-drag-region="false" onMouseDown={resizeWindow("North")} />
+      <div className="window-resize s" data-tauri-drag-region="false" onMouseDown={resizeWindow("South")} />
+      <div className="window-resize e" data-tauri-drag-region="false" onMouseDown={resizeWindow("East")} />
+      <div className="window-resize w" data-tauri-drag-region="false" onMouseDown={resizeWindow("West")} />
+      <div className="window-resize ne" data-tauri-drag-region="false" onMouseDown={resizeWindow("NorthEast")} />
+      <div className="window-resize nw" data-tauri-drag-region="false" onMouseDown={resizeWindow("NorthWest")} />
+      <div className="window-resize se" data-tauri-drag-region="false" onMouseDown={resizeWindow("SouthEast")} />
+      <div className="window-resize sw" data-tauri-drag-region="false" onMouseDown={resizeWindow("SouthWest")} />
       {!isFileManagerWindow && (
         <header className="chrome" data-tauri-drag-region="deep">
           <div className="brand" data-tauri-drag-region="deep">
@@ -4495,7 +4538,7 @@ export default function App() {
           </div>
           <AppMenuBar menus={appMenus} />
           <div className="topbar-drag-region" data-tauri-drag-region="deep" />
-          <div className="topbar-connect">
+          <div className="topbar-connect" data-tauri-drag-region="false">
             <input
               className="host-search"
               value={hostSearch}
@@ -7098,7 +7141,7 @@ function AppSelect<T extends string>({
   }, [open]);
 
   return (
-    <div className={`app-select ${open ? "open" : ""} ${className}`} onClick={(event) => event.stopPropagation()}>
+    <div className={`app-select ${open ? "open" : ""} ${className}`} data-tauri-drag-region="false" onClick={(event) => event.stopPropagation()}>
       <button
         ref={buttonRef}
         type="button"
@@ -8762,7 +8805,7 @@ function AppMenuBar({ menus }: { menus: AppMenuGroup[] }) {
   }, [openMenu]);
 
   return (
-    <nav className="app-menu-bar" aria-label="应用菜单" onClick={(event) => event.stopPropagation()}>
+    <nav className="app-menu-bar" aria-label="应用菜单" data-tauri-drag-region="false" onClick={(event) => event.stopPropagation()}>
       {menus.map((menu) => {
         const open = openMenu === menu.label;
         return (
