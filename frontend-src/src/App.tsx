@@ -202,7 +202,7 @@ const emptyDirectoryCompare: DirectoryCompare = {
 };
 const terminalSnippets = ["pwd", "ls -la", "df -h", "free -h", "ps aux | head", "whoami"];
 const defaultLeftPanelWidth = 272;
-const defaultRightPanelWidth = 386;
+const defaultRightPanelWidth = 280;
 const minPanelWidth = 220;
 const maxPanelWidth = 620;
 const collapsedPanelWidth = 38;
@@ -3237,6 +3237,7 @@ export default function App() {
     if (event.button !== 0) return;
     event.preventDefault();
     const startX = event.clientX;
+    const startY = event.clientY;
     const startWidth = side === "left" ? leftPanelWidth : rightPanelWidth;
     if (side === "left") {
       setLeftPanelCollapsed(false);
@@ -3245,19 +3246,22 @@ export default function App() {
     }
 
     const move = (moveEvent: globalThis.MouseEvent) => {
+      if (side === "right") {
+        const delta = startY - moveEvent.clientY;
+        setRightPanelWidth(clampNumber(startWidth + delta, 180, 560));
+        return;
+      }
       const delta = moveEvent.clientX - startX;
-      const nextWidth = side === "left" ? startWidth + delta : startWidth - delta;
-      const setWidth = side === "left" ? setLeftPanelWidth : setRightPanelWidth;
-      setWidth(clampNumber(nextWidth, minPanelWidth, maxPanelWidth));
+      setLeftPanelWidth(clampNumber(startWidth + delta, minPanelWidth, maxPanelWidth));
     };
 
     const stop = () => {
-      document.body.classList.remove("is-resizing-panel");
+      document.body.classList.remove("is-resizing-panel", "is-resizing-bottom");
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", stop);
     };
 
-    document.body.classList.add("is-resizing-panel");
+    document.body.classList.add(side === "right" ? "is-resizing-bottom" : "is-resizing-panel");
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", stop);
   };
@@ -4403,7 +4407,7 @@ export default function App() {
           onClick: () => setLeftPanelCollapsed((current) => !current)
         },
         {
-          label: rightPanelCollapsed ? "显示右侧栏" : "隐藏右侧栏",
+          label: rightPanelCollapsed ? "显示下方文件区" : "隐藏下方文件区",
           onClick: () => setRightPanelCollapsed((current) => !current)
         }
       ]
@@ -4481,43 +4485,31 @@ export default function App() {
   return (
     <div className={`app-shell ${isFileManagerWindow ? "file-window-shell" : ""}`}>
       {!isFileManagerWindow && (
-        <header className="chrome">
-          <div className="titlebar" data-tauri-drag-region="deep">
-            <div className="brand">
-              <img className="brand-mark" src="/rustshell-logo.svg" alt="" aria-hidden="true" draggable={false} />
-              <div>
-                <div className="brand-title">RustShell</div>
-                <div className="brand-subtitle">SSH 终端工具</div>
-              </div>
-            </div>
-            <AppMenuBar menus={appMenus} />
-            {windowControls}
-          </div>
-          <div className="toolbar" data-tauri-drag-region="deep">
-            <IconButton title="新建会话" icon={<CirclePlus size={15} />} onClick={() => openProfileEditor()} />
-            <IconButton title="快速连接" icon={<Cable size={15} />} onClick={() => setDialog("quick")} />
-            <IconButton title="重连" icon={<RefreshCcw size={15} />} onClick={reconnectActive} disabled={!activeProfile} />
-            <IconButton title="本地终端" icon={<Monitor size={15} />} onClick={openLocalShell} />
-            <span className="toolbar-sep" />
-            <IconButton title="显示文件区" icon={<Folder size={15} />} onClick={() => setRightPanelCollapsed(false)} />
-            <IconButton title="传输队列" icon={<ListChecks size={15} />} onClick={() => setDialog("transfers")} />
-            <IconButton title="设置" icon={<Settings size={15} />} onClick={() => setDialog("settings")} />
-            <div className="topbar-drag-region" />
-            <div className="topbar-connect">
-              <input
-                className="host-search"
-                value={hostSearch}
-                onChange={(event) => setHostSearch(event.target.value)}
-                placeholder="主机名、IP 地址或会话名称"
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") connectFromSearch();
-                }}
-              />
-              <button className="primary-button" onClick={connectFromSearch}>
-                连接
-              </button>
+        <header className="chrome" data-tauri-drag-region="deep">
+          <div className="brand" data-tauri-drag-region="deep">
+            <img className="brand-mark" src="/rustshell-logo.svg" alt="" aria-hidden="true" draggable={false} />
+            <div data-tauri-drag-region="deep">
+              <div className="brand-title">RustShell</div>
+              <div className="brand-subtitle">RS-20260812-N</div>
             </div>
           </div>
+          <AppMenuBar menus={appMenus} />
+          <div className="topbar-drag-region" data-tauri-drag-region="deep" />
+          <div className="topbar-connect">
+            <input
+              className="host-search"
+              value={hostSearch}
+              onChange={(event) => setHostSearch(event.target.value)}
+              placeholder="主机名、IP 或会话名称"
+              onKeyDown={(event) => {
+                if (event.key === "Enter") connectFromSearch();
+              }}
+            />
+            <button className="primary-button" onClick={connectFromSearch}>
+              连接
+            </button>
+          </div>
+          {windowControls}
         </header>
       )}
 
@@ -4755,8 +4747,8 @@ export default function App() {
         <div
           className="panel-resizer right-resizer"
           role="separator"
-          aria-orientation="vertical"
-          title="拖拽调整右侧宽度，双击恢复"
+          aria-orientation="horizontal"
+          title="拖拽调整下方高度，双击恢复"
           onMouseDown={(event) => startPanelResize("right", event)}
           onDoubleClick={() => resetPanelWidth("right")}
         />
@@ -4765,8 +4757,8 @@ export default function App() {
 
         <aside className={`right-panel ${rightPanelCollapsed ? "collapsed" : ""}`}>
           {rightPanelCollapsed && !isFileManagerWindow ? (
-            <button className="panel-rail-button" title="展开右侧" onClick={() => setRightPanelCollapsed(false)}>
-              <ChevronLeft size={16} />
+            <button className="panel-rail-button" title="打开下方文件区" onClick={() => setRightPanelCollapsed(false)}>
+              <ArrowUp size={16} />
             </button>
           ) : (
             <>
@@ -4774,7 +4766,7 @@ export default function App() {
                 <section className="side-card toolbox-panel">
                   <div className="compact-info-head">
                     <h3>工具箱</h3>
-                    <IconButton title="收起右侧" icon={<X size={14} />} onClick={() => setRightPanelCollapsed(true)} />
+                    <IconButton title="收起下方文件区" icon={<X size={14} />} onClick={() => setRightPanelCollapsed(true)} />
                   </div>
                   <div className="toolbox-grid">
                     <IconButton title="新建会话" icon={<CirclePlus size={15} />} onClick={() => openProfileEditor()} />
@@ -4844,7 +4836,7 @@ export default function App() {
                     windowControls
                   ) : (
                     <IconButton
-                      title="收起右侧"
+                      title="收起下方文件区"
                       icon={<ChevronRight size={14} />}
                       onClick={() => setRightPanelCollapsed(true)}
                     />
