@@ -1560,15 +1560,32 @@ fn resume_needs_source_bytes(choice: ResumeChoice) -> bool {
     matches!(choice, ResumeChoice::Append(_) | ResumeChoice::Restart)
 }
 
-fn resume_download_can_skip_open(local_path: &Path, remote_size: Option<u64>) -> bool {
+enum FinishedLocalResume {
+    NeedsRemote,
+    Complete(u64),
+    Larger { target: u64, source: u64 },
+}
+
+/// The folder listing already has the remote size. One local stat is enough
+/// to keep a finished file or refuse a larger one. Opening the download used
+/// to stat that same file again.
+fn finished_local_resume(local_path: &Path, remote_size: Option<u64>) -> FinishedLocalResume {
     let Some(remote_size) = remote_size else {
-        return false;
+        return FinishedLocalResume::NeedsRemote;
     };
     let Ok(metadata) = fs::symlink_metadata(local_path) else {
-        return false;
+        return FinishedLocalResume::NeedsRemote;
     };
-    metadata.is_file()
-        && !resume_needs_source_bytes(choose_resume(Some(metadata.len()), Some(remote_size)))
+    if !metadata.is_file() || local_path_is_link(local_path, &metadata) {
+        return FinishedLocalResume::NeedsRemote;
+    }
+    match choose_resume(Some(metadata.len()), Some(remote_size)) {
+        ResumeChoice::Complete => FinishedLocalResume::Complete(metadata.len()),
+        ResumeChoice::TargetLarger { target, source } => {
+            FinishedLocalResume::Larger { target, source }
+        }
+        _ => FinishedLocalResume::NeedsRemote,
+    }
 }
 
 fn upload_single_file<F>(
@@ -2282,24 +2299,26 @@ where
             )?;
             continue;
         }
-        // The listing already has the size. A finished file does not need the
-        // remote file opened, and a larger local file fails before that open.
-        if matches!(conflict, TransferConflictStrategy::Resume)
-            && resume_download_can_skip_open(&local_path, stat.size)
-        {
-            download_single_file(
-                sftp,
-                &remote_path,
-                &local_path,
-                total,
-                transferred,
-                cancel.clone(),
-                conflict,
-                None,
-                trusted_listing_stat(stat),
-                on_progress,
-            )?;
-            continue;
+        // The listing already has the remote size. A finished file does not
+        // need another local stat or the remote file opened. A larger local
+        // file fails before that open.
+        if matches!(conflict, TransferConflictStrategy::Resume) {
+            match finished_local_resume(&local_path, stat.size) {
+                FinishedLocalResume::Complete(local_size) => {
+                    *transferred += local_size;
+                    on_progress(*transferred, total);
+                    preserve_local_permissions(&local_path, stat.perm);
+                    preserve_local_times(&local_path, stat.atime, stat.mtime);
+                    continue;
+                }
+                FinishedLocalResume::Larger { target, source } => {
+                    bail!(
+                        "{}",
+                        resume_target_larger_message(&local_path, target, source, true)
+                    );
+                }
+                FinishedLocalResume::NeedsRemote => {}
+            }
         }
         // The handle is reused for the copy. Opening it again would be another
         // round trip for every file in the folder.
@@ -3997,7 +4016,10 @@ mod preferred_transfer_name_tests {
 
 #[cfg(test)]
 mod resume_choice_tests {
-    use super::{choose_resume, resume_needs_source_bytes, ResumeChoice};
+    use super::{
+        choose_resume, finished_local_resume, resume_needs_source_bytes, FinishedLocalResume,
+        ResumeChoice,
+    };
 
     #[test]
     fn appends_when_existing_file_is_shorter() {
@@ -4061,6 +4083,51 @@ mod resume_choice_tests {
             Some(10)
         )));
         assert!(!resume_needs_source_bytes(choose_resume(Some(8), None)));
+    }
+
+    #[test]
+    fn a_finished_local_file_does_not_need_another_size_check() {
+        let root = std::env::temp_dir().join(format!(
+            "rustshell-resume-local-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        std::fs::write(root.join("done.txt"), b"hello").unwrap();
+        std::fs::write(root.join("short.txt"), b"hi").unwrap();
+        std::fs::write(root.join("big.txt"), b"0123456789").unwrap();
+
+        assert!(matches!(
+            finished_local_resume(&root.join("done.txt"), Some(5)),
+            FinishedLocalResume::Complete(5)
+        ));
+        assert!(matches!(
+            finished_local_resume(&root.join("short.txt"), Some(5)),
+            FinishedLocalResume::NeedsRemote
+        ));
+        assert!(matches!(
+            finished_local_resume(&root.join("big.txt"), Some(5)),
+            FinishedLocalResume::Larger { target: 10, source: 5 }
+        ));
+        assert!(matches!(
+            finished_local_resume(&root.join("missing.txt"), Some(5)),
+            FinishedLocalResume::NeedsRemote
+        ));
+        assert!(matches!(
+            finished_local_resume(&root.join("done.txt"), None),
+            FinishedLocalResume::NeedsRemote
+        ));
     }
 }
 
