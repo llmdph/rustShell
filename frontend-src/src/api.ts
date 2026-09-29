@@ -62,6 +62,7 @@ export type TerminalView = {
   lastError?: string | null;
   hostKeyIssue?: HostKeyIssue | null;
   currentDirectory?: string | null;
+  epoch?: number;
 };
 
 export type TerminalDrain = {
@@ -72,6 +73,7 @@ export type TerminalDrain = {
   lastError?: string | null;
   hostKeyIssue?: HostKeyIssue | null;
   currentDirectory?: string | null;
+  epoch?: number;
 };
 
 /** Event the backend pump emits per terminal. Must match `terminal_event_name` in main.rs. */
@@ -177,6 +179,8 @@ export const api = {
   terminalSnapshot: (terminalId: string) => invoke<TerminalView>("terminal_snapshot", { terminalId }),
   terminalDrain: (terminalId: string) => invoke<TerminalDrain>("terminal_drain", { terminalId }),
   duplicateTerminal: (terminalId: string) => invoke<TerminalView>("duplicate_terminal", { terminalId }),
+  reconnectTerminal: (terminalId: string, password?: string | null) =>
+    invoke<TerminalView>("reconnect_terminal", { terminalId, password: password || null }),
   terminalSend: (terminalId: string, data: string) =>
     invoke<void>("terminal_send", { request: { terminalId, data } }),
   terminalResize: (terminalId: string, cols: number, rows: number) =>

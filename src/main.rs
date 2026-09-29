@@ -22,7 +22,9 @@ use crate::{
             search_local as search_local_impl, FileEntry, LocalPathStats, LocalTextFile,
             TransferConflictStrategy, TransferDirection,
         },
-        terminal::{HostKeyIssue, PumpSignal, TerminalModel, TerminalSize, TerminalStatus},
+        terminal::{
+            HostKeyIssue, PumpSignal, RunningTerminal, TerminalModel, TerminalSize, TerminalStatus,
+        },
     },
     services::{
         sftp_pool, sftp_service, ssh,
@@ -463,6 +465,7 @@ struct TerminalView {
     last_error: Option<String>,
     host_key_issue: Option<HostKeyIssue>,
     current_directory: Option<String>,
+    epoch: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -475,6 +478,7 @@ struct TerminalDrain {
     last_error: Option<String>,
     host_key_issue: Option<HostKeyIssue>,
     current_directory: Option<String>,
+    epoch: u64,
 }
 
 /// Fields the frontend re-renders on. Output is streamed unconditionally; these
@@ -486,6 +490,7 @@ struct TerminalMetadata {
     last_error: Option<String>,
     host_key_fingerprint: Option<String>,
     current_directory: Option<String>,
+    epoch: u64,
 }
 
 impl TerminalMetadata {
@@ -498,6 +503,7 @@ impl TerminalMetadata {
                 .as_ref()
                 .map(|issue| issue.fingerprint.clone()),
             current_directory: drain.current_directory.clone(),
+            epoch: drain.epoch,
         }
     }
 }
@@ -929,6 +935,43 @@ async fn duplicate_terminal(terminal_id: String, app: AppHandle) -> Result<Termi
             mark_profile_connected(profile.id, &state)?;
         }
         Ok(terminal)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn reconnect_terminal(
+    terminal_id: String,
+    password: Option<String>,
+    app: AppHandle,
+) -> Result<TerminalView, String> {
+    blocking(move || {
+        let state = app.state::<AppRuntime>();
+        let id = parse_uuid(&terminal_id)?;
+        let (profile, size) = {
+            let terminals = lock(&state.terminals)?;
+            let terminal = terminals
+                .get(&id)
+                .ok_or_else(|| "终端不存在或已关闭".to_owned())?;
+            (terminal.profile.clone(), terminal.size)
+        };
+        let password = resolve_password(&profile, password.as_deref(), &state)?;
+        let profile = profile_for_secret(profile, password.as_deref());
+        let running = start_terminal_worker(profile.clone(), password, size, &state)?;
+        let view = {
+            let mut terminals = lock(&state.terminals)?;
+            let terminal = terminals
+                .get_mut(&id)
+                .ok_or_else(|| "终端不存在或已关闭".to_owned())?;
+            terminal.profile = profile.clone();
+            terminal.reconnect(running);
+            snapshot_terminal(terminal)
+        };
+        if !matches!(profile.protocol, SessionProtocol::LocalShell) {
+            mark_profile_connected(profile.id, &state)?;
+        }
+        state.terminal_pump.notify();
+        Ok(view)
     })
     .await
 }
@@ -2018,6 +2061,7 @@ fn main() {
             terminal_snapshot,
             terminal_drain,
             duplicate_terminal,
+            reconnect_terminal,
             load_settings,
             save_settings,
             exit_main_window,
@@ -2327,6 +2371,22 @@ fn launch_terminal(
     password: Option<String>,
     state: &State<'_, AppRuntime>,
 ) -> Result<TerminalView, String> {
+    let size = TerminalSize::default();
+    let running = start_terminal_worker(profile.clone(), password, size, state)?;
+    let mut terminal = TerminalModel::new(profile, size);
+    terminal.attach(running);
+    let view = snapshot_terminal(&mut terminal);
+    lock(&state.terminals)?.insert(terminal.id, terminal);
+    state.terminal_pump.notify();
+    Ok(view)
+}
+
+fn start_terminal_worker(
+    profile: SessionProfile,
+    password: Option<String>,
+    size: TerminalSize,
+    state: &State<'_, AppRuntime>,
+) -> Result<RunningTerminal, String> {
     let missing_password = password.as_deref().map(str::is_empty).unwrap_or(true);
     if matches!(profile.protocol, SessionProtocol::Ssh)
         && matches!(profile.auth, AuthProfile::Password)
@@ -2335,7 +2395,6 @@ fn launch_terminal(
         return Err("需要输入密码".to_owned());
     }
 
-    let size = TerminalSize::default();
     let local_shell = if matches!(profile.protocol, SessionProtocol::LocalShell) {
         let configured = lock(&state.settings)?.local_shell.trim().to_owned();
         if configured.is_empty() {
@@ -2346,19 +2405,13 @@ fn launch_terminal(
     } else {
         None
     };
-    let running = TerminalLauncher::spawn(
-        profile.clone(),
+    Ok(TerminalLauncher::spawn(
+        profile,
         password,
         size,
         local_shell,
         state.terminal_pump.clone(),
-    );
-    let mut terminal = TerminalModel::new(profile, size);
-    terminal.attach(running);
-    let view = snapshot_terminal(&mut terminal);
-    lock(&state.terminals)?.insert(terminal.id, terminal);
-    state.terminal_pump.notify();
-    Ok(view)
+    ))
 }
 
 /// Drains one terminal into the payload shape the frontend consumes.
@@ -2372,6 +2425,7 @@ fn drain_terminal(terminal: &mut TerminalModel) -> TerminalDrain {
         last_error: terminal.last_error.clone(),
         host_key_issue: terminal.host_key_issue.clone(),
         current_directory: terminal.current_directory.clone(),
+        epoch: terminal.epoch,
     }
 }
 
@@ -2468,6 +2522,7 @@ fn snapshot_terminal(terminal: &mut TerminalModel) -> TerminalView {
         last_error: terminal.last_error.clone(),
         host_key_issue: terminal.host_key_issue.clone(),
         current_directory: terminal.current_directory.clone(),
+        epoch: terminal.epoch,
     }
 }
 

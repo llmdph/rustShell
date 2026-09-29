@@ -221,6 +221,9 @@ pub struct TerminalModel {
     pub host_key_issue: Option<HostKeyIssue>,
     pub current_directory: Option<String>,
     pub exit_code: Option<i32>,
+    /// Incremented when this model is reused for a new worker so stale
+    /// host-key / auth events from the previous attempt can be ignored.
+    pub epoch: u64,
     command_tx: Option<Sender<TerminalCommand>>,
     event_rx: Option<Receiver<TerminalEvent>>,
     history: HistoryBuffer,
@@ -242,6 +245,7 @@ impl TerminalModel {
             host_key_issue: None,
             current_directory: None,
             exit_code: None,
+            epoch: 0,
             command_tx: None,
             event_rx: None,
             history: HistoryBuffer::new(TERMINAL_REPLAY_CAP),
@@ -254,6 +258,22 @@ impl TerminalModel {
     pub fn attach(&mut self, running: RunningTerminal) {
         self.command_tx = Some(running.command_tx);
         self.event_rx = Some(running.event_rx);
+    }
+
+    /// Keep the same terminal id / tab and start a fresh worker, e.g. after
+    /// the user trusts a host key that stopped the previous SSH attempt.
+    pub fn reconnect(&mut self, running: RunningTerminal) {
+        self.pump_events();
+        self.shutdown();
+        self.command_tx = None;
+        self.event_rx = None;
+        self.epoch = self.epoch.saturating_add(1);
+        self.status = TerminalStatus::Connecting;
+        self.last_error = None;
+        self.host_key_issue = None;
+        self.exit_code = None;
+        self.current_directory = None;
+        self.attach(running);
     }
 
     pub fn pump_events(&mut self) {

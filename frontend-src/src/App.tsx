@@ -237,6 +237,7 @@ export default function App() {
   const [profileSecrets, setProfileSecrets] = useState<Record<string, string>>({});
   const [profileSecretDrafts, setProfileSecretDrafts] = useState<Record<string, string>>({});
   const authPromptedTabsRef = useRef(new Set<string>());
+  const terminalEpochRef = useRef(new Map<string, number>());
   const fileDragRef = useRef<FileDragPayload | null>(null);
   const transferStatusRef = useRef(new Map<string, TransferView["status"]>());
   const remoteFilePaneRef = useRef<HTMLDivElement | null>(null);
@@ -1150,8 +1151,22 @@ export default function App() {
   });
 
   const appendTab = (terminal: TerminalView) => {
+    terminalEpochRef.current.set(terminal.id, terminal.epoch ?? 0);
     setTabs((current) => [...current.filter((tab) => tab.id !== terminal.id), terminal]);
     setPrimaryPaneActiveTabId(terminal.id);
+    setActiveTabId(terminal.id);
+    setSelectedProfileId(terminal.profileId);
+  };
+
+  const updateTabInPlace = (terminal: TerminalView) => {
+    terminalEpochRef.current.set(terminal.id, Math.max(terminalEpochRef.current.get(terminal.id) ?? 0, terminal.epoch ?? 0));
+    setTabs((current) => {
+      const index = current.findIndex((tab) => tab.id === terminal.id);
+      if (index === -1) return [...current, terminal];
+      const next = [...current];
+      next[index] = { ...current[index], ...terminal, text: current[index].text };
+      return next;
+    });
     setActiveTabId(terminal.id);
     setSelectedProfileId(terminal.profileId);
   };
@@ -1415,6 +1430,7 @@ export default function App() {
       return next;
     });
     authPromptedTabsRef.current.delete(tabId);
+    terminalEpochRef.current.delete(tabId);
   };
 
   const closeTabWithConfirm = async (tabId: string) => {
@@ -1595,8 +1611,34 @@ export default function App() {
     try {
       await api.trustHostKey(hostKeyPrompt.issue);
       const profile = profiles.find((item) => item.id === hostKeyPrompt.profileId);
+      const failedTabId = hostKeyPrompt.terminalId;
+      const knownSecret = profile ? profileSecretValue(profile) : "";
       setHostKeyPrompt(null);
       pushToast("success", "主机密钥已信任");
+      if (failedTabId) {
+        try {
+          const terminal = await api.reconnectTerminal(failedTabId, knownSecret || null);
+          rememberProfileSecret(terminal.profileId, knownSecret || null);
+          updateTabInPlace(terminal);
+          setStatus(`正在连接 ${terminal.endpoint}`);
+          await reloadProfiles().catch(() => undefined);
+          return;
+        } catch (error) {
+          const message = String(error);
+          if (profile && shouldPromptForPassword(profile, message)) {
+            requestProfileSecret(profile, message);
+            pushToast("info", "请输入连接密码/口令");
+            return;
+          }
+          if (profile && message.includes("终端不存在或已关闭")) {
+            await connectProfile(profile);
+            return;
+          }
+          setStatus(`连接失败: ${message}`);
+          pushToast("error", "连接失败");
+          return;
+        }
+      }
       if (profile) await connectProfile(profile);
     } catch (error) {
       pushToast("error", `主机密钥保存失败: ${String(error)}`);
@@ -3084,16 +3126,22 @@ export default function App() {
     return () => window.removeEventListener("storage", handleStorage);
   }, [isFileManagerWindow, profiles, resetRemoteBrowserProfile]);
   const handleTerminalDrain = (next: TerminalDrain, profileId: string) => {
+    const nextEpoch = next.epoch ?? 0;
+    const knownEpoch = terminalEpochRef.current.get(next.id) ?? 0;
+    if (nextEpoch < knownEpoch) return;
+    terminalEpochRef.current.set(next.id, nextEpoch);
     setTabs((current) => {
       let changed = false;
       const updated = current.map((tab) => {
         if (tab.id !== next.id) return tab;
+        if ((tab.epoch ?? 0) > nextEpoch) return tab;
         const same =
           tab.status === next.status &&
           tab.statusLabel === next.statusLabel &&
           (tab.lastError ?? "") === (next.lastError ?? "") &&
           (tab.hostKeyIssue?.fingerprint ?? "") === (next.hostKeyIssue?.fingerprint ?? "") &&
-          (tab.currentDirectory ?? "") === (next.currentDirectory ?? "");
+          (tab.currentDirectory ?? "") === (next.currentDirectory ?? "") &&
+          (tab.epoch ?? 0) === nextEpoch;
         if (same) return tab;
         changed = true;
         return {
@@ -3102,13 +3150,14 @@ export default function App() {
           statusLabel: next.statusLabel,
           lastError: next.lastError,
           hostKeyIssue: next.hostKeyIssue,
-          currentDirectory: next.currentDirectory
+          currentDirectory: next.currentDirectory,
+          epoch: nextEpoch
         };
       });
       return changed ? updated : current;
     });
-    if (next.hostKeyIssue) {
-      setHostKeyPrompt({ profileId, issue: next.hostKeyIssue });
+    if (next.status === "failed" && next.hostKeyIssue) {
+      setHostKeyPrompt({ profileId, terminalId: next.id, issue: next.hostKeyIssue });
     }
     void retryAuthFailure(next, profileId).catch((error) => {
       setStatus(`认证重试失败: ${String(error)}`);

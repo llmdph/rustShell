@@ -20,5 +20,5 @@ export type AppConfirmOptions = {
 
 export type BatchRenamePlanItem = { entry: FileEntry; newName: string };
 export type DeleteConfirmState = { side: FileSide; entries: FileEntry[] };
-export type HostKeyPromptState = { profileId: string; issue: HostKeyIssue };
+export type HostKeyPromptState = { profileId: string; terminalId: string; issue: HostKeyIssue };
 export type TextPreviewPosition = "head" | "tail";
