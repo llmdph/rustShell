@@ -549,11 +549,20 @@
   background-color: color-mix(in srgb, var(--muted) 74%, transparent) !important;
 }
 
-[data-app-bg] [data-xterm-host],
+/* One sheet only. xterm also fills .xterm, the viewport, the screen, and
+   .xterm-scrollable-element (inline). Stacking those ignores the opacity
+   slider, so the host alone uses the same mix as the settings preview. */
+[data-app-bg] [data-xterm-host] {
+  background-color: color-mix(in srgb, var(--background) calc(var(--app-surface-alpha, 86) * 1%), transparent) !important;
+}
+
 [data-app-bg] [data-xterm-host] .xterm,
-[data-app-bg] [data-xterm-host] .xterm-viewport,
-[data-app-bg] [data-xterm-host] .xterm-screen {
-  background-color: var(--xterm-background, transparent) !important;
+[data-app-bg] [data-xterm-host] .xterm .xterm-viewport,
+[data-app-bg] [data-xterm-host] .xterm .xterm-screen,
+[data-app-bg] [data-xterm-host] .xterm-scrollable-element,
+[data-app-bg] [data-xterm-host] .xterm-rows {
+  background-color: transparent !important;
+  background-image: none !important;
 }
 
 /* ---------- Signal desk: link-state lights & chrome motion ----------

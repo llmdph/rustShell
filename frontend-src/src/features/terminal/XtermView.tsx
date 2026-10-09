@@ -63,7 +63,9 @@ function hexByte(value: number) {
 /// space-separated `rgb(10 10 10)` fails its comma regex and only works via a
 /// canvas fallback; keep the wire format boring so cursor/bg never drop out.
 function alphaColor(rgb: [number, number, number], alpha: number) {
-  const opacity = clampNumber(alpha, 55, 100) / 100;
+  // 0 clears xterm's own fill so it cannot stack on the host sheet.
+  if (!(alpha > 0)) return "#00000000";
+  const opacity = clampNumber(alpha, 0, 100) / 100;
   const [r, g, b] = rgb;
   const base = `#${hexByte(r)}${hexByte(g)}${hexByte(b)}`;
   if (opacity >= 1) return base;

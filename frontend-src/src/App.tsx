@@ -3499,7 +3499,7 @@ export default function App() {
             fileDockOpenForTab={fileDockOpenForTab}
             onToggleFileDock={toggleFileDockForTab}
             renderFileDock={renderTerminalFileDock}
-            terminalBackgroundAlpha={appBackgroundActive ? Math.min(appBackground.surfaceAlpha, 58) : 100}
+            terminalBackgroundAlpha={appBackgroundActive ? 0 : 100}
             settings={settings}
             commandForTab={commandForTab}
             broadcast={{
